@@ -1,9 +1,11 @@
 """Core dividend / FCF analysis with 100-point safety scoring."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
+from io import StringIO
 
 import pandas as pd
 import requests
@@ -37,7 +39,7 @@ CAPEX_TAGS = (
     "PaymentsToAcquireProductiveAssets",
 )
 
-# Turnaround screener (System B → active fact-finding)
+# Turnaround screener (active fact-finding radar)
 TURNAROUND_LOOKBACK = "6mo"
 TURNAROUND_MIN_DRAWDOWN_PCT = 15.0
 RND_ROW_NAMES = (
@@ -46,6 +48,42 @@ RND_ROW_NAMES = (
     "ResearchAndDevelopmentExpense",
     "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
 )
+
+# Index scan universes — Wikipedia constituents with hardcoded fallback
+WIKI_INDEX_PAGES: dict[str, str] = {
+    "dow30": "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+    "nasdaq100": "https://en.wikipedia.org/wiki/Nasdaq-100",
+    "sp500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+}
+FALLBACK_SCAN_UNIVERSE: tuple[str, ...] = (
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "GOOGL",
+    "AMZN",
+    "META",
+    "BRK-B",
+    "LLY",
+    "AVGO",
+    "JPM",
+    "TSLA",
+    "V",
+    "UNH",
+    "XOM",
+    "MA",
+    "PG",
+    "JNJ",
+    "HD",
+    "COST",
+    "ABBV",
+)
+_SYMBOL_COLUMN_CANDIDATES = ("Symbol", "Ticker", "Ticker symbol")
+_INDEX_EXPECTED_COUNTS: dict[str, tuple[int, int]] = {
+    "dow30": (25, 35),
+    "nasdaq100": (90, 110),
+    "sp500": (450, 520),
+}
+_TICKER_PATTERN = re.compile(r"^[A-Z]{1,6}([.-][A-Z]{1,2})?$")
 
 # Right-side trend / MA crossover signals (positions 1, 3, 4)
 TREND_HISTORY_PERIOD = "1y"
@@ -398,7 +436,7 @@ def fetch_latest_fcf_snapshot(
     """
     Latest fiscal-year FCF via existing SEC-first `fetch_fcf` pipeline.
 
-    Reuses the same helpers as System B scoring so turnaround facts stay
+    Reuses the same helpers as core financial scoring so turnaround facts stay
     consistent with the passive safety screen.
     """
     try:
@@ -495,7 +533,7 @@ def find_turnaround_opportunities(
     """
     Active turnaround screener: "garbage heap gold" fact detective.
 
-    Refactor notes (System B → fact-finding extension):
+    Refactor notes (turnaround radar extension):
     -----------------------------------------------
     1. **Price gate (yfinance `.history`)** — scans each ticker for a
        drawdown > `min_drawdown_pct` (default 15%) vs the lookback high
@@ -529,6 +567,181 @@ def find_turnaround_opportunities(
 
     candidates.sort(key=lambda o: o.drawdown_pct, reverse=True)
     return candidates
+
+
+def normalize_equity_ticker(symbol: str) -> str:
+    """Normalize Wikipedia / vendor symbols for yfinance (e.g. BRK.B → BRK-B)."""
+    token = str(symbol).strip().upper().replace(".", "-")
+    token = re.sub(r"\s+", "", token)
+    return token
+
+
+def _is_plausible_ticker(symbol: str) -> bool:
+    return bool(symbol) and bool(_TICKER_PATTERN.match(symbol))
+
+
+def _normalize_table_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [
+            str(levels[0]).strip() if str(levels[0]).strip() else str(levels[-1]).strip()
+            for levels in out.columns
+        ]
+    else:
+        out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
+def _symbols_from_frame(df: pd.DataFrame) -> list[str]:
+    frame = _normalize_table_columns(df)
+    columns = {str(c).strip(): c for c in frame.columns}
+
+    for candidate in _SYMBOL_COLUMN_CANDIDATES:
+        if candidate in columns:
+            values = frame[columns[candidate]].dropna().astype(str).tolist()
+            cleaned = [
+                normalize_equity_ticker(v)
+                for v in values
+                if _is_plausible_ticker(normalize_equity_ticker(v))
+            ]
+            if cleaned:
+                return cleaned
+
+    for col_name, col in columns.items():
+        lower = col_name.lower()
+        if "symbol" in lower or lower == "ticker":
+            values = frame[col].dropna().astype(str).tolist()
+            cleaned = [
+                normalize_equity_ticker(v)
+                for v in values
+                if _is_plausible_ticker(normalize_equity_ticker(v))
+            ]
+            if cleaned:
+                return cleaned
+    return []
+
+
+def _read_html_tables(html: str, **kwargs) -> list[pd.DataFrame]:
+    """Parse HTML tables with lxml first, then html5lib."""
+    last_error: Exception | None = None
+    buffer = StringIO(html)
+    for flavor in ("lxml", "html5lib"):
+        try:
+            buffer.seek(0)
+            return pd.read_html(buffer, flavor=flavor, **kwargs)
+        except ImportError as exc:
+            last_error = exc
+            continue
+        except ValueError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error:
+        raise last_error
+    raise ValueError("No HTML parser available for Wikipedia tables")
+
+
+def _fetch_wikipedia_tables(url: str) -> list[pd.DataFrame]:
+    resp = requests.get(url, headers=SEC_HEADERS, timeout=45)
+    resp.raise_for_status()
+    html = resp.text
+
+    collected: list[pd.DataFrame] = []
+    seen_ids: set[int] = set()
+
+    def _append_tables(found: list[pd.DataFrame]) -> None:
+        for table in found:
+            tid = id(table)
+            if tid not in seen_ids:
+                seen_ids.add(tid)
+                collected.append(table)
+
+    for attrs in (
+        {"class": "wikitable"},
+    ):
+        try:
+            _append_tables(_read_html_tables(html, attrs=attrs))
+        except ValueError:
+            continue
+        except Exception:
+            continue
+
+    if not collected:
+        try:
+            _append_tables(_read_html_tables(html, match="Symbol"))
+        except ValueError:
+            pass
+
+    try:
+        _append_tables(_read_html_tables(html))
+    except ValueError:
+        pass
+
+    if not collected:
+        raise ValueError(f"No Wikipedia tables parsed for {url}")
+    return collected
+
+
+def _extract_symbols_from_tables(
+    tables: list[pd.DataFrame],
+    index_key: str | None = None,
+) -> list[str]:
+    expected = _INDEX_EXPECTED_COUNTS.get(index_key or "")
+    best: list[str] = []
+
+    for table in tables:
+        symbols = _symbols_from_frame(table)
+        if not symbols:
+            continue
+        if expected:
+            low, high = expected
+            if low <= len(symbols) <= high:
+                return symbols
+        if len(symbols) > len(best):
+            best = symbols
+
+    return best
+
+
+def fetch_index_constituents(index_key: str) -> list[str]:
+    """
+    Fetch latest index constituents from Wikipedia.
+
+    Raises on network/parse failures — callers should fall back to
+    `FALLBACK_SCAN_UNIVERSE` when needed.
+    """
+    url = WIKI_INDEX_PAGES.get(index_key)
+    if not url:
+        raise ValueError(f"Unknown index key: {index_key}")
+
+    last_error: Exception | None = None
+    symbols: list[str] = []
+
+    try:
+        tables = _fetch_wikipedia_tables(url)
+        symbols = _extract_symbols_from_tables(tables, index_key=index_key)
+    except Exception as exc:
+        last_error = exc
+
+    if not symbols:
+        raise ValueError(f"No symbols parsed for index: {index_key}") from last_error
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for sym in symbols:
+        if sym and sym not in seen:
+            seen.add(sym)
+            ordered.append(sym)
+    return ordered
+
+
+def fetch_index_constituents_safe(index_key: str) -> tuple[list[str], str]:
+    """Return (tickers, source) where source is 'wikipedia' or 'fallback'."""
+    try:
+        return fetch_index_constituents(index_key), "wikipedia"
+    except Exception:
+        return list(FALLBACK_SCAN_UNIVERSE), "fallback"
 
 
 def _daily_close_with_smas(hist: pd.DataFrame) -> pd.DataFrame | None:

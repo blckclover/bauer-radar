@@ -1,4 +1,4 @@
-"""Streamlit dashboard — System B scoring + Turnaround Hunter."""
+"""Streamlit dashboard — core financial scoring + turnaround radar."""
 from __future__ import annotations
 
 import pandas as pd
@@ -9,12 +9,14 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 from analyzer_core import (
+    FALLBACK_SCAN_UNIVERSE,
     StockReport,
     TurnaroundOpportunity,
     analyze_symbol,
     detect_trend_signals,
     dividend_chart_df,
     fcf_chart_df,
+    fetch_index_constituents_safe,
     find_turnaround_opportunities,
     reports_to_summary_df,
 )
@@ -34,6 +36,15 @@ GRADE_COLORS = {
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
 SCORE_COLUMNS = ("綜合安全得分", "FCF分", "股息分", "發放率分", "Beta分")
 DEFAULT_HUNTER_UNIVERSE = "AAPL, MSFT, NVDA, INTC, BA, DIS, JNJ, KO"
+SCAN_UNIVERSE_OPTIONS: dict[str, str] = {
+    "🇺🇸 道瓊 30 (Dow 30) - 快速掃描": "dow30",
+    "🦅 納斯達克 100 (Nasdaq 100) - 科技主導": "nasdaq100",
+    "🌍 標普 500 (S&P 500) - 全市場深度掃描": "sp500",
+    "✍️ 自訂輸入 (Custom Input)": "custom",
+}
+SCAN_UNIVERSE_LABELS = list(SCAN_UNIVERSE_OPTIONS.keys())
+HUNTER_SCAN_UNIVERSE_KEY = "hunter_scan_universe_label"
+HUNTER_CUSTOM_INPUT_KEY = "hunter_custom_input"
 WATCHLIST_INPUT_KEY = "watchlist_input"
 
 TREND_BADGE_STYLES: dict[str, tuple[str, str, str, str]] = {
@@ -108,9 +119,15 @@ def _inject_css() -> None:
             background-color: #121212 !important;
         }}
         .block-container {{
-            padding-top: 2rem;
+            padding-top: 3.75rem;
             padding-bottom: 2.5rem;
             max-width: 1480px;
+        }}
+        [data-testid="stMainBlockContainer"] {{
+            padding-top: 0.75rem;
+        }}
+        [data-testid="stAppViewContainer"] .main .block-container {{
+            padding-top: 3.75rem;
         }}
         [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] {{
             gap: 0.85rem;
@@ -454,8 +471,10 @@ def _init_session_state() -> None:
         st.session_state.analyzed_tickers = []
     if WATCHLIST_INPUT_KEY not in st.session_state:
         st.session_state[WATCHLIST_INPUT_KEY] = ""
-    if "hunter_universe_input" not in st.session_state:
-        st.session_state.hunter_universe_input = DEFAULT_HUNTER_UNIVERSE
+    if HUNTER_SCAN_UNIVERSE_KEY not in st.session_state:
+        st.session_state[HUNTER_SCAN_UNIVERSE_KEY] = SCAN_UNIVERSE_LABELS[0]
+    if HUNTER_CUSTOM_INPUT_KEY not in st.session_state:
+        st.session_state[HUNTER_CUSTOM_INPUT_KEY] = DEFAULT_HUNTER_UNIVERSE
     if "hunter_results" not in st.session_state:
         st.session_state.hunter_results = []
     if "hunter_scanned_count" not in st.session_state:
@@ -526,9 +545,29 @@ def _build_reports_map(tickers: list[str]) -> dict[str, StockReport]:
     return reports
 
 
+@st.cache_data(ttl=86400, show_spinner="正在載入成分股清單…")
+def _cached_index_constituents(index_key: str) -> tuple[tuple[str, ...], str]:
+    """Cached Wikipedia index constituents; returns (tickers, source)."""
+    tickers, source = fetch_index_constituents_safe(index_key)
+    return tuple(tickers), source
+
+
+def _resolve_hunter_universe() -> tuple[list[str], str, str]:
+    """Resolve scan tickers from selected universe label."""
+    label = st.session_state.get(HUNTER_SCAN_UNIVERSE_KEY, SCAN_UNIVERSE_LABELS[0])
+    index_key = SCAN_UNIVERSE_OPTIONS.get(label, "dow30")
+
+    if index_key == "custom":
+        parsed = _parse_ticker_list(st.session_state.get(HUNTER_CUSTOM_INPUT_KEY, ""))
+        return parsed, "custom", label
+
+    tickers, source = _cached_index_constituents(index_key)
+    return list(tickers), source, label
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def _cached_trend_signal(symbol: str) -> dict | None:
-    """Cached SMA trend lookup for Hunter tab (does not touch System B state)."""
+    """Cached SMA trend lookup for turnaround radar tab."""
     return detect_trend_signals(symbol)
 
 
@@ -1157,8 +1196,8 @@ def _scroll_to_analysis_section() -> None:
     )
 
 
-def _render_system_b_tab() -> None:
-    """System B passive scoring — summary for user-loaded watchlist."""
+def _render_core_scoring_tab() -> None:
+    """Core financial scoring — summary for user-loaded watchlist."""
     tickers: list[str] = st.session_state.analyzed_tickers
     st.markdown(
         '<p class="subtitle">'
@@ -1244,7 +1283,7 @@ def _render_company_deep_analysis() -> None:
 
 
 def _render_turnaround_hunter_tab() -> None:
-    """Active turnaround screener — unlock buttons feed analyzed_tickers."""
+    """Turnaround radar — index universes or custom list feed analyzed_tickers."""
     st.markdown(
         '<p class="subtitle">'
         "在<strong>市場恐慌（股價大跌）</strong>中，尋找<strong>自由現金流仍為正</strong>的硬事實標的。"
@@ -1257,21 +1296,51 @@ def _render_turnaround_hunter_tab() -> None:
     c2.metric("硬事實", "最新財年 FCF > 0")
     c3.metric("上次命中", len(st.session_state.hunter_results))
 
-    st.markdown("#### 自訂掃描清單")
-    st.text_area(
-        "輸入股票代號（逗號或換行分隔）",
-        height=120,
-        help="例如：AAPL, MSFT, NVDA, INTC … 可自行增刪。",
-        key="hunter_universe_input",
+    st.markdown('<p class="panel-label">選擇掃描母體 (Scan Universe)</p>', unsafe_allow_html=True)
+    selected_label = st.selectbox(
+        "選擇掃描母體 (Scan Universe)",
+        SCAN_UNIVERSE_LABELS,
+        key=HUNTER_SCAN_UNIVERSE_KEY,
+        label_visibility="collapsed",
     )
+    index_key = SCAN_UNIVERSE_OPTIONS[selected_label]
 
-    parsed = _parse_ticker_list(st.session_state.hunter_universe_input)
-    st.caption(f"已解析 **{len(parsed)}** 檔標的：" + (", ".join(parsed) if parsed else "（無）"))
+    if index_key == "custom":
+        st.text_area(
+            "輸入股票代號（逗號或換行分隔）",
+            height=120,
+            placeholder="AAPL, MSFT, NVDA",
+            help="僅在「自訂輸入」模式下使用。",
+            key=HUNTER_CUSTOM_INPUT_KEY,
+        )
+
+    parsed, source, _ = _resolve_hunter_universe()
+
+    if index_key == "custom":
+        preview = ", ".join(parsed[:12]) + (" …" if len(parsed) > 12 else "")
+        st.caption(
+            f"已解析 **{len(parsed)}** 檔自訂標的："
+            + (preview if parsed else "（無）")
+        )
+    else:
+        if source == "fallback":
+            st.caption(
+                f"已載入 **{len(parsed)}** 檔成分股 · 已啟用離線市值前 20 大備用清單"
+            )
+        else:
+            st.caption(f"已載入 **{len(parsed)}** 檔成分股 · 來源：Wikipedia 最新成分股")
+
+    if index_key == "sp500":
+        st.info("⏱ 掃描標普 500 全市場需時約 **1–3 分鐘**，請耐心等候…")
+    elif index_key == "nasdaq100":
+        st.caption("⏱ 掃描納斯達克 100 約需 **30–90 秒**。")
+    elif index_key == "dow30":
+        st.caption("⏱ 道瓊 30 快速掃描，通常 **30 秒內** 完成。")
 
     col_btn, col_hint = st.columns([1, 2])
     with col_btn:
         run_scan = st.button(
-            "開始在垃圾堆中搜尋黃金",
+            "啟動大盤逆向掃描 (Initiate Reversal Scan)",
             type="primary",
             use_container_width=True,
             key="hunter_run_button",
@@ -1281,9 +1350,11 @@ def _render_turnaround_hunter_tab() -> None:
 
     if run_scan:
         if not parsed:
-            st.warning("請至少輸入一個有效股票代號。")
+            st.warning("請至少提供一個有效股票代號，或選擇可載入的指數成分股清單。")
         else:
-            with st.spinner("偵探引擎正在剝離市場噪音，審查核心現金流 facts..."):
+            with st.spinner(
+                f"偵探引擎正在掃描 **{len(parsed)}** 檔標的，剝離市場噪音、審查核心現金流…"
+            ):
                 st.session_state.hunter_results = find_turnaround_opportunities(parsed)
                 st.session_state.hunter_scanned_count = len(parsed)
 
@@ -1351,7 +1422,7 @@ def _render_turnaround_hunter_tab() -> None:
 
 
 def _render_sidebar() -> None:
-    st.sidebar.header("System B 評分")
+    st.sidebar.header("量化評分標準")
     st.sidebar.markdown(
         """
         - **FCF** (40)：連續 5 年為正
@@ -1362,7 +1433,7 @@ def _render_sidebar() -> None:
         **等級**：≥85 🟢 | 70–84 🟡 | <70 🔴
         """
     )
-    st.sidebar.header("Turnaround Hunter")
+    st.sidebar.header("逆向轉機股雷達")
     st.sidebar.markdown(
         """
         1. 半年股價跌幅 **> 15%**
@@ -1382,10 +1453,11 @@ def _render_sidebar() -> None:
     st.sidebar.markdown(
         f"**已載入深度分析**：{len(st.session_state.get('analyzed_tickers', []))} 檔"
     )
-    if st.sidebar.button("清除 System B 快取"):
+    if st.sidebar.button("清除快取資料"):
         load_report_for_symbol.clear()
         _validate_ticker_symbol.clear()
         _fetch_market_history.clear()
+        _cached_index_constituents.clear()
         st.rerun()
 
 
@@ -1401,13 +1473,13 @@ def main() -> None:
 
     tab_score, tab_hunter = st.tabs(
         [
-            "📊 System B · 實戰持股評分",
-            "🛡️ 逆向轉機股雷達 (Turnaround Hunter)",
+            "📊 核心財務評分",
+            "🛡️ 逆向轉機股雷達",
         ]
     )
 
     with tab_score:
-        _render_system_b_tab()
+        _render_core_scoring_tab()
 
     with tab_hunter:
         _render_turnaround_hunter_tab()

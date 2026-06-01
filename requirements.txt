@@ -8,7 +8,8 @@ yfinance>=0.2.40
 
 # --- Streamlit dashboard (app.py) ---
 streamlit>=1.32.0
-plotly>=5.18.0
+lxml>=4.9.0
+html5lib>=1.1
 
 # --- CLI terminal output (analyze_dividend_screen.py) ---
 rich>=13.0.0
