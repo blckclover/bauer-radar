@@ -9,13 +9,16 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-# Portfolio groups (Direction B)
-TICKER_GROUPS: dict[str, tuple[str, ...]] = {
-    "柏立推薦組": ("PFE", "GIS", "FLO"),
-    "父親自選組": ("NOK", "NVO"),
-}
-TICKERS: tuple[str, ...] = tuple(
-    sym for group in TICKER_GROUPS.values() for sym in group
+# Neutral default universe for CLI / cron when no custom list is supplied
+DEFAULT_SCAN_UNIVERSE: tuple[str, ...] = (
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "JNJ",
+    "KO",
+    "INTC",
+    "BA",
+    "DIS",
 )
 
 YEARS_REQUIRED = 5
@@ -33,8 +36,6 @@ CAPEX_TAGS = (
     "PaymentsToAcquirePropertyPlantAndEquipment",
     "PaymentsToAcquireProductiveAssets",
 )
-
-GROWTH_ORIENTED_TICKERS = frozenset({"NOK", "NVO"})
 
 # Turnaround screener (System B → active fact-finding)
 TURNAROUND_LOOKBACK = "6mo"
@@ -123,7 +124,6 @@ class ScoreDetail:
 class StockReport:
     symbol: str
     company_name: str
-    portfolio_group: str
     fcf_history: list[YearFCF] = field(default_factory=list)
     div_history: list[YearDividend] = field(default_factory=list)
     payout_ratio: float | None = None
@@ -145,14 +145,6 @@ class StockReport:
         if self.total_score <= 0 and not self.score_details:
             return None
         return self.total_score >= 70
-
-
-def ticker_group(symbol: str) -> str:
-    sym = symbol.upper()
-    for group, symbols in TICKER_GROUPS.items():
-        if sym in symbols:
-            return group
-    return "未分類"
 
 
 @lru_cache(maxsize=1)
@@ -803,36 +795,10 @@ def evaluate_dividends(history: list[YearDividend]) -> tuple[bool | None, str]:
     return False, "Dividend growth streak broken"
 
 
-def _growth_vs_defense_note(symbol: str, report: "StockReport") -> list[str]:
-    lines: list[str] = []
-    if symbol not in GROWTH_ORIENTED_TICKERS:
-        return lines
-
-    if symbol == "NOK":
-        lines.extend(
-            [
-                "**NOK（諾基亞）— 成長/趨勢 vs 傳統高股息防禦**",
-                "- 父親自選組定位偏 **5G/網路基建轉型與股價趨勢**，並非典型「高股息貴族」防禦標的。",
-                "- 股息提供 **現金回饋緩衝**，但核心投資邏輯應看 **營運轉型、訂單能見度與 FCF 修復**，而非僅看殖利率。",
-                "- 若 FCF 分項偏低，常反映 **資本支出與轉型投入** 壓力，需與傳統消費防禦股（如 GIS/FLO）區分看待。",
-            ]
-        )
-    elif symbol == "NVO":
-        lines.extend(
-            [
-                "**NVO（諾和諾德）— 成長/趨勢 vs 傳統高股息防禦**",
-                "- 屬 **成長型醫療龍頭**（GLP-1 等），市場給予高成長溢價，**發放率往往偏低**（留存再投資）。",
-                "- 與柏立組的 **PFE/GIS/FLO** 不同：高分來自 **獲利成長帶動股價**，而非高現金殖利率防禦。",
-                "- 評分上可能「股息成長」尚可，但 **發放率分項** 常落在 10%–29%（15 分）— 這是成長股常態，非警訊。",
-            ]
-        )
-    return lines
-
-
 def build_analyst_commentary(report: StockReport) -> str:
     sections: list[str] = [
         "### AI 首席分析師決策點評",
-        f"**{report.symbol} · {report.company_name}**（{report.portfolio_group}）",
+        f"**{report.symbol} · {report.company_name}**",
         f"**綜合安全得分：{report.total_score:.1f} / 100** — {report.grade_emoji} {report.grade_label}",
         "",
         "#### 評分明細（微觀原因）",
@@ -866,19 +832,10 @@ def build_analyst_commentary(report: StockReport) -> str:
 
     sections.append("")
     sections.append("#### 投資風格提示")
-    growth_notes = _growth_vs_defense_note(report.symbol, report)
-    if growth_notes:
-        sections.extend(growth_notes)
-    elif report.portfolio_group == "柏立推薦組":
-        sections.append(
-            "- **柏立推薦組** 偏重 **現金流穩健 + 股息紀律** 的防禦型配置，"
-            "適合與父親自選的成長標的做組合平衡。"
-        )
-    else:
-        sections.append(
-            "- 建議將本分數與 **產業景氣、估值與持倉成本** 一併考量；"
-            "100 分制為財務紀律篩選，非買賣訊號。"
-        )
+    sections.append(
+        "- 100 分制衡量 **FCF 紀律、股息成長、發放率與 Beta**；"
+        "建議與 **產業景氣、估值與個人風險偏好** 一併考量，非直接買賣訊號。"
+    )
 
     if report.total_score >= 85:
         sections.append(
@@ -920,7 +877,6 @@ def analyze_symbol(symbol: str) -> StockReport:
     ticker = yf.Ticker(sym)
     info = _safe_ticker_info(ticker, sym)
     name = _company_name(info, sym)
-    group = ticker_group(sym)
 
     fcf_rows = fetch_fcf(sym)
     div_rows = fetch_dividends(sym, ticker=ticker)
@@ -935,7 +891,6 @@ def analyze_symbol(symbol: str) -> StockReport:
     report = StockReport(
         symbol=sym,
         company_name=name,
-        portfolio_group=group,
         fcf_history=fcf_rows,
         div_history=div_rows,
         payout_ratio=payout,
@@ -954,8 +909,19 @@ def analyze_symbol(symbol: str) -> StockReport:
     return report
 
 
-def analyze_all() -> list[StockReport]:
-    return [analyze_symbol(sym) for sym in TICKERS]
+def analyze_all(symbols: list[str] | tuple[str, ...] | None = None) -> list[StockReport]:
+    """Analyze a user-supplied symbol list; returns empty when none provided."""
+    if not symbols:
+        return []
+    seen: set[str] = set()
+    reports: list[StockReport] = []
+    for raw in symbols:
+        sym = raw.upper().strip()
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        reports.append(analyze_symbol(sym))
+    return reports
 
 
 def reports_to_summary_df(reports: list[StockReport]) -> pd.DataFrame:
@@ -963,7 +929,6 @@ def reports_to_summary_df(reports: list[StockReport]) -> pd.DataFrame:
     for r in reports:
         rows.append(
             {
-                "組別": r.portfolio_group,
                 "Ticker": r.symbol,
                 "Company": r.company_name,
                 "綜合安全得分": r.total_score,

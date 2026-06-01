@@ -11,7 +11,7 @@ import requests
 from google import genai
 
 from analyzer_core import (
-    TICKERS,
+    DEFAULT_SCAN_UNIVERSE,
     TurnaroundOpportunity,
     detect_trend_signals,
     find_turnaround_opportunities,
@@ -86,10 +86,10 @@ def _fmt_money_large(value: float | None) -> str:
 
 
 def build_scan_universe() -> list[str]:
-    """Merge portfolio TICKERS with large-cap extras; dedupe while preserving order."""
+    """Merge default scan universe with large-cap extras; dedupe while preserving order."""
     seen: set[str] = set()
     universe: list[str] = []
-    for sym in (*TICKERS, *LARGE_CAP_EXTRAS):
+    for sym in (*DEFAULT_SCAN_UNIVERSE, *LARGE_CAP_EXTRAS):
         token = sym.upper().strip()
         if token and token not in seen:
             seen.add(token)

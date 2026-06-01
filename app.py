@@ -4,14 +4,13 @@ from __future__ import annotations
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
+from plotly.subplots import make_subplots
 
 from analyzer_core import (
-    TICKERS,
-    TICKER_GROUPS,
     StockReport,
     TurnaroundOpportunity,
-    analyze_all,
     analyze_symbol,
     detect_trend_signals,
     dividend_chart_df,
@@ -21,7 +20,7 @@ from analyzer_core import (
 )
 
 st.set_page_config(
-    page_title="實戰持股安全儀表板",
+    page_title="股息安全分析儀表板",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -34,8 +33,8 @@ GRADE_COLORS = {
 }
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
 SCORE_COLUMNS = ("綜合安全得分", "FCF分", "股息分", "發放率分", "Beta分")
-DEFAULT_HUNTER_UNIVERSE = "PFE, GIS, FLO, NOK, NVO, INTC, BA, DIS"
-DEFAULT_ANALYZED_TICKERS = ["PFE", "GIS", "FLO", "NOK", "NVO"]
+DEFAULT_HUNTER_UNIVERSE = "AAPL, MSFT, NVDA, INTC, BA, DIS, JNJ, KO"
+WATCHLIST_INPUT_KEY = "watchlist_input"
 
 TREND_BADGE_STYLES: dict[str, tuple[str, str, str, str]] = {
     "Buy": ("#15803d", "#dcfce7", "🟢", "BUY · 右側動能確認（建議進場）"),
@@ -43,13 +42,30 @@ TREND_BADGE_STYLES: dict[str, tuple[str, str, str, str]] = {
     "Wait": ("#1d4ed8", "#dbeafe", "🔵", "WAIT · 底部觀察中（請勿接刀）"),
     "Hold": ("#b45309", "#fef3c7", "🟡", "HOLD · 趨勢穩定持有"),
 }
-TECH_CHART_PERIOD = "1y"
 TECH_SMA_SHORT = 20
 TECH_SMA_LONG = 50
-TECH_COLOR_SMA20 = "#eab308"
-TECH_COLOR_SMA50 = "#ef4444"
-TECH_DARK_PAPER = "#0f172a"
-TECH_DARK_PLOT = "#1e293b"
+TECH_COLOR_CLOSE = "#00d2d3"
+TECH_COLOR_CLOSE_FILL = "rgba(0, 210, 211, 0.22)"
+TECH_COLOR_SMA20 = "rgba(234, 179, 8, 0.55)"
+TECH_COLOR_SMA50 = "rgba(239, 68, 68, 0.55)"
+TECH_DARK_BG = "#0f172a"
+TECH_DARK_CARD = "#1e293b"
+TECH_ACCENT = "#14b8a6"
+TECH_CHART_HEIGHT = 680
+TECH_CHART_HEIGHT_VOL = 720
+FREQ_OPTIONS = ["日線 (Daily)", "週線 (Weekly)", "月線 (Monthly)"]
+INDICATOR_OPTIONS = [
+    "SMA 20/50",
+    "EMA 12/26/9",
+    "成交量 (Volume)",
+    "布林通道 (Bollinger Bands)",
+]
+FREQ_YF_MAP: dict[str, tuple[str, str]] = {
+    "日線 (Daily)": ("1d", "1y"),
+    "週線 (Weekly)": ("1wk", "2y"),
+    "月線 (Monthly)": ("1mo", "max"),
+}
+COMPANY_TAB_KEY = "company_tab_radio"
 
 
 def _fmt1(value: float | None) -> str:
@@ -71,20 +87,219 @@ def _fmt_money_large(value: float | None) -> str:
 
 def _inject_css() -> None:
     st.markdown(
-        """
+        f"""
         <style>
-        .main-title { font-size: 2rem; font-weight: 700; margin-bottom: 0.25rem; }
-        .subtitle { color: #64748b; margin-bottom: 1.25rem; }
-        div[data-testid="stMetric"] {
-            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
-            padding: 1rem; border-radius: 0.75rem; border: 1px solid #e2e8f0;
-        }
-        .panic-tag {
-            color: #dc2626; font-weight: 800; font-size: 1.05rem;
-        }
-        .trend-facts {
-            color: #475569; font-size: 0.92rem; margin-top: 0.35rem;
-        }
+        :root {{
+            --bg-base: #0f172a;
+            --bg-card: #1e293b;
+            --accent: {TECH_ACCENT};
+            --accent-soft: rgba(20, 184, 166, 0.14);
+            --text-muted: #94a3b8;
+            --border-subtle: rgba(148, 163, 184, 0.1);
+        }}
+        .stApp, [data-testid="stAppViewContainer"] {{
+            background-color: var(--bg-base) !important;
+        }}
+        section[data-testid="stSidebar"] {{
+            background-color: #121212 !important;
+            border-right: 1px solid var(--border-subtle) !important;
+        }}
+        section[data-testid="stSidebar"] > div {{
+            background-color: #121212 !important;
+        }}
+        .block-container {{
+            padding-top: 2rem;
+            padding-bottom: 2.5rem;
+            max-width: 1480px;
+        }}
+        [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] {{
+            gap: 0.85rem;
+        }}
+        [data-testid="stTabs"] {{
+            margin-top: 0.5rem;
+            margin-bottom: 1.25rem;
+        }}
+        div[data-testid="stVerticalBlockBorderWrapper"] {{
+            background: var(--bg-card) !important;
+            border: 1px solid var(--border-subtle) !important;
+            border-radius: 8px !important;
+            padding: 0.75rem 1rem !important;
+            margin-bottom: 1rem !important;
+        }}
+        .main-title {{
+            font-size: 1.55rem;
+            font-weight: 700;
+            margin-bottom: 0.35rem;
+            letter-spacing: -0.02em;
+            color: #f1f5f9;
+        }}
+        .subtitle {{
+            color: var(--text-muted);
+            font-size: 0.92rem;
+            margin-bottom: 1.35rem;
+            line-height: 1.55;
+        }}
+        h2, h3, h4, h5 {{
+            letter-spacing: -0.01em;
+            color: #e2e8f0;
+        }}
+        [data-testid="stTabs"] button p {{
+            font-size: 0.92rem;
+        }}
+        div[data-testid="stMetric"] {{
+            background: var(--bg-card);
+            padding: 0.85rem 1rem;
+            border-radius: 8px;
+            border: none;
+            margin-bottom: 0.35rem;
+            box-shadow: inset 0 0 0 1px var(--border-subtle);
+        }}
+        div[data-testid="stMetric"] label {{
+            color: var(--text-muted) !important;
+            font-size: 0.78rem !important;
+        }}
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
+            font-size: 1.1rem !important;
+            white-space: normal !important;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            line-height: 1.25;
+            color: #f1f5f9 !important;
+        }}
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] > div {{
+            overflow: visible !important;
+            text-overflow: unset !important;
+        }}
+        div.stButton > button {{
+            border-radius: 8px !important;
+            font-weight: 600 !important;
+            letter-spacing: 0.01em;
+            transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease,
+                box-shadow 0.2s ease !important;
+            border: 1px solid var(--border-subtle) !important;
+            background: #1a2332 !important;
+            color: #cbd5e1 !important;
+        }}
+        div.stButton > button:hover {{
+            border-color: rgba(20, 184, 166, 0.45) !important;
+            background: rgba(30, 41, 59, 0.95) !important;
+            color: #e2e8f0 !important;
+        }}
+        div.stButton > button[kind="primary"],
+        div.stButton > button[data-testid="baseButton-primary"] {{
+            background: var(--accent-soft) !important;
+            color: #5eead4 !important;
+            border: 1px solid var(--accent) !important;
+        }}
+        div.stButton > button[kind="primary"]:hover,
+        div.stButton > button[data-testid="baseButton-primary"]:hover {{
+            background: rgba(20, 184, 166, 0.24) !important;
+            border-color: #2dd4bf !important;
+            color: #99f6e4 !important;
+            box-shadow: 0 0 0 1px rgba(45, 212, 191, 0.15) !important;
+        }}
+        div[data-testid="stDataFrame"] div[data-testid="StyledFullScreenFrame"] {{
+            border: none !important;
+            background: transparent !important;
+        }}
+        div[data-testid="stDataFrame"] [data-testid="stTable"] {{
+            font-size: 0.86rem;
+        }}
+        div[data-testid="stDataFrame"] th, div[data-testid="stDataFrame"] td {{
+            white-space: normal !important;
+            word-break: break-word;
+        }}
+        .section-card {{
+            background: var(--bg-card);
+            border-radius: 8px;
+            padding: 0.85rem 1rem;
+            margin-bottom: 0.85rem;
+            box-shadow: inset 0 0 0 1px var(--border-subtle);
+        }}
+        .trend-tag {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.35rem 0.65rem;
+            border-radius: 999px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+            margin-bottom: 0.5rem;
+        }}
+        .trend-facts {{
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            line-height: 1.55;
+            margin-top: 0.35rem;
+        }}
+        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stMarkdownContainer"] h3 {{
+            font-size: 0.95rem !important;
+            color: #e2e8f0 !important;
+            margin: 0.65rem 0 0.35rem !important;
+        }}
+        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stMarkdownContainer"] h4 {{
+            font-size: 0.88rem !important;
+            color: var(--text-muted) !important;
+            margin: 0.55rem 0 0.25rem !important;
+        }}
+        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stMarkdownContainer"] p,
+        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stMarkdownContainer"] li {{
+            color: #cbd5e1;
+            font-size: 0.86rem;
+            line-height: 1.65;
+        }}
+        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stMarkdownContainer"] strong {{
+            color: #f1f5f9;
+        }}
+        div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stMarkdownContainer"] blockquote {{
+            border-left: 3px solid var(--accent);
+            padding-left: 0.75rem;
+            color: var(--text-muted);
+            margin: 0.5rem 0;
+        }}
+        .panic-tag {{
+            color: #f87171;
+            font-weight: 700;
+            font-size: 0.95rem;
+        }}
+        .panel-label {{
+            color: #64748b;
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin-bottom: 0.45rem;
+        }}
+        div[data-testid="stRadio"] > div {{
+            gap: 0.45rem !important;
+            flex-wrap: wrap;
+            margin-bottom: 0.75rem;
+        }}
+        div[data-testid="stRadio"] label {{
+            background: var(--bg-card) !important;
+            border-radius: 8px !important;
+            padding: 0.4rem 0.8rem !important;
+            border: 1px solid var(--border-subtle) !important;
+            font-size: 0.85rem !important;
+        }}
+        div[data-testid="stDataFrame"] {{
+            border: none !important;
+            margin-bottom: 0.75rem;
+        }}
+        hr {{
+            margin: 1.5rem 0 !important;
+            border-color: var(--border-subtle) !important;
+        }}
+        [data-testid="stExpander"] {{
+            border: 1px solid var(--border-subtle) !important;
+            border-radius: 8px !important;
+            background: var(--bg-card) !important;
+            margin-top: 1rem;
+        }}
+        div[data-testid="stAlert"] {{
+            border-radius: 8px !important;
+            border: 1px solid var(--border-subtle) !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -122,30 +337,51 @@ def _style_summary_table(df: pd.DataFrame):
         except (TypeError, ValueError):
             return ""
         if v >= 85:
-            bg = GRADE_COLORS["頂級穩健"]
+            color = "#4ade80"
         elif v >= 70:
-            bg = GRADE_COLORS["良好"]
+            color = "#facc15"
         else:
-            bg = GRADE_COLORS["高風險"]
-        return f"background-color: {bg}; color: white; font-weight: 700; text-align: center;"
+            color = "#f87171"
+        return f"color: {color}; font-weight: 700; text-align: center;"
 
     def color_grade(val):
         text = str(val)
         if "頂級" in text:
-            bg = GRADE_COLORS["頂級穩健"]
+            color = "#4ade80"
         elif "良好" in text:
-            bg = GRADE_COLORS["良好"]
+            color = "#facc15"
         else:
-            bg = GRADE_COLORS["高風險"]
-        return f"background-color: {bg}; color: white; font-weight: 600; text-align: center;"
+            color = "#f87171"
+        return f"color: {color}; font-weight: 600; text-align: center;"
 
     styled = df.style.map(color_score, subset=["綜合安全得分"]).map(
         color_grade, subset=["等級"]
     )
     return styled.set_table_styles(
         [
-            {"selector": "th", "props": [("background-color", "#1e293b"), ("color", "white")]},
-            {"selector": "td", "props": [("text-align", "center")]},
+            {
+                "selector": "th",
+                "props": [
+                    ("background-color", "#1e293b"),
+                    ("color", "#94a3b8"),
+                    ("font-weight", "600"),
+                    ("font-size", "0.82rem"),
+                    ("border", "none"),
+                    ("padding", "8px 12px"),
+                ],
+            },
+            {
+                "selector": "td",
+                "props": [
+                    ("text-align", "center"),
+                    ("background-color", "#0f172a"),
+                    ("color", "#e2e8f0"),
+                    ("border", "none"),
+                    ("padding", "8px 12px"),
+                    ("font-size", "0.88rem"),
+                ],
+            },
+            {"selector": "table", "props": [("border-collapse", "collapse")]},
         ]
     )
 
@@ -192,48 +428,101 @@ def _style_turnaround_table(df: pd.DataFrame):
     )
 
 
-@st.cache_data(ttl=3600, show_spinner="正在抓取 SEC EDGAR、股息與評分數據…")
-def load_reports() -> list[StockReport]:
-    """Cached batch load for core portfolio (System B summary table)."""
-    return analyze_all()
+@st.cache_data(ttl=3600, show_spinner=False)
+def _validate_ticker_symbol(symbol: str) -> bool:
+    """Return True if yfinance returns non-empty ~1M daily history for the symbol."""
+    try:
+        sym = symbol.upper().strip()
+        if not sym:
+            return False
+        hist = yf.Ticker(sym).history(period="1mo", interval="1d")
+        if hist is None or hist.empty:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_report_for_symbol(symbol: str) -> StockReport:
-    """Per-symbol cache for dynamically unlocked tickers (e.g. Hunter hits)."""
+    """Per-symbol cache for user watchlist / Hunter unlocks."""
     return analyze_symbol(symbol.upper())
 
 
 def _init_session_state() -> None:
     if "analyzed_tickers" not in st.session_state:
-        st.session_state.analyzed_tickers = list(DEFAULT_ANALYZED_TICKERS)
+        st.session_state.analyzed_tickers = []
+    if WATCHLIST_INPUT_KEY not in st.session_state:
+        st.session_state[WATCHLIST_INPUT_KEY] = ""
     if "hunter_universe_input" not in st.session_state:
         st.session_state.hunter_universe_input = DEFAULT_HUNTER_UNIVERSE
     if "hunter_results" not in st.session_state:
         st.session_state.hunter_results = []
     if "hunter_scanned_count" not in st.session_state:
         st.session_state.hunter_scanned_count = 0
+    if "focus_ticker" not in st.session_state:
+        st.session_state.focus_ticker = None
+    if "scroll_to_analysis" not in st.session_state:
+        st.session_state.scroll_to_analysis = False
 
 
 def _unlock_ticker_for_analysis(symbol: str) -> None:
     sym = symbol.upper().strip()
-    if sym and sym not in st.session_state.analyzed_tickers:
+    if not sym:
+        return
+    if sym not in st.session_state.analyzed_tickers:
+        if not _validate_ticker_symbol(sym):
+            st.error(f"⚠️ 找不到代碼 {sym} 或該代碼已下市，請確認後重新輸入。")
+            return
         st.session_state.analyzed_tickers.append(sym)
+    st.session_state.focus_ticker = sym
+    st.session_state[COMPANY_TAB_KEY] = sym
+    st.session_state.scroll_to_analysis = True
+    st.rerun()
+
+
+def _load_watchlist_tickers() -> None:
+    """Parse watchlist input, validate tickers, append only valid symbols."""
+    parsed = _parse_ticker_list(st.session_state.get(WATCHLIST_INPUT_KEY, ""))
+    if not parsed:
+        st.warning("請輸入至少一個有效股票代號（以逗號分隔）。")
+        return
+
+    to_validate = [sym for sym in parsed if sym not in st.session_state.analyzed_tickers]
+    valid_new: list[str] = []
+    invalid: list[str] = []
+
+    for sym in to_validate:
+        if _validate_ticker_symbol(sym):
+            valid_new.append(sym)
+        else:
+            invalid.append(sym)
+
+    for sym in invalid:
+        st.error(f"⚠️ 找不到代碼 {sym} 或該代碼已下市，請確認後重新輸入。")
+
+    if not valid_new:
+        if not invalid and parsed:
+            st.info("清單中的標的皆已在深度分析中。")
+        return
+
+    for sym in valid_new:
+        st.session_state.analyzed_tickers.append(sym)
+
+    st.session_state.focus_ticker = valid_new[0]
+    st.session_state[COMPANY_TAB_KEY] = valid_new[0]
+    st.session_state.scroll_to_analysis = True
     st.rerun()
 
 
 def _build_reports_map(tickers: list[str]) -> dict[str, StockReport]:
-    """Merge core cached reports with per-symbol loads for unlocked extras."""
-    core_map = {r.symbol: r for r in load_reports()}
+    """Load cached per-symbol reports for the active watchlist."""
     reports: dict[str, StockReport] = {}
     for raw in tickers:
         sym = raw.upper().strip()
         if not sym:
             continue
-        if sym in core_map:
-            reports[sym] = core_map[sym]
-        else:
-            reports[sym] = load_report_for_symbol(sym)
+        reports[sym] = load_report_for_symbol(sym)
     return reports
 
 
@@ -253,13 +542,14 @@ def _fmt_price(value: float | str | None) -> str:
 
 
 def _render_trend_signal_block(trend: dict | None) -> None:
-    """Render right-side trend badge + hard price facts."""
-    st.markdown("#### 📈 右側動態趨勢")
+    """Render compact right-side trend tag + price facts."""
+    st.markdown('<p class="panel-label">右側動態趨勢</p>', unsafe_allow_html=True)
 
     if not trend:
         st.markdown(
-            '<div style="background:#f1f5f9; padding:0.75rem 1rem; border-radius:0.5rem; '
-            'color:#64748b;">趨勢數據不足，無法計算 SMA 20/50 交叉訊號。</div>',
+            '<div class="section-card" style="color:#64748b;font-size:0.85rem;">'
+            "趨勢數據不足，無法計算 SMA 20/50 交叉訊號。"
+            "</div>",
             unsafe_allow_html=True,
         )
         return
@@ -269,11 +559,9 @@ def _render_trend_signal_block(trend: dict | None) -> None:
 
     st.markdown(
         f"""
-        <div style="background:{bg}; border-left: 5px solid {border};
-             padding: 0.85rem 1rem; border-radius: 0.5rem; margin-bottom: 0.25rem;">
-          <span style="color:{border}; font-weight: 800; font-size: 1.08rem;">
-            {emoji} {label}
-          </span>
+        <div class="trend-tag" style="background:{bg}; color:{border};
+             box-shadow: inset 0 0 0 1px {border}33;">
+          {emoji} {label}
         </div>
         """,
         unsafe_allow_html=True,
@@ -281,14 +569,16 @@ def _render_trend_signal_block(trend: dict | None) -> None:
 
     as_of = trend.get("as_of_date") or "—"
     st.markdown(
-        f"當前現價: **{_fmt_price(trend.get('current_price'))}** | "
-        f"20日均線: **{_fmt_price(trend.get('sma_20'))}** | "
-        f"50日防禦線: **{_fmt_price(trend.get('sma_50'))}** "
-        f"(數據截至: {as_of})"
+        f'<p class="trend-facts">'
+        f"現價 <strong>{_fmt_price(trend.get('current_price'))}</strong> · "
+        f"SMA20 <strong>{_fmt_price(trend.get('sma_20'))}</strong> · "
+        f"SMA50 <strong>{_fmt_price(trend.get('sma_50'))}</strong><br>"
+        f"截至 {as_of}</p>",
+        unsafe_allow_html=True,
     )
 
 
-def _fcf_bar_chart(report: StockReport) -> go.Figure:
+def _fcf_bar_chart(report: StockReport, *, height: int = 400) -> go.Figure:
     df = fcf_chart_df(report)
     unit = "Billions USD"
     y_vals = df["FCF (USD billions)"]
@@ -314,134 +604,413 @@ def _fcf_bar_chart(report: StockReport) -> go.Figure:
         ]
     )
     fig.update_layout(
-        title=f"{report.symbol} — 自由現金流 FCF",
-        xaxis_title="Fiscal Year",
+        title=dict(text="自由現金流 FCF", font=dict(size=13, color="#94a3b8")),
+        xaxis_title="",
         yaxis_title=unit,
-        template="plotly_white",
-        height=400,
-        margin=dict(t=50, b=40),
+        template="plotly_dark",
+        paper_bgcolor=TECH_DARK_CARD,
+        plot_bgcolor=TECH_DARK_CARD,
+        height=height,
+        margin=dict(t=36, b=28, l=40, r=16),
+        showlegend=False,
     )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor="#334155", zeroline=False)
     return fig
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def _fetch_daily_ohlc(symbol: str, period: str = TECH_CHART_PERIOD) -> pd.DataFrame | None:
-    """Fetch daily OHLC for technical chart; returns None on any failure."""
+def _fetch_market_history(
+    symbol: str, interval: str, period: str
+) -> pd.DataFrame | None:
+    """Fetch OHLCV history for technical chart; returns None on any failure."""
     try:
         sym = symbol.upper().strip()
-        hist = yf.Ticker(sym).history(period=period, interval="1d")
+        hist = yf.Ticker(sym).history(period=period, interval=interval)
         if hist is None or hist.empty:
             return None
         cols = ["Open", "High", "Low", "Close"]
         if not all(c in hist.columns for c in cols):
             return None
-        df = hist[cols].copy().dropna()
-        if len(df) < TECH_SMA_LONG:
+        df = hist[cols].copy()
+        if "Volume" in hist.columns:
+            df["Volume"] = hist["Volume"]
+        df = df.dropna(subset=["Close"])
+        if df.empty:
             return None
         return df
     except Exception:
         return None
 
 
-def render_technical_chart(symbol: str) -> go.Figure | None:
-    """
-    Daily candlestick + SMA20 / SMA50 for the last ~6–12 months.
+def _min_bars_for_indicators(indicators: list[str]) -> int:
+    need = 1
+    if "SMA 20/50" in indicators:
+        need = max(need, TECH_SMA_LONG)
+    if "EMA 12/26/9" in indicators:
+        need = max(need, 26)
+    if "布林通道 (Bollinger Bands)" in indicators:
+        need = max(need, 20)
+    return need
 
-    Aligns visually with detect_trend_signals badge logic (SMA20 vs SMA50).
-    Returns None if data is unavailable — callers must handle gracefully.
+
+def _compute_chart_indicators(df: pd.DataFrame, indicators: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    if "SMA 20/50" in indicators:
+        out["SMA20"] = out["Close"].rolling(TECH_SMA_SHORT).mean()
+        out["SMA50"] = out["Close"].rolling(TECH_SMA_LONG).mean()
+    if "EMA 12/26/9" in indicators:
+        out["EMA12"] = out["Close"].ewm(span=12, adjust=False).mean()
+        out["EMA26"] = out["Close"].ewm(span=26, adjust=False).mean()
+        out["EMA9"] = out["Close"].ewm(span=9, adjust=False).mean()
+    if "布林通道 (Bollinger Bands)" in indicators:
+        out["BB_MID"] = out["Close"].rolling(20).mean()
+        bb_std = out["Close"].rolling(20).std()
+        out["BB_UPPER"] = out["BB_MID"] + 2 * bb_std
+        out["BB_LOWER"] = out["BB_MID"] - 2 * bb_std
+    return out
+
+
+def _drop_indicator_warmup(df: pd.DataFrame, indicators: list[str]) -> pd.DataFrame:
+    subset = ["Close"]
+    if "SMA 20/50" in indicators:
+        subset.extend(["SMA20", "SMA50"])
+    if "EMA 12/26/9" in indicators:
+        subset.extend(["EMA12", "EMA26", "EMA9"])
+    if "布林通道 (Bollinger Bands)" in indicators:
+        subset.extend(["BB_MID", "BB_UPPER", "BB_LOWER"])
+    existing = [c for c in subset if c in df.columns]
+    if not existing:
+        return df
+    return df.dropna(subset=existing)
+
+
+def _price_range_columns(df: pd.DataFrame, indicators: list[str]) -> list[str]:
+    cols = ["Close"]
+    if "SMA 20/50" in indicators:
+        cols.extend(["SMA20", "SMA50"])
+    if "EMA 12/26/9" in indicators:
+        cols.extend(["EMA12", "EMA26", "EMA9"])
+    if "布林通道 (Bollinger Bands)" in indicators:
+        cols.extend(["BB_UPPER", "BB_LOWER", "BB_MID"])
+    return [c for c in cols if c in df.columns]
+
+
+def render_technical_chart(
+    symbol: str,
+    frequency: str = "日線 (Daily)",
+    indicators: list[str] | None = None,
+) -> go.Figure | None:
     """
+    Close-price area chart with optional overlays and volume subplot.
+
+    Supports daily / weekly / monthly intervals via yfinance, range selector
+    (1M/3M/6M/YTD/1Y), and dynamic indicator toggles.
+    """
+    if indicators is None:
+        indicators = ["SMA 20/50"]
     try:
         sym = symbol.upper().strip()
-        ohlc = _fetch_daily_ohlc(sym)
-        if ohlc is None or ohlc.empty:
+        interval, period = FREQ_YF_MAP.get(frequency, ("1d", "1y"))
+        raw = _fetch_market_history(sym, interval, period)
+        if raw is None or raw.empty:
+            return None
+        if len(raw) < _min_bars_for_indicators(indicators):
             return None
 
-        df = ohlc.copy()
-        df["SMA20"] = df["Close"].rolling(TECH_SMA_SHORT).mean()
-        df["SMA50"] = df["Close"].rolling(TECH_SMA_LONG).mean()
-        df = df.dropna(subset=["SMA50"])
+        df = _compute_chart_indicators(raw, indicators)
+        df = _drop_indicator_warmup(df, indicators)
         if df.empty:
             return None
 
-        fig = go.Figure()
-        fig.add_trace(
-            go.Candlestick(
-                x=df.index,
-                open=df["Open"],
-                high=df["High"],
-                low=df["Low"],
-                close=df["Close"],
-                name="日K",
-                increasing_line_color="#22c55e",
-                increasing_fillcolor="#22c55e",
-                decreasing_line_color="#ef4444",
-                decreasing_fillcolor="#ef4444",
-            )
+        end_dt = pd.Timestamp(df.index[-1])
+        default_start = end_dt - pd.DateOffset(months=3)
+        if default_start < pd.Timestamp(df.index[0]):
+            default_start = pd.Timestamp(df.index[0])
+
+        price_cols = _price_range_columns(df, indicators)
+        y_min = float(df[price_cols].min().min()) * 0.95
+        y_max = float(df[price_cols].max().max()) * 1.05
+
+        show_volume = "成交量 (Volume)" in indicators and "Volume" in df.columns
+        range_selector = dict(
+            buttons=[
+                dict(count=1, label="1M", step="month", stepmode="backward"),
+                dict(count=3, label="3M", step="month", stepmode="backward"),
+                dict(count=6, label="6M", step="month", stepmode="backward"),
+                dict(step="year", stepmode="todate", label="YTD"),
+                dict(step="all", label="1Y"),
+            ],
+            bgcolor=TECH_DARK_BG,
+            activecolor="#475569",
+            bordercolor="#64748b",
+            borderwidth=1,
+            font=dict(color="#e2e8f0", size=11),
+            x=0,
+            y=-0.2,
+            xanchor="left",
+            yanchor="top",
         )
-        fig.add_trace(
+
+        if show_volume:
+            fig = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.04,
+                row_heights=[0.72, 0.28],
+            )
+            price_row, vol_row = 1, 2
+            chart_height = TECH_CHART_HEIGHT_VOL
+        else:
+            fig = go.Figure()
+            price_row, vol_row = None, None
+            chart_height = TECH_CHART_HEIGHT
+
+        def _add_price_trace(trace: go.Scatter) -> None:
+            if show_volume:
+                fig.add_trace(trace, row=price_row, col=1)
+            else:
+                fig.add_trace(trace)
+
+        _add_price_trace(
             go.Scatter(
                 x=df.index,
-                y=df["SMA20"],
+                y=df["Close"],
                 mode="lines",
-                name="SMA20 短期",
-                line=dict(color=TECH_COLOR_SMA20, width=1.8),
+                name="收盤價",
+                line=dict(color=TECH_COLOR_CLOSE, width=2),
+                fill="tozeroy",
+                fillcolor=TECH_COLOR_CLOSE_FILL,
             )
         )
-        fig.add_trace(
-            go.Scatter(
-                x=df.index,
-                y=df["SMA50"],
-                mode="lines",
-                name="SMA50 中期防線",
-                line=dict(color=TECH_COLOR_SMA50, width=2.2),
+
+        if "SMA 20/50" in indicators:
+            _add_price_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["SMA20"],
+                    mode="lines",
+                    name="SMA20",
+                    line=dict(color=TECH_COLOR_SMA20, width=1.5),
+                )
             )
-        )
-        fig.update_layout(
-            title=dict(
-                text=f"{sym} · 日K 技術線圖（近12個月）",
-                font=dict(size=16, color="#f1f5f9"),
-            ),
+            _add_price_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["SMA50"],
+                    mode="lines",
+                    name="SMA50",
+                    line=dict(color=TECH_COLOR_SMA50, width=1.5),
+                )
+            )
+
+        if "EMA 12/26/9" in indicators:
+            _add_price_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["EMA12"],
+                    mode="lines",
+                    name="EMA12",
+                    line=dict(color="rgba(96, 165, 250, 0.7)", width=1.5),
+                )
+            )
+            _add_price_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["EMA26"],
+                    mode="lines",
+                    name="EMA26",
+                    line=dict(color="rgba(167, 139, 250, 0.7)", width=1.5),
+                )
+            )
+            _add_price_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["EMA9"],
+                    mode="lines",
+                    name="EMA9",
+                    line=dict(color="rgba(52, 211, 153, 0.65)", width=1.5),
+                )
+            )
+
+        if "布林通道 (Bollinger Bands)" in indicators:
+            _add_price_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["BB_UPPER"],
+                    mode="lines",
+                    name="BB Upper",
+                    line=dict(color="rgba(148, 163, 184, 0.45)", width=1, dash="dot"),
+                )
+            )
+            _add_price_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["BB_LOWER"],
+                    mode="lines",
+                    name="BB Lower",
+                    line=dict(color="rgba(148, 163, 184, 0.45)", width=1, dash="dot"),
+                    fill="tonexty",
+                    fillcolor="rgba(148, 163, 184, 0.08)",
+                )
+            )
+
+        if show_volume:
+            vol_colors = [
+                "#22c55e" if row["Close"] >= row["Open"] else "#ef4444"
+                for _, row in df.iterrows()
+            ]
+            fig.add_trace(
+                go.Bar(
+                    x=df.index,
+                    y=df["Volume"],
+                    name="Volume",
+                    marker_color=vol_colors,
+                    opacity=0.75,
+                ),
+                row=vol_row,
+                col=1,
+            )
+
+        layout_kwargs = dict(
+            title=None,
             template="plotly_dark",
-            paper_bgcolor=TECH_DARK_PAPER,
-            plot_bgcolor=TECH_DARK_PLOT,
+            paper_bgcolor=TECH_DARK_BG,
+            plot_bgcolor=TECH_DARK_BG,
             font=dict(color="#e2e8f0", size=12),
-            xaxis_rangeslider_visible=False,
-            height=460,
-            margin=dict(l=52, r=28, t=52, b=40),
+            hovermode="x unified",
+            height=chart_height,
+            margin=dict(t=20, b=60, l=40, r=40),
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
                 y=1.02,
                 x=0,
-                bgcolor="rgba(15, 23, 42, 0.6)",
+                bgcolor="rgba(15, 23, 42, 0.4)",
             ),
-            xaxis=dict(showgrid=True, gridcolor="#334155", zeroline=False),
-            yaxis=dict(
+        )
+        if not show_volume:
+            layout_kwargs["xaxis_rangeslider_visible"] = False
+
+        fig.update_layout(**layout_kwargs)
+
+        if show_volume:
+            fig.update_yaxes(
+                range=[y_min, y_max],
                 showgrid=True,
                 gridcolor="#334155",
                 zeroline=False,
-                title="Price (USD)",
-            ),
-        )
+                title="Price",
+                row=1,
+                col=1,
+            )
+            fig.update_yaxes(
+                showgrid=False,
+                zeroline=False,
+                title="Vol",
+                row=2,
+                col=1,
+            )
+            fig.update_xaxes(
+                type="date",
+                range=[default_start, end_dt],
+                showgrid=False,
+                zeroline=False,
+                showticklabels=False,
+                row=1,
+                col=1,
+            )
+            fig.update_xaxes(
+                type="date",
+                range=[default_start, end_dt],
+                showgrid=False,
+                zeroline=False,
+                showspikes=True,
+                spikemode="across",
+                spikesnap="cursor",
+                spikecolor="#64748b",
+                spikethickness=1,
+                row=2,
+                col=1,
+            )
+            fig.update_xaxes(rangeselector=range_selector, row=2, col=1)
+        else:
+            fig.update_layout(
+                xaxis=dict(
+                    type="date",
+                    range=[default_start, end_dt],
+                    rangeslider=dict(visible=False),
+                    showgrid=False,
+                    zeroline=False,
+                    showspikes=True,
+                    spikemode="across",
+                    spikesnap="cursor",
+                    spikecolor="#64748b",
+                    spikethickness=1,
+                ),
+                yaxis=dict(
+                    range=[y_min, y_max],
+                    showgrid=True,
+                    gridcolor="#334155",
+                    zeroline=False,
+                    title="Price (USD)",
+                    showspikes=True,
+                    spikemode="across",
+                    spikesnap="cursor",
+                    spikecolor="#64748b",
+                    spikethickness=1,
+                ),
+            )
+            fig.update_xaxes(rangeselector=range_selector)
+
         return fig
     except Exception:
         return None
 
 
 def _display_technical_chart(symbol: str) -> None:
-    """Render technical chart block with safe fallback warning."""
-    st.markdown("#### 📉 近期技術線圖")
-    fig = render_technical_chart(symbol)
+    """Chart controls + render block with safe fallback."""
+    sym = symbol.upper()
+    ctrl_freq, ctrl_ind = st.columns(2)
+    with ctrl_freq:
+        frequency = st.selectbox(
+            "數據頻率",
+            FREQ_OPTIONS,
+            index=0,
+            key=f"tech_freq_{sym}",
+            label_visibility="visible",
+        )
+    with ctrl_ind:
+        indicators = st.multiselect(
+            "附加指標",
+            INDICATOR_OPTIONS,
+            default=["SMA 20/50"],
+            key=f"tech_ind_{sym}",
+        )
+
+    freq_label = frequency.split("(")[0].strip()
+    st.markdown(
+        f'<p class="panel-label">📉 {sym} · {freq_label}技術線圖（預設近3個月）</p>',
+        unsafe_allow_html=True,
+    )
+    fig = render_technical_chart(sym, frequency=frequency, indicators=indicators)
+    ind_suffix = "_".join(i.split()[0] for i in indicators) or "base"
     if fig is not None:
-        st.plotly_chart(fig, use_container_width=True, key=f"tech_{symbol.upper()}")
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            key=f"tech_{sym}_{frequency.split()[0]}_{ind_suffix}",
+        )
     else:
         st.warning(
-            f"暫時無法載入 **{symbol.upper()}** 的日K技術線圖"
-            "（API 限制、資料不足或該標的暫無行情）。"
+            f"暫時無法載入 **{sym}** 的技術線圖"
+            f"（{frequency} · 指標：{', '.join(indicators) or '無'}）。"
+            "可能為 API 限制、資料不足或該標的暫無行情。"
         )
 
 
-def _dps_line_chart(report: StockReport) -> go.Figure:
+def _dps_line_chart(report: StockReport, *, height: int = 400) -> go.Figure:
     df = dividend_chart_df(report)
     fig = go.Figure(
         data=[
@@ -449,21 +1018,53 @@ def _dps_line_chart(report: StockReport) -> go.Figure:
                 x=df["Year"],
                 y=df["DPS (USD)"],
                 mode="lines+markers",
-                line=dict(color=CHART_COLORS[1], width=3),
-                marker=dict(size=10),
+                line=dict(color=CHART_COLORS[1], width=2.5),
+                marker=dict(size=7),
                 hovertemplate="%{x}<br>DPS: $%{y:.3f}<extra></extra>",
             )
         ]
     )
     fig.update_layout(
-        title=f"{report.symbol} — 年度股息 DPS",
-        xaxis_title="Calendar Year",
+        title=dict(text="年度股息 DPS", font=dict(size=13, color="#94a3b8")),
+        xaxis_title="",
         yaxis_title="DPS (USD)",
-        template="plotly_white",
-        height=400,
+        template="plotly_dark",
+        paper_bgcolor=TECH_DARK_CARD,
+        plot_bgcolor=TECH_DARK_CARD,
+        height=height,
+        margin=dict(t=36, b=28, l=40, r=16),
+        showlegend=False,
         xaxis=dict(dtick=1),
     )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor="#334155", zeroline=False)
     return fig
+
+
+def _render_watchlist_bar() -> None:
+    """Top watchlist input — user-defined ticker universe."""
+    with st.container(border=True):
+        st.markdown('<p class="panel-label">自訂觀察清單</p>', unsafe_allow_html=True)
+        col_input, col_btn = st.columns([4, 1])
+        with col_input:
+            st.text_input(
+                "股票代號（逗號分隔）",
+                placeholder="AAPL, MSFT, NVDA",
+                key=WATCHLIST_INPUT_KEY,
+                label_visibility="collapsed",
+            )
+        with col_btn:
+            load_clicked = st.button(
+                "載入深度分析",
+                type="primary",
+                use_container_width=True,
+                key="watchlist_load_button",
+            )
+        if load_clicked:
+            _load_watchlist_tickers()
+        loaded = st.session_state.analyzed_tickers
+        if loaded:
+            st.caption(f"已載入 **{len(loaded)}** 檔：" + ", ".join(loaded))
 
 
 def _format_fcf_table(report: StockReport) -> pd.DataFrame:
@@ -488,8 +1089,11 @@ def _format_dividend_table(report: StockReport) -> pd.DataFrame:
 
 
 def _render_company_detail(report: StockReport) -> None:
-    _render_trend_signal_block(report.trend_signal)
-    st.caption(f"{report.company_name} · {report.portfolio_group}")
+    st.markdown(
+        f'<p class="subtitle" style="margin-bottom:0.65rem;">'
+        f"{report.symbol} · {report.company_name}</p>",
+        unsafe_allow_html=True,
+    )
 
     h1, h2, h3, h4 = st.columns(4)
     h1.metric("綜合安全得分", _fmt1(report.total_score))
@@ -500,14 +1104,24 @@ def _render_company_detail(report: StockReport) -> None:
     )
     h4.metric("Beta", _fmt1(report.beta) if report.beta is not None else "N/A")
 
-    chart_left, chart_right = st.columns(2)
-    with chart_left:
-        st.plotly_chart(_fcf_bar_chart(report), use_container_width=True, key=f"fcf_{report.symbol}")
-    with chart_right:
-        st.plotly_chart(_dps_line_chart(report), use_container_width=True, key=f"dps_{report.symbol}")
-
-    _display_technical_chart(report.symbol)
-    st.markdown(report.analyst_commentary)
+    chart_col, side_col = st.columns([0.67, 0.33], gap="medium")
+    with chart_col:
+        _display_technical_chart(report.symbol)
+    with side_col:
+        _render_trend_signal_block(report.trend_signal)
+        st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(report.analyst_commentary)
+        st.plotly_chart(
+            _fcf_bar_chart(report, height=240),
+            use_container_width=True,
+            key=f"fcf_{report.symbol}",
+        )
+        st.plotly_chart(
+            _dps_line_chart(report, height=240),
+            use_container_width=True,
+            key=f"dps_{report.symbol}",
+        )
 
     with st.expander("原始數據與分項得分"):
         for d in report.score_details:
@@ -521,15 +1135,44 @@ def _render_company_detail(report: StockReport) -> None:
             st.dataframe(_format_dividend_table(report), use_container_width=True, hide_index=True)
 
 
-def _render_system_b_tab() -> None:
-    """System B passive scoring — summary metrics only."""
-    reports = load_reports()
-    summary_df = _format_summary_df(reports_to_summary_df(reports))
-
-    groups_txt = " | ".join(
-        f"**{g}**：{', '.join(syms)}" for g, syms in TICKER_GROUPS.items()
+def _scroll_to_analysis_section() -> None:
+    """Smooth-scroll to company deep-analysis block after Hunter unlock."""
+    components.html(
+        """
+        <script>
+        (function () {
+            const doc = window.parent.document;
+            const nodes = doc.querySelectorAll('h2, h3, [data-testid="stMarkdownContainer"] p');
+            for (const node of nodes) {
+                const text = (node.textContent || '').trim();
+                if (text.includes('公司深度分析')) {
+                    node.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    break;
+                }
+            }
+        })();
+        </script>
+        """,
+        height=0,
     )
-    st.markdown(f'<p class="subtitle">{groups_txt}</p>', unsafe_allow_html=True)
+
+
+def _render_system_b_tab() -> None:
+    """System B passive scoring — summary for user-loaded watchlist."""
+    tickers: list[str] = st.session_state.analyzed_tickers
+    st.markdown(
+        '<p class="subtitle">'
+        "100 分制財務紀律評分 · FCF40 + 股息30 + 發放率20 + Beta10"
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    if not tickers:
+        st.info("請從上方輸入股票代號並載入，或使用轉機雷達解鎖標的，以查看綜合摘要。")
+        return
+
+    by_symbol = _build_reports_map(tickers)
+    reports = [by_symbol[s] for s in tickers if s in by_symbol]
 
     top = [r for r in reports if r.total_score >= 85]
     c1, c2, c3, c4 = st.columns(4)
@@ -541,32 +1184,63 @@ def _render_system_b_tab() -> None:
         _fmt1(sum(r.total_score for r in reports) / len(reports)) if reports else "—",
     )
 
-    st.subheader("綜合摘要")
-    st.dataframe(_style_summary_table(summary_df), use_container_width=True, hide_index=True)
+    summary_df = _format_summary_df(reports_to_summary_df(reports))
+    st.markdown('<p class="panel-label">綜合摘要</p>', unsafe_allow_html=True)
+    st.dataframe(
+        _style_summary_table(summary_df),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Ticker": st.column_config.TextColumn(width="small"),
+            "Company": st.column_config.TextColumn(width="medium"),
+            "等級": st.column_config.TextColumn(width="small"),
+        },
+    )
 
 
 def _render_company_deep_analysis() -> None:
-    """Dynamic per-ticker tabs driven by session_state.analyzed_tickers."""
+    """Dynamic per-ticker view driven by session_state.analyzed_tickers."""
     tickers: list[str] = st.session_state.analyzed_tickers
     st.markdown("---")
-    st.subheader("公司深度分析")
+    st.markdown("### 公司深度分析")
     st.caption(
-        f"已解鎖 **{len(tickers)}** 檔 · 點選 Tab 切換公司（含從轉機雷達解鎖的新標的）"
+        f"已解鎖 **{len(tickers)}** 檔 · 選擇標的切換（含從轉機雷達解鎖的新標的）"
     )
 
     if not tickers:
-        st.info("尚未解鎖任何分析標的。請在轉機股雷達中點擊「解鎖深度財報圖表」。")
+        st.info(
+            "請從上方輸入股票代號，或使用轉機雷達進行掃描以載入深度分析。"
+        )
         return
 
+    if COMPANY_TAB_KEY not in st.session_state:
+        st.session_state[COMPANY_TAB_KEY] = tickers[0]
+
+    focus = st.session_state.get("focus_ticker")
+    if focus and focus.upper() in [t.upper() for t in tickers]:
+        st.session_state[COMPANY_TAB_KEY] = focus.upper()
+        st.session_state.focus_ticker = None
+
+    if st.session_state.get(COMPANY_TAB_KEY) not in tickers:
+        st.session_state[COMPANY_TAB_KEY] = tickers[0]
+
+    selected = st.radio(
+        "選擇公司",
+        options=tickers,
+        horizontal=True,
+        key=COMPANY_TAB_KEY,
+        label_visibility="collapsed",
+    )
+
+    if st.session_state.pop("scroll_to_analysis", False):
+        _scroll_to_analysis_section()
+
     by_symbol = _build_reports_map(tickers)
-    company_tabs = st.tabs(tickers)
-    for tab, sym in zip(company_tabs, tickers):
-        with tab:
-            report = by_symbol.get(sym.upper())
-            if report is None:
-                st.error(f"無法載入 {sym} 的財報資料。")
-            else:
-                _render_company_detail(report)
+    report = by_symbol.get(selected.upper())
+    if report is None:
+        st.error(f"無法載入 {selected} 的財報資料。")
+    else:
+        _render_company_detail(report)
 
 
 def _render_turnaround_hunter_tab() -> None:
@@ -587,7 +1261,7 @@ def _render_turnaround_hunter_tab() -> None:
     st.text_area(
         "輸入股票代號（逗號或換行分隔）",
         height=120,
-        help="例如大市值美股：PFE, GIS, INTC … 可自行增刪。",
+        help="例如：AAPL, MSFT, NVDA, INTC … 可自行增刪。",
         key="hunter_universe_input",
     )
 
@@ -638,7 +1312,7 @@ def _render_turnaround_hunter_tab() -> None:
     )
 
     st.markdown("#### 解鎖深度財報分析")
-    st.caption("點擊後將在頁面下方「公司深度分析」新增專屬 Tab。")
+    st.caption("點擊後將自動聚焦至下方「公司深度分析」並切換至該標的。")
     unlock_cols = st.columns(min(len(results), 4) or 1)
     for i, opp in enumerate(results):
         with unlock_cols[i % len(unlock_cols)]:
@@ -706,19 +1380,24 @@ def _render_sidebar() -> None:
         """
     )
     st.sidebar.markdown(
-        f"**已解鎖深度分析**：{len(st.session_state.get('analyzed_tickers', []))} 檔"
+        f"**已載入深度分析**：{len(st.session_state.get('analyzed_tickers', []))} 檔"
     )
     if st.sidebar.button("清除 System B 快取"):
-        load_reports.clear()
         load_report_for_symbol.clear()
-        _fetch_daily_ohlc.clear()
+        _validate_ticker_symbol.clear()
+        _fetch_market_history.clear()
         st.rerun()
 
 
 def main() -> None:
     _inject_css()
     _init_session_state()
-    st.markdown('<p class="main-title">實戰持股 · 綜合安全儀表板</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-title">股息安全 · 綜合分析儀表板</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="subtitle">自訂觀察清單 · 100 分制財務評分 · 轉機股雷達 · 技術線圖</p>',
+        unsafe_allow_html=True,
+    )
+    _render_watchlist_bar()
 
     tab_score, tab_hunter = st.tabs(
         [

@@ -6,20 +6,22 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from analyzer_core import TICKERS, analyze_all, reports_to_summary_df
+from analyzer_core import DEFAULT_SCAN_UNIVERSE, analyze_all, reports_to_summary_df
+
+DEFAULT_CLI_TICKERS = list(DEFAULT_SCAN_UNIVERSE[:5])
 
 
 def main() -> None:
     console = Console()
     console.print(
         Panel(
-            "實戰持股：PFE, GIS, FLO, NOK, NVO\n"
-            "100 分制 | Web: streamlit run app.py",
+            "自訂觀察清單 · 100 分制評分\n"
+            "Web: streamlit run app.py",
             title="Dividend Safety Analyzer (CLI)",
             border_style="green",
         )
     )
-    reports = analyze_all()
+    reports = analyze_all(DEFAULT_CLI_TICKERS)
     df = reports_to_summary_df(reports)
     table = Table(title="Summary", box=box.ROUNDED)
     for col in df.columns:
