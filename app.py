@@ -12,10 +12,22 @@ from plotly.subplots import make_subplots
 
 from analyzer_core import (
     FALLBACK_SCAN_UNIVERSE,
+    FCF_PAYOUT_DEATH_THRESHOLD,
+    FCF_PAYOUT_EXTRA_PENALTY,
+    NET_DEBT_EBITDA_DEATH_THRESHOLD,
     STRATEGY_LABEL_GROWTH,
     STRATEGY_LABEL_VALUE,
     STRATEGY_LABELS,
     STRATEGY_VALUE,
+    VALUE_SCORE_DEATH_CAP,
+    WEIGHT_GROWTH_FUNDAMENTAL,
+    WEIGHT_GROWTH_PEG_VAL,
+    WEIGHT_GROWTH_SURPRISE,
+    WEIGHT_GROWTH_TECH_TIMING,
+    WEIGHT_VALUE_CASHFLOW,
+    WEIGHT_VALUE_QUALITY,
+    WEIGHT_VALUE_REVENUE,
+    WEIGHT_VALUE_SAFETY,
     MasterMetrics,
     ScoreDetail,
     ScorecardItem,
@@ -332,8 +344,42 @@ def _fmt_money_large(value: float | None) -> str:
 
 def _inject_css() -> None:
     st.markdown(
+        """
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
         f"""
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        html, body, [class*="css"], .stApp, .stMarkdown, label, p, span, div {{
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
+        }}
+        div[data-testid="stMetric"] {{
+            background-color: #1E293B !important;
+            border: 1px solid #334155 !important;
+            border-radius: 8px !important;
+            padding: 0.85rem 1rem 0.95rem !important;
+            box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.06);
+        }}
+        div[data-testid="stMetric"] label {{
+            color: #94A3B8 !important;
+            font-size: 0.72rem !important;
+            font-weight: 600 !important;
+            letter-spacing: 0.04em !important;
+            text-transform: uppercase !important;
+        }}
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
+            font-size: 1.65rem !important;
+            font-weight: 700 !important;
+            color: #F1F5F9 !important;
+        }}
+        div[data-testid="stMetric"] [data-testid="stMetricDelta"] {{
+            font-size: 0.78rem !important;
+        }}
         :root {{
             --bg-base: #0f172a;
             --bg-card: #1e293b;
@@ -638,6 +684,64 @@ def _inject_css() -> None:
             margin: 0.65rem 0 1rem;
             text-align: center;
             box-shadow: 0 0 12px rgba(239, 68, 68, 0.15);
+        }}
+        .terminal-score-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin: 1.1rem 0 0.85rem;
+        }}
+        @media (max-width: 768px) {{
+            .terminal-score-grid {{ grid-template-columns: 1fr; }}
+        }}
+        .terminal-score-card {{
+            background: linear-gradient(165deg, #1E293B 0%, #172033 100%);
+            border: 1px solid #334155;
+            border-radius: 10px;
+            padding: 1.35rem 1.25rem 1.15rem;
+            text-align: center;
+            box-shadow: 0 8px 24px rgba(2, 6, 23, 0.35);
+        }}
+        .terminal-score-label {{
+            color: #94A3B8;
+            font-size: 0.72rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 0.35rem;
+        }}
+        .terminal-score-sublabel {{
+            color: #64748B;
+            font-size: 0.68rem;
+            margin-bottom: 0.55rem;
+        }}
+        .terminal-score-value {{
+            font-size: 48px;
+            font-weight: 800;
+            line-height: 1.05;
+            letter-spacing: -0.02em;
+        }}
+        .terminal-score-cap {{
+            color: #64748B;
+            font-size: 0.7rem;
+            margin-top: 0.45rem;
+        }}
+        .death-penalty-banner {{
+            background: linear-gradient(90deg, rgba(127, 29, 29, 0.55) 0%, rgba(69, 10, 10, 0.45) 100%);
+            border: 1px solid #EF4444;
+            border-left: 4px solid #EF4444;
+            color: #FEE2E2;
+            font-size: 0.88rem;
+            font-weight: 600;
+            padding: 0.85rem 1.1rem;
+            border-radius: 8px;
+            margin: 0.65rem 0 0.85rem;
+            line-height: 1.55;
+        }}
+        .terminal-grade-strip {{
+            color: #94A3B8;
+            font-size: 0.82rem;
+            margin: 0.35rem 0 0.85rem;
         }}
         .ai-terminal-panel {{
             display: none;
@@ -988,6 +1092,191 @@ def _format_grade(report: StockReport) -> str:
     quality = report.business_quality_score or report.total_score
     emoji, label = grade_from_score(quality, growth=growth)
     return f"{emoji} {label}"
+
+
+def _terminal_score_color(score: float | None) -> str:
+    """Semantic terminal colors: >=85 green, 70–84 gray, <70 red."""
+    if score is None:
+        return "#94A3B8"
+    try:
+        v = float(score)
+    except (TypeError, ValueError):
+        return "#94A3B8"
+    if v >= 85:
+        return "#10B981"
+    if v >= 70:
+        return "#94A3B8"
+    return "#EF4444"
+
+
+def _score_detail_pair(report: StockReport, *keywords: str) -> tuple[float | None, float | None]:
+    """Return (earned, max_points) for first matching score_detail category."""
+    for detail in report.score_details:
+        if detail.max_points <= 0:
+            continue
+        if any(k in detail.category for k in keywords):
+            return detail.earned, detail.max_points
+    return None, None
+
+
+def _collect_death_penalty_messages(report: StockReport) -> list[str]:
+    """Detect asymmetric death penalties for fatal red-flag banners."""
+    if is_growth_strategy(report.strategy_mode):
+        return []
+
+    messages: list[str] = []
+    m = report.master
+
+    if m.net_debt_ebitda is not None and m.net_debt_ebitda > NET_DEBT_EBITDA_DEATH_THRESHOLD:
+        messages.append(
+            f"🚨 致命紅旗警告：債務槓桿嚴重超標（淨債務/EBITDA {m.net_debt_ebitda:.1f}x > "
+            f"{NET_DEBT_EBITDA_DEATH_THRESHOLD:.0f}x），觸發財務安全一票否決，"
+            f"企業品質分強制封頂 {VALUE_SCORE_DEATH_CAP:.0f}。"
+        )
+
+    if m.fcf_payout_ratio is not None and m.fcf_payout_ratio > FCF_PAYOUT_DEATH_THRESHOLD:
+        messages.append(
+            f"🚨 致命紅旗警告：FCF 支付率 {m.fcf_payout_ratio * 100:.1f}% 透支"
+            f"（>{FCF_PAYOUT_DEATH_THRESHOLD * 100:.0f}%），觸發現金流一票否決，"
+            f"該維度歸零並額外扣 {FCF_PAYOUT_EXTRA_PENALTY:.0f} 分。"
+        )
+
+    return messages
+
+
+def _render_terminal_dual_scores(report: StockReport) -> None:
+    """Hero dual-track scores — Quality & Valuation (48px, semantic colors)."""
+    quality = report.business_quality_score or report.total_score
+    valuation = report.valuation_safety_score
+    q_color = _terminal_score_color(quality)
+    v_color = _terminal_score_color(valuation)
+
+    _render_html(
+        f"""
+        <div class="terminal-score-grid">
+            <div class="terminal-score-card">
+                <div class="terminal-score-label">企業品質分 · Quality</div>
+                <div class="terminal-score-sublabel">Business Quality Score</div>
+                <div class="terminal-score-value" style="color:{q_color};">{quality:.1f}</div>
+                <div class="terminal-score-cap">滿分 100 · Red Team 封頂 95</div>
+            </div>
+            <div class="terminal-score-card">
+                <div class="terminal-score-label">估值安全邊際 · Valuation</div>
+                <div class="terminal-score-sublabel">Valuation Safety Score</div>
+                <div class="terminal-score-value" style="color:{v_color};">{valuation:.1f}</div>
+                <div class="terminal-score-cap">Forward P/E · PEG · FCF Yield</div>
+            </div>
+        </div>
+        <div class="terminal-grade-strip">等級 {_format_grade(report)}</div>
+        """
+    )
+
+
+def _render_death_penalty_banners(report: StockReport) -> None:
+    """Full-width fatal red-flag banners below hero scores."""
+    for msg in _collect_death_penalty_messages(report):
+        _render_html(f'<div class="death-penalty-banner">{html.escape(msg)}</div>')
+
+
+def _render_value_dimension_grid(report: StockReport) -> None:
+    """Four-column Bloomberg-style dimension grid with st.metric tooltips."""
+    dims: list[tuple[str, float, tuple[str, ...], str]] = [
+        (
+            f"企業品質 · {WEIGHT_VALUE_QUALITY:.0f}%",
+            WEIGHT_VALUE_QUALITY,
+            ("企業品質", "護城河"),
+            SCORE_WEIGHT_TOOLTIPS_VALUE["企業品質與護城河"]
+            + " 子指標：ROIC/ROA、毛利率波動、營業利益率。資料：SQLite cache · yfinance · SEC。",
+        ),
+        (
+            f"財務安全 · {WEIGHT_VALUE_SAFETY:.0f}%",
+            WEIGHT_VALUE_SAFETY,
+            ("財務安全",),
+            SCORE_WEIGHT_TOOLTIPS_VALUE["財務安全防線"]
+            + " 子指標：Net Debt/EBITDA、利息保障倍數。死亡門檻：槓桿 >3x。",
+        ),
+        (
+            f"現金流品質 · {WEIGHT_VALUE_CASHFLOW:.0f}%",
+            WEIGHT_VALUE_CASHFLOW,
+            ("現金流",),
+            SCORE_WEIGHT_TOOLTIPS_VALUE["現金流品質"]
+            + " 子指標：FCF 支付率、股息連續成長。死亡門檻：FCF Payout >90%。",
+        ),
+        (
+            f"營收穩定 · {WEIGHT_VALUE_REVENUE:.0f}%",
+            WEIGHT_VALUE_REVENUE,
+            ("營收穩定",),
+            SCORE_WEIGHT_TOOLTIPS_VALUE["營收穩定"]
+            + " 子指標：5Y 營收 CAGR、TTM 營收增速。資料：年度財報 · yfinance。",
+        ),
+    ]
+
+    c1, c2, c3, c4 = st.columns(4)
+    for col, (label, max_pts, keys, help_text) in zip(
+        (c1, c2, c3, c4), dims, strict=True
+    ):
+        earned, cap = _score_detail_pair(report, *keys)
+        earned = earned if earned is not None else 0.0
+        with col:
+            st.metric(
+                label=label,
+                value=f"{earned:.1f}",
+                delta=f"/ {max_pts:.0f} pts",
+                delta_color="off",
+                help=help_text,
+            )
+
+
+def _render_growth_dimension_grid(report: StockReport) -> None:
+    """Growth-mode four-column grid (30/25/25/15)."""
+    dims: list[tuple[str, float, tuple[str, ...], str]] = [
+        (
+            f"基本面增長 · {WEIGHT_GROWTH_FUNDAMENTAL:.0f}%",
+            WEIGHT_GROWTH_FUNDAMENTAL,
+            ("基本面增長",),
+            "營收成長 + CapEx 擴張率。資料：yfinance info · 季度現金流。",
+        ),
+        (
+            f"預期修正 · {WEIGHT_GROWTH_SURPRISE:.0f}%",
+            WEIGHT_GROWTH_SURPRISE,
+            ("預期修正", "Surprise"),
+            "EPS Surprise 連續超預期季數。資料：yfinance earnings_history。",
+        ),
+        (
+            f"PEG 估值 · {WEIGHT_GROWTH_PEG_VAL:.0f}%",
+            WEIGHT_GROWTH_PEG_VAL,
+            ("PEG", "估值相對"),
+            "Trailing PEG 相對成長估值剪刀差。資料：yfinance trailingPegRatio。",
+        ),
+        (
+            f"Timing 輔助 · {WEIGHT_GROWTH_TECH_TIMING:.0f}%",
+            WEIGHT_GROWTH_TECH_TIMING,
+            ("Timing", "技術面輔助"),
+            "SMA20/50 均線結構 — 僅作進場 Timing，不主導基本面決策。",
+        ),
+    ]
+
+    c1, c2, c3, c4 = st.columns(4)
+    for col, (label, max_pts, keys, help_text) in zip(
+        (c1, c2, c3, c4), dims, strict=True
+    ):
+        earned, _ = _score_detail_pair(report, *keys)
+        earned = earned if earned is not None else 0.0
+        with col:
+            st.metric(
+                label=label,
+                value=f"{earned:.1f}",
+                delta=f"/ {max_pts:.0f} pts",
+                delta_color="off",
+                help=help_text,
+            )
+
+
+def _render_dimension_grid(report: StockReport) -> None:
+    if is_growth_strategy(report.strategy_mode):
+        _render_growth_dimension_grid(report)
+    else:
+        _render_value_dimension_grid(report)
 
 
 def _valuation_trap_warning(report: StockReport) -> bool:
@@ -2413,23 +2702,32 @@ def _render_company_detail(report: StockReport) -> None:
         unsafe_allow_html=True,
     )
     st.markdown(f'<span class="strategy-badge">{html.escape(mode_label)}</span>', unsafe_allow_html=True)
-    _render_valuation_trap_alert(report)
 
-    quality = report.business_quality_score or report.total_score
-    val_score = report.valuation_safety_score
-    _render_fx_metric_row(
-        [
-            ("企業品質分", _fmt1(quality), f"Business Quality · 封頂95"),
-            ("估值安全分", _fmt1(val_score), "Forward P/E · PEG · FCF Yield · 封頂95"),
-            ("等級", _format_grade(report)),
-            (
-                "發放率",
-                f"{report.payout_ratio * 100:.1f}%"
-                if report.payout_ratio is not None
-                else "N/A",
-            ),
-        ]
+    _render_terminal_dual_scores(report)
+    _render_death_penalty_banners(report)
+    _render_valuation_trap_alert(report)
+    _render_dimension_grid(report)
+
+    payout_cell = (
+        f"{report.payout_ratio * 100:.1f}%"
+        if report.payout_ratio is not None
+        else "N/A"
     )
+    meta1, meta2, meta3 = st.columns(3)
+    with meta1:
+        st.metric("EPS 發放率", payout_cell, help="Trailing payout ratio · yfinance info")
+    with meta2:
+        beta_v = _fmt1(report.beta) if report.beta is not None else "N/A"
+        st.metric("Beta", beta_v, help="相對大盤波動係數 · 風險參考")
+    with meta3:
+        nd = report.master.net_debt_ebitda
+        nd_v = f"{nd:.1f}x" if nd is not None else "N/A"
+        st.metric(
+            "淨債務/EBITDA",
+            nd_v,
+            help="槓桿安全線 · >3.0x 觸發死亡懲罰",
+        )
+
     _render_master_metric_row(report)
     _render_factor_glossary(report.strategy_mode)
 
