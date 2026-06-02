@@ -53,10 +53,14 @@ VALUE_SCORE_DEATH_CAP = 69.0
 FCF_PAYOUT_EXTRA_PENALTY = 10.0
 # Turnaround radar — anti-bankruptcy gate (shared with death penalty)
 NET_DEBT_EBITDA_MAX = 3.0
-# 🚀 Growth momentum — Soros reflexivity + PEG scissors + right-side trend
-WEIGHT_GROWTH_FORWARD = 40.0   # PEG asymmetry + CapEx expansion lead indicator
-WEIGHT_GROWTH_MOMENTUM = 40.0  # Close > SMA20 & SMA50 mid-term MA cluster support
-WEIGHT_GROWTH_SURPRISE = 20.0  # analyst EPS upward-revision / surprise trend
+# 🚀 Growth momentum — nerfed technicals; quality vs valuation split
+WEIGHT_GROWTH_FUNDAMENTAL = 30.0   # revenue / CapEx fundamental growth
+WEIGHT_GROWTH_SURPRISE = 25.0      # EPS surprise / revision
+WEIGHT_GROWTH_PEG_VAL = 25.0       # PEG relative-growth valuation
+WEIGHT_GROWTH_TECH_TIMING = 15.0   # SMA timing auxiliary only (demoted)
+# Legacy aliases (backward compat for helpers)
+WEIGHT_GROWTH_FORWARD = WEIGHT_GROWTH_FUNDAMENTAL + WEIGHT_GROWTH_PEG_VAL
+WEIGHT_GROWTH_MOMENTUM = WEIGHT_GROWTH_TECH_TIMING
 
 # Legacy growth weights retained for backward-compatible helpers
 WEIGHT_GROWTH_REVENUE = 40.0
@@ -81,9 +85,11 @@ CAPEX_TAGS = (
     "PaymentsToAcquireProductiveAssets",
 )
 
-# Turnaround screener (active fact-finding radar)
+# Turnaround — anti-value-trap: reject shrinking core businesses
 TURNAROUND_LOOKBACK = "6mo"
 TURNAROUND_MIN_DRAWDOWN_PCT = 15.0
+TURNAROUND_REVENUE_CAGR_YEARS = 3
+TURNAROUND_STRUCTURAL_GM_DECLINE_PP = 5.0
 # Valuation attractiveness — price vs 52-week high OR trailing PEG
 TURNAROUND_52W_HIGH_RATIO_MAX = 0.75   # current / 52w high < 0.75 → ≥25% off highs
 TURNAROUND_PEG_MAX = 1.5
@@ -336,6 +342,8 @@ class MasterMetrics:
     ttm_operating_margin: float | None = None      # yfinance info — trailing twelve months
     ttm_gross_margin: float | None = None
     ttm_revenue_growth: float | None = None        # info.revenueGrowth (TTM proxy)
+    forward_pe: float | None = None                # forwardPE — valuation margin input
+    fcf_yield: float | None = None                 # FCF / market cap
     data_as_of: str = ""                           # ISO date of latest price / quarter
 
 
@@ -357,7 +365,9 @@ class StockReport:
     payout_ratio: float | None = None
     beta: float | None = None
     score_details: list[ScoreDetail] = field(default_factory=list)
-    total_score: float = 0.0
+    total_score: float = 0.0                       # legacy alias → business_quality_score
+    business_quality_score: float = 0.0            # Business Quality 0–100
+    valuation_margin_score: float = 0.0            # Valuation Margin 0–100
     grade_label: str = ""
     grade_emoji: str = ""
     analyst_commentary: str = ""
@@ -373,9 +383,12 @@ class StockReport:
 
     @property
     def overall_pass(self) -> bool | None:
-        if self.total_score <= 0 and not self.score_details:
+        if self.business_quality_score <= 0 and not self.score_details:
             return None
-        return self.total_score >= 70
+        return (
+            self.business_quality_score >= 70
+            and self.valuation_margin_score >= 60
+        )
 
 
 @lru_cache(maxsize=1)
@@ -1005,6 +1018,51 @@ def fetch_revenue_cagr_5y(ticker: yf.Ticker) -> float | None:
     return round(cagr, 4)
 
 
+def fetch_revenue_cagr_3y(ticker: yf.Ticker) -> float | None:
+    """3-year revenue CAGR from annual income statements."""
+    try:
+        inc = ticker.get_income_stmt(freq="yearly")
+    except Exception:
+        return None
+    if inc is None or inc.empty:
+        return None
+
+    rev_row = _pick_row(inc, *TOTAL_REVENUE_ROW_NAMES)
+    if rev_row is None:
+        return None
+
+    col_dates = sorted(inc.columns, reverse=True)
+    revenues: list[float] = []
+    for col in col_dates[: TURNAROUND_REVENUE_CAGR_YEARS + 1]:
+        try:
+            val = float(rev_row.get(col))
+        except (TypeError, ValueError):
+            continue
+        if pd.notna(val) and val > 0:
+            revenues.append(val)
+
+    if len(revenues) < 2:
+        return None
+
+    years = len(revenues) - 1
+    if years <= 0 or revenues[-1] <= 0:
+        return None
+
+    cagr = (revenues[0] / revenues[-1]) ** (1.0 / years) - 1.0
+    return round(cagr, 4)
+
+
+def _compute_fcf_yield(info: dict, symbol: str, ticker: yf.Ticker) -> float | None:
+    """FCF yield = latest fiscal FCF / market cap."""
+    mkt_cap = _safe_info_float(info, "marketCap")
+    if mkt_cap is None or mkt_cap <= 0:
+        return None
+    fcf_val, _, _ = fetch_latest_fcf_snapshot(symbol, ticker=ticker)
+    if fcf_val is None or fcf_val <= 0:
+        return None
+    return round(fcf_val / mkt_cap, 4)
+
+
 def fetch_gross_margin_volatility(ticker: yf.Ticker, years: int = 5) -> float | None:
     """Max-min gross margin range (percentage points) over recent fiscal years."""
     try:
@@ -1296,7 +1354,27 @@ def fetch_master_metrics(
         ttm_operating_margin=_safe_info_float(info, "operatingMargins"),
         ttm_gross_margin=_safe_info_float(info, "grossMargins"),
         ttm_revenue_growth=_safe_info_float(info, "revenueGrowth"),
+        forward_pe=_safe_info_float(info, "forwardPE") or _safe_info_float(info, "trailingPE"),
+        fcf_yield=_compute_fcf_yield(info, sym, t),
     )
+
+
+def _anti_value_trap_filter(ticker: yf.Ticker) -> bool:
+    """
+    Anti-value-trap gate: reject names whose core business is shrinking.
+
+    Pass when 3Y revenue CAGR > 0. When CAGR is unknown, require latest-quarter
+    gross margin to show no structural collapse (YoY decline ≤ threshold).
+    Any confirmed 3Y revenue decline → hard reject regardless of drawdown.
+    """
+    cagr_3y = fetch_revenue_cagr_3y(ticker)
+    if cagr_3y is not None:
+        return cagr_3y > 0
+
+    margin_ok, _, gm_change = _gross_margin_filter(ticker)
+    if gm_change is None:
+        return False
+    return margin_ok
 
 
 def _passes_right_side_filter(
@@ -1466,7 +1544,7 @@ def compute_value_defense_score_only(symbol: str) -> tuple[float, str, str]:
         beta = _safe_beta(info)
         trend = detect_trend_signals(sym)
         master = fetch_master_metrics(sym, info, ticker=ticker)
-        _, total, emoji, label = compute_scores(
+        _, quality, valuation, emoji, label = compute_scores(
             fcf_rows,
             div_rows,
             payout,
@@ -1478,7 +1556,7 @@ def compute_value_defense_score_only(symbol: str) -> tuple[float, str, str]:
             ticker=ticker,
             master=master,
         )
-        return total, emoji, label
+        return quality, emoji, label
     except Exception:
         return 0.0, "🔴", "防禦不足"
 
@@ -1592,6 +1670,10 @@ def _screen_single_turnaround(
     if not margin_ok:
         return None
 
+    # Filter 5 — anti-value-trap: reject shrinking core businesses.
+    if not _anti_value_trap_filter(ticker):
+        return None
+
     rd_expense, rd_year = fetch_latest_rd_expense(sym, ticker=ticker)
 
     return TurnaroundOpportunity(
@@ -1629,7 +1711,7 @@ def find_turnaround_opportunities(
     Filters (all mandatory):
       6M drawdown > 15% · valuation (52w high ≥25% off OR PEG < 1.5)
       FCF > 0 · Close > SMA20 · Net Debt/EBITDA < 3 · interest coverage > 3x
-      gross margin YoY stable (≤ 5pp decline)
+      gross margin YoY stable · 3Y revenue CAGR > 0 (anti-value-trap)
 
     Post-scan enrichment (default on):
       · 100-pt value-defense score per candidate
@@ -2174,15 +2256,22 @@ def score_revenue_potential_component(
 def score_growth_momentum_component(
     trend: dict[str, float | str | None] | None,
 ) -> ScoreDetail:
-    """Momentum structure — full score when price clears both SMA20 and SMA50."""
-    max_pts = WEIGHT_GROWTH_MOMENTUM
-    category = "技術面右側通道支撐"
+    """Legacy alias → demoted technical timing auxiliary (15 pts)."""
+    return score_growth_technical_timing_component(trend)
+
+
+def score_growth_technical_timing_component(
+    trend: dict[str, float | str | None] | None,
+) -> ScoreDetail:
+    """Technical timing auxiliary — SMA cluster for entry timing only (15 pts max)."""
+    max_pts = WEIGHT_GROWTH_TECH_TIMING
+    category = "技術面輔助 (Timing)"
     if not trend:
         return ScoreDetail(
             category,
             max_pts,
-            0.0,
-            "趨勢數據不足，無法評估中期均線動能結構。",
+            max_pts * 0.40,
+            "趨勢數據不足；Timing 輔助給予中性基礎分（不主導決策）。",
         )
 
     signal = str(trend.get("current_signal", "Hold"))
@@ -2191,30 +2280,30 @@ def score_growth_momentum_component(
         sma_20 = float(trend.get("sma_20", 0))
         sma_50 = float(trend.get("sma_50", 0))
     except (TypeError, ValueError):
-        return ScoreDetail(category, max_pts, 0.0, "均線數據格式異常。")
+        return ScoreDetail(category, max_pts, max_pts * 0.30, "均線數據格式異常。")
 
     above_20 = price > sma_20
     above_50 = price > sma_50
 
     if above_20 and above_50:
         earned = max_pts
-        band = "📈 價格已站上中期均線群，呈現右側打底結構（確認價格轉入中期上升軌道）"
-    elif above_20 and not above_50:
-        earned = max_pts * 0.72
-        band = "收盤站上 SMA20，中期均線群尚未完全確認"
-    elif above_50 and not above_20:
-        earned = max_pts * 0.55
-        band = "價格高於 SMA50 但低於 SMA20（整理區間）"
+        band = "均線群確認 · 可作 Timing 加分（非基本面主導）"
+    elif above_20:
+        earned = max_pts * 0.65
+        band = "站上 SMA20 · 短線 Timing 尚可"
+    elif above_50:
+        earned = max_pts * 0.45
+        band = "SMA50 上方但 SMA20 下方 · 整理區"
     elif signal == "Wait":
-        earned = max_pts * 0.18
-        band = "弱勢結構 · 右側動能尚未確立"
+        earned = max_pts * 0.20
+        band = "弱勢結構 · Timing 不利"
     else:
-        earned = max_pts * 0.08
-        band = "均線下方 · 等待結構修復"
+        earned = max_pts * 0.10
+        band = "均線下方 · 僅供觀察"
 
     rationale = (
         f"收盤 ${price:.2f} | SMA20 ${sma_20:.2f} | SMA50 ${sma_50:.2f} · "
-        f"{band}，本項得 {earned:.1f}/{max_pts:.0f} 分。"
+        f"{band}，本項得 {earned:.1f}/{max_pts:.0f} 分（Timing 輔助）。"
     )
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
@@ -2542,59 +2631,156 @@ def score_earnings_surprise_component(
 
 
 def score_forward_asymmetry_component(master: MasterMetrics) -> ScoreDetail:
-    """🚀 Forward growth asymmetry (40): PEG scissors + CapEx expansion lead indicator."""
-    max_pts = WEIGHT_GROWTH_FORWARD
-    category = "前瞻增長不對稱性"
+    """Legacy alias — fundamental growth leg (30 pts)."""
+    return score_growth_fundamental_component(master)
+
+
+def score_growth_fundamental_component(master: MasterMetrics) -> ScoreDetail:
+    """🚀 Fundamental growth (30): revenue momentum + CapEx expansion."""
+    max_pts = WEIGHT_GROWTH_FUNDAMENTAL
+    category = "基本面增長"
     earned = 0.0
     parts: list[str] = []
 
-    # PEG scissors — growth priced cheaply (max 24)
-    peg = master.peg_ratio
-    if peg is not None and peg > 0:
-        if peg <= 1.0:
-            sub, tag = 24.0, "PEG ≤1（增長被低估，剪刀差顯著）"
-        elif peg <= 1.5:
-            sub, tag = 18.0, "PEG 1.0–1.5（估值合理）"
-        elif peg <= 2.0:
-            sub, tag = 12.0, "PEG 1.5–2.0（估值偏滿）"
-        elif peg <= 3.0:
-            sub, tag = 6.0, "PEG 2.0–3.0（增長溢價偏貴）"
+    rev = master.revenue_growth or master.ttm_revenue_growth
+    if rev is not None and rev > 0:
+        if rev >= 0.20:
+            sub, tag = 18.0, "高速 ≥20%"
+        elif rev >= 0.10:
+            sub, tag = 15.0, "強勁 10%–20%"
+        elif rev >= 0.05:
+            sub, tag = 11.0, "穩健 5%–10%"
         else:
-            sub, tag = 2.0, "PEG >3（增長定價過度）"
+            sub, tag = 7.0, "低個位數"
         earned += sub
-        parts.append(f"前瞻 PEG {peg:.2f}（{tag}）")
+        parts.append(f"營收成長 {rev*100:.1f}%（{tag}）")
+    elif master.revenue_cagr_5y is not None and master.revenue_cagr_5y > 0:
+        sub = min(18.0, 18.0 * (master.revenue_cagr_5y / 0.15))
+        earned += sub
+        parts.append(f"5Y 營收 CAGR {master.revenue_cagr_5y*100:+.1f}%")
     else:
-        rev = master.revenue_growth
-        if rev is not None and rev > 0:
-            sub = min(24.0, 24.0 * (rev / 0.20))
-            earned += sub
-            parts.append(f"PEG 缺失 · 以營收成長 {rev*100:.1f}% 代理（{sub:.1f}/24）")
-        else:
-            earned += 24.0 * 0.40
-            parts.append("PEG 與營收成長數據缺失（給予中性基礎）")
+        earned += 18.0 * 0.25
+        parts.append("營收成長數據不足")
 
-    # CapEx expansion — industry tailwind / order visibility (max 16)
     cg = master.capex_growth
     if cg is not None:
         cg_pct = cg * 100
-        if cg >= 0.30:
-            sub, tag = 16.0, "資本支出大幅擴張 ≥30%（產業擴張領先訊號）"
-        elif cg >= 0.15:
-            sub, tag = 12.0, "擴張 15%–30%"
+        if cg >= 0.25:
+            sub, tag = 12.0, "CapEx 擴張 ≥25%"
+        elif cg >= 0.10:
+            sub, tag = 9.0, "CapEx 擴張 10%–25%"
         elif cg >= 0.0:
-            sub, tag = 8.0, "溫和擴張 0%–15%"
+            sub, tag = 6.0, "CapEx 溫和擴張"
         elif cg >= -0.15:
-            sub, tag = 4.0, "資本支出收縮 0% 至 -15%"
+            sub, tag = 3.0, "CapEx 收縮"
         else:
-            sub, tag = 2.0, "大幅收縮 <-15%（擴張動能轉弱）"
+            sub, tag = 1.0, "CapEx 大幅收縮"
         earned += sub
         parts.append(f"CapEx YoY {cg_pct:+.1f}%（{tag}）")
     else:
-        earned += 16.0 * 0.40
-        parts.append("CapEx 動態數據缺失")
+        earned += 12.0 * 0.35
+        parts.append("CapEx 動態缺失")
 
     rationale = " · ".join(parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
+def score_growth_peg_valuation_component(master: MasterMetrics) -> ScoreDetail:
+    """🚀 PEG relative-growth valuation (25) — isolated valuation track."""
+    max_pts = WEIGHT_GROWTH_PEG_VAL
+    category = "估值相對成長 (PEG)"
+    peg = master.peg_ratio
+    if peg is not None and peg > 0:
+        if peg <= 1.0:
+            earned, tag = max_pts, "PEG ≤1 · 成長被低估"
+        elif peg <= 1.5:
+            earned, tag = max_pts * 0.78, "PEG 1.0–1.5 · 合理"
+        elif peg <= 2.0:
+            earned, tag = max_pts * 0.55, "PEG 1.5–2.0 · 偏滿"
+        elif peg <= 3.0:
+            earned, tag = max_pts * 0.30, "PEG 2.0–3.0 · 透支風險"
+        else:
+            earned, tag = max_pts * 0.10, "PEG >3 · 定價過度"
+        rationale = f"PEG {peg:.2f}（{tag}），本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    else:
+        earned = max_pts * 0.35
+        rationale = f"PEG 缺失，給予中性基礎 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
+def score_valuation_margin_component(
+    master: MasterMetrics,
+    info: dict | None = None,
+) -> ScoreDetail:
+    """
+    Valuation Margin (100): Forward P/E + PEG + FCF Yield.
+
+    Isolated from Business Quality — exposes 'great company, bad price' traps.
+    """
+    max_pts = 100.0
+    category = "估值安全邊際"
+    info = info or {}
+    earned = 0.0
+    parts: list[str] = []
+
+    fpe = master.forward_pe or _safe_info_float(info, "forwardPE")
+    if fpe is None or fpe <= 0:
+        fpe = _safe_info_float(info, "trailingPE")
+    if fpe is not None and fpe > 0:
+        if fpe <= 15:
+            sub, tag = 40.0, "深度折價 ≤15x"
+        elif fpe <= 20:
+            sub, tag = 32.0, "合理 15–20x"
+        elif fpe <= 25:
+            sub, tag = 22.0, "偏滿 20–25x"
+        elif fpe <= 35:
+            sub, tag = 10.0, "高估 25–35x"
+        else:
+            sub, tag = 2.0, "透支 >35x（偉大公司買太貴陷阱）"
+        earned += sub
+        parts.append(f"Forward P/E {fpe:.1f}x（{tag}）")
+    else:
+        earned += 16.0
+        parts.append("Forward P/E 缺失")
+
+    peg = master.peg_ratio
+    if peg is not None and peg > 0:
+        if peg <= 1.0:
+            sub, tag = 35.0, "PEG ≤1"
+        elif peg <= 1.5:
+            sub, tag = 28.0, "PEG 1.0–1.5"
+        elif peg <= 2.0:
+            sub, tag = 18.0, "PEG 1.5–2.0"
+        elif peg <= 3.0:
+            sub, tag = 8.0, "PEG 2.0–3.0"
+        else:
+            sub, tag = 2.0, "PEG >3"
+        earned += sub
+        parts.append(f"PEG {peg:.2f}（{tag}）")
+    else:
+        earned += 12.0
+        parts.append("PEG 缺失")
+
+    fcf_y = master.fcf_yield
+    if fcf_y is not None and fcf_y > 0:
+        if fcf_y >= 0.06:
+            sub, tag = 25.0, "FCF Yield ≥6%"
+        elif fcf_y >= 0.04:
+            sub, tag = 20.0, "FCF Yield 4%–6%"
+        elif fcf_y >= 0.025:
+            sub, tag = 14.0, "FCF Yield 2.5%–4%"
+        elif fcf_y >= 0.015:
+            sub, tag = 8.0, "FCF Yield 1.5%–2.5%"
+        else:
+            sub, tag = 3.0, "FCF Yield <1.5%"
+        earned += sub
+        parts.append(f"FCF Yield {fcf_y*100:.2f}%（{tag}）")
+    else:
+        earned += 8.0
+        parts.append("FCF Yield 缺失")
+
+    rationale = " · ".join(parts) + f"，估值邊際 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail(category, max_pts, round(min(earned, max_pts), 1), rationale)
 
 
 def grade_from_score(total: float, *, growth: bool = False) -> tuple[str, str]:
@@ -2711,6 +2897,8 @@ def format_master_metrics_block(master: MasterMetrics) -> str:
             f"- TTM Operating Margin: {_fmt_pct(master.ttm_operating_margin)}",
             f"- TTM Revenue Growth (revenueGrowth): {_fmt_pct(master.ttm_revenue_growth)}",
             f"- Trailing PEG (trailingPegRatio): {master.peg_ratio if master.peg_ratio is not None else 'N/A'}",
+            f"- Forward P/E: {master.forward_pe if master.forward_pe is not None else 'N/A'}",
+            f"- FCF Yield (FCF/MktCap): {_fmt_pct(master.fcf_yield)}",
             "",
             "[C] RETURN QUALITY & CONSENSUS:",
             f"- ROIC: {_fmt_pct(master.roic)} | ROA: {_fmt_pct(master.roa)} | ROE: {_fmt_pct(master.roe)}",
@@ -2740,17 +2928,27 @@ def _format_master_commentary_context(report: StockReport) -> str:
         if is_growth_strategy(report.strategy_mode)
         else STRATEGY_LABEL_VALUE
     )
+    quality = report.business_quality_score or report.total_score
+    valuation = report.valuation_margin_score
     lines = [
         f"Ticker: {report.symbol}",
         f"Company: {report.company_name}",
         f"Strategy: {mode_label}",
-        f"Total Score: {report.total_score}/100",
-        f"Grade: {report.grade_emoji} {report.grade_label}",
+        f"Business Quality Score: {quality:.1f}/100",
+        f"Valuation Margin Score: {valuation:.1f}/100",
+        f"Grade (quality-based): {report.grade_emoji} {report.grade_label}",
+    ]
+    if quality >= 85 and valuation < 60:
+        lines.append(
+            "⚠ VALUATION TRAP ALERT: Business quality elite but valuation margin <60 — "
+            "Red Team MUST attack overvaluation / priced-in perfection."
+        )
+    lines.extend([
         "",
         format_master_metrics_block(report.master),
         "",
         "Score breakdown:",
-    ]
+    ])
     for d in report.score_details:
         if is_growth_strategy(report.strategy_mode) and d.max_points <= 0:
             continue
@@ -2783,11 +2981,14 @@ def _format_master_commentary_context(report: StockReport) -> str:
 
 
 def _build_value_analyst_commentary(report: StockReport) -> str:
+    quality = report.business_quality_score or report.total_score
+    valuation = report.valuation_margin_score
     sections: list[str] = [
         "AI 首席分析師決策點評",
         f"{report.symbol} · {report.company_name}",
         "策略戰術：🛡️ 價值防禦模式",
-        f"綜合安全得分：{report.total_score:.1f} / 100 — {report.grade_emoji} {report.grade_label}",
+        f"綜合評分（雙軌）：企業品質 {quality:.1f}/100 · 估值安全邊際 {valuation:.1f}/100 — "
+        f"{report.grade_emoji} {report.grade_label}",
         "",
         "【評分明細（微觀原因）】",
     ]
@@ -2851,12 +3052,16 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
         "建議與 產業景氣、估值與個人風險偏好 一併考量。"
     )
 
-    if report.total_score >= 85:
+    if quality >= 85 and valuation < 60:
         sections.append(
-            "\n結論：護城河與現金流紀律俱佳，財務防禦確立，可作為核心底倉候選；"
-            "仍須追蹤產業景氣與估值。"
+            "\n⚠️ 品質極優，但估值過高，注意安全邊際。"
+            "紅隊必須質疑：當前價格已透支多少未來的完美預期？"
         )
-    elif report.total_score >= 70:
+    elif quality >= 85:
+        sections.append(
+            "\n結論：護城河與現金流紀律俱佳；仍須確認估值邊際是否提供足夠安全墊。"
+        )
+    elif quality >= 70:
         sections.append(
             "\n結論：體質穩健，但存在可改進項（見 ⚠️ 項目）；"
             "適合觀察名單或分批佈局。"
@@ -2874,7 +3079,8 @@ def _format_growth_commentary_context(report: StockReport) -> str:
         f"Ticker: {report.symbol}",
         f"Company: {report.company_name}",
         f"Strategy: {STRATEGY_LABEL_GROWTH}",
-        f"Total Score: {report.total_score}/100",
+        f"Business Quality: {report.business_quality_score or report.total_score:.1f}/100",
+        f"Valuation Margin: {report.valuation_margin_score:.1f}/100",
         f"Grade: {report.grade_emoji} {report.grade_label}",
         "",
         "Score breakdown (FCF/Dividend/Payout excluded — weight 0):",
@@ -2913,11 +3119,14 @@ def _format_growth_commentary_context(report: StockReport) -> str:
 
 
 def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
+    quality = report.business_quality_score or report.total_score
+    valuation = report.valuation_margin_score
     sections: list[str] = [
         "AI 首席分析師決策點評",
         f"{report.symbol} · {report.company_name}",
-        "策略戰術：🚀 動能成長模式 · VC / 趨勢交易視角",
-        f"綜合動能得分：{report.total_score:.1f} / 100 — {report.grade_emoji} {report.grade_label}",
+        "策略戰術：🚀 動能成長模式 · 紅隊審查視角",
+        f"雙軌得分：企業品質 {quality:.1f}/100 · 估值邊際 {valuation:.1f}/100 — "
+        f"{report.grade_emoji} {report.grade_label}",
         "",
         "【評分明細（動能引擎）】",
     ]
@@ -3073,9 +3282,9 @@ def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardIt
     """Return (commentary markdown, investment scorecard rows)."""
     growth = is_growth_strategy(report.strategy_mode)
     strategy_tagline = (
-        "🚀 動能成長模式 · 機構多空對峙 / 部門拆解 / 風險邊界"
+        "🚀 動能成長模式 · 紅隊審查 / 剝離成長敘事 vs 估值透支"
         if growth
-        else "🛡️ 價值防禦模式 · 葛拉漢安全邊際 / 巴菲特護城河視角"
+        else "🛡️ 價值防禦模式 · 紅隊審查 / 剝離好公司 vs 好價格"
     )
     context = _format_master_commentary_context(report)
     sym = report.symbol.upper()
@@ -3234,22 +3443,26 @@ def compute_scores(
     symbol: str = "",
     ticker: yf.Ticker | None = None,
     master: MasterMetrics | None = None,
-) -> tuple[list[ScoreDetail], float, str, str]:
+) -> tuple[list[ScoreDetail], float, float, str, str]:
+    """
+    Dual-track scoring: Business Quality (100) + Valuation Margin (100).
+
+    Returns (score_details, business_quality_score, valuation_margin_score, emoji, label).
+    """
     mode = normalize_strategy_mode(strategy_mode)
     master = master or MasterMetrics()
+    info = info or {}
 
     if mode == STRATEGY_GROWTH:
-        # 🚀 Forward asymmetry (PEG + CapEx) 40 / right-side technical 40 / surprise 20.
-        scored = [
-            score_forward_asymmetry_component(master),
-            score_growth_momentum_component(trend_signal),
-            score_earnings_surprise_component(
-                master, category="預期修正動態", max_pts=WEIGHT_GROWTH_SURPRISE
-            ),
-        ]
+        fund = score_growth_fundamental_component(master)
+        surp = score_earnings_surprise_component(
+            master, category="預期修正 Surprise", max_pts=WEIGHT_GROWTH_SURPRISE
+        )
+        peg_val = score_growth_peg_valuation_component(master)
+        tech = score_growth_technical_timing_component(trend_signal)
         excluded = [
             _growth_excluded_component(
-                "FCF 連續為正", "🚀 成長模式：歷史 FCF 不計分（權重 0，避免對燒錢新創的防禦偏見）。"
+                "FCF 連續為正", "🚀 成長模式：歷史 FCF 不計分（權重 0）。"
             ),
             _growth_excluded_component(
                 "股息連續成長", "🚀 成長模式：股息不計分（權重 0）。"
@@ -3258,21 +3471,28 @@ def compute_scores(
                 "股息發放率", "🚀 成長模式：發放率不計分（權重 0）。"
             ),
         ]
-        details = excluded + scored
-        total = round(sum(d.earned for d in scored), 1)
-        emoji, label = grade_from_score(total, growth=True)
-        return details, total, emoji, label
+        details = excluded + [fund, surp, peg_val, tech]
+        quality_raw = fund.earned + surp.earned
+        quality_max = WEIGHT_GROWTH_FUNDAMENTAL + WEIGHT_GROWTH_SURPRISE
+        business_quality = round(min(100.0, quality_raw / quality_max * 100.0), 1)
+        valuation_margin = round(
+            min(100.0, peg_val.earned / WEIGHT_GROWTH_PEG_VAL * 100.0), 1
+        )
+        emoji, label = grade_from_score(business_quality, growth=True)
+        return details, business_quality, valuation_margin, emoji, label
 
-    # 🛡️ Value defence — quality 35 / safety 25 / cashflow 25 / revenue 15 + death penalties.
-    details = [
+    quality_details = [
         score_value_quality_component(master),
         score_value_safety_component(master),
         score_value_cashflow_component(master, div_rows),
         score_value_revenue_stability_component(master),
     ]
-    total = _apply_value_death_penalties(details, master)
-    emoji, label = grade_from_score(total, growth=False)
-    return details, total, emoji, label
+    business_quality = _apply_value_death_penalties(quality_details, master)
+    val_detail = score_valuation_margin_component(master, info)
+    valuation_margin = val_detail.earned
+    details = quality_details + [val_detail]
+    emoji, label = grade_from_score(business_quality, growth=False)
+    return details, business_quality, valuation_margin, emoji, label
 
 
 def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
@@ -3293,7 +3513,7 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
 
     fcf_pass, fcf_note = evaluate_fcf(fcf_rows)
     div_pass, div_note = evaluate_dividends(div_rows)
-    score_details, total, emoji, label = compute_scores(
+    score_details, quality, valuation, emoji, label = compute_scores(
         fcf_rows,
         div_rows,
         payout,
@@ -3314,7 +3534,9 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
         payout_ratio=payout,
         beta=beta,
         score_details=score_details,
-        total_score=total,
+        total_score=quality,
+        business_quality_score=quality,
+        valuation_margin_score=valuation,
         grade_label=label,
         grade_emoji=emoji,
         fcf_pass=fcf_pass,
@@ -3418,27 +3640,30 @@ def reports_to_summary_df(
     rows = []
     growth_mode = is_growth_strategy(strategy_mode)
     for r in reports:
-        grade_emoji, grade_label = grade_from_score(
-            r.total_score, growth=growth_mode
-        )
+        quality = r.business_quality_score or r.total_score
+        valuation = r.valuation_margin_score
+        grade_emoji, grade_label = grade_from_score(quality, growth=growth_mode)
         grade_display = f"{grade_emoji} {grade_label}"
         if growth_mode:
             row = {
                 "Ticker": r.symbol,
                 "Company": r.company_name,
-                "綜合安全得分": r.total_score,
+                "企業品質分": quality,
+                "估值安全邊際": valuation,
                 "等級": grade_display,
-                "前瞻增長分": _detail_score(r, "前瞻", "增長", "不對稱"),
-                "技術面分": _detail_score(r, "技術", "右側", "動能"),
-                "預期修正分": _detail_score(r, "預期", "Surprise"),
+                "基本面增長分": _detail_score(r, "基本面增長"),
+                "預期修正分": _detail_score(r, "預期修正", "Surprise"),
+                "PEG估值分": _detail_score(r, "PEG", "估值相對"),
+                "Timing輔助": _detail_score(r, "Timing", "技術面輔助"),
             }
         else:
             row = {
                 "Ticker": r.symbol,
                 "Company": r.company_name,
-                "綜合安全得分": r.total_score,
+                "企業品質分": quality,
+                "估值安全邊際": valuation,
                 "等級": grade_display,
-                "企業品質分": _detail_score(r, "企業品質", "護城河"),
+                "護城河分": _detail_score(r, "企業品質", "護城河"),
                 "現金流品質分": _detail_score(r, "現金流"),
                 "財務安全分": _detail_score(r, "財務安全"),
                 "營收穩定分": _detail_score(r, "營收穩定"),
