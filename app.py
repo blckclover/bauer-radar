@@ -53,8 +53,8 @@ GRADE_COLORS = {
     "趨勢待確認": "#ef4444",
 }
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
-SCORE_COLUMNS_VALUE = ("企業品質分", "估值安全邊際", "護城河分", "現金流品質分", "財務安全分", "營收穩定分")
-SCORE_COLUMNS_GROWTH = ("企業品質分", "估值安全邊際", "基本面增長分", "PEG估值分", "預期修正分", "Timing輔助")
+SCORE_COLUMNS_VALUE = ("企業品質分", "估值安全分", "護城河分", "現金流品質分", "財務安全分", "營收穩定分")
+SCORE_COLUMNS_GROWTH = ("企業品質分", "估值安全分", "基本面增長分", "PEG估值分", "預期修正分", "Timing輔助", "風險緩衝")
 
 # Institutional factor glossary — surfaced via hover tooltips & glossary expander
 METRIC_TOOLTIPS: dict[str, str] = {
@@ -74,8 +74,8 @@ METRIC_TOOLTIPS: dict[str, str] = {
         "五年營收複合成長率，用於排除「便宜但衰退」的價值陷阱；"
         "負成長直接觸發營收穩定 0 分。"
     ),
-    "企業品質分": "Business Quality 0–100：ROIC、護城河、現金流、財務安全、營收穩定（不含估值）。",
-    "估值安全邊際": "Valuation Margin 0–100：Forward P/E、PEG、FCF Yield。<60 觸發買太貴紅燈。",
+    "企業品質分": "Business Quality 0–95（Red Team 封頂）：護城河、現金流、財務、營收。",
+    "估值安全分": "Valuation Safety 0–95：Forward P/E、PEG、FCF Yield。<50 觸發買太貴紅燈。",
     "等級": "依企業品質分映射；估值過高時另顯示紅燈警告。",
     "發放率": "每股盈餘發放率（輔助指標）；價值模式以 FCF 支付率為主判斷股息安全。",
     "Beta": "相對大盤波動係數；價值防禦模式不計入 Beta，僅供風險參考。",
@@ -104,9 +104,10 @@ SCORE_WEIGHT_TOOLTIPS_VALUE: dict[str, str] = {
 
 SCORE_WEIGHT_TOOLTIPS_GROWTH: dict[str, str] = {
     "基本面增長": "營收成長 + CapEx 擴張（30 分）→ 併入企業品質軌。",
-    "估值相對成長 (PEG)": "PEG 相對成長估值（25 分）→ 併入估值安全邊際軌。",
+    "估值相對成長 (PEG)": "PEG 相對成長估值（25 分）→ 併入估值安全分軌。",
     "預期修正 Surprise": "EPS Surprise / 分析師修正（25 分）→ 併入企業品質軌。",
     "技術面輔助 (Timing)": "SMA 均線僅作 Timing 輔助（15 分），不主導決策。",
+    "風險緩衝": "紅旗扣分緩衝（5 分）：槓桿、CapEx/利益率陷阱、高 Beta。",
 }
 
 SCORECARD_TOOLTIPS: dict[str, str] = {
@@ -190,8 +191,8 @@ def _strategy_short_name(mode: str | None = None) -> str:
 def _strategy_weight_caption(mode: str | None = None) -> str:
     active = mode or _current_strategy_mode()
     if is_growth_strategy(active):
-        return "雙軌計分 · 品質(基本面30+Surprise25) / 估值(PEG25) / Timing輔助15"
-    return "雙軌計分 · 品質(35+25+25+15) / 估值(Forward P/E+PEG+FCF Yield 100)"
+        return "雙軌計分 · 品質(30+25) / 估值(PEG25) / Timing15 / 風險緩衝5 · 封頂95"
+    return "雙軌計分 · 品質(35+25+25+15) / 估值(Fwd P/E+PEG+FCF Yield) · 封頂95"
 
 
 def _on_strategy_mode_change() -> None:
@@ -991,7 +992,10 @@ def _format_grade(report: StockReport) -> str:
 
 def _valuation_trap_warning(report: StockReport) -> bool:
     quality = report.business_quality_score or report.total_score
-    return quality >= 70 and report.valuation_margin_score < 60
+    val = getattr(report, "valuation_safety_score", None)
+    if val is None:
+        val = report.valuation_margin_score
+    return quality >= 70 and val < 50
 
 
 def _render_valuation_trap_alert(report: StockReport) -> None:
@@ -1134,7 +1138,7 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
             tone = ""
             if col == "企業品質分":
                 tone = _score_tone(raw)
-            elif col == "估值安全邊際":
+            elif col == "估值安全分":
                 tone = _score_tone(raw)
             elif col == "等級":
                 tone = _grade_tone(raw)
@@ -1297,7 +1301,7 @@ def _style_summary_table(df: pd.DataFrame):
             color = "#f87171"
         return f"color: {color}; font-weight: 600; text-align: center;"
 
-    score_cols = [c for c in ("企業品質分", "估值安全邊際") if c in df.columns]
+    score_cols = [c for c in ("企業品質分", "估值安全分") if c in df.columns]
     styled = df.style
     for col in score_cols:
         styled = styled.map(color_score, subset=[col])
@@ -2312,7 +2316,13 @@ def _coerce_report(report: object) -> StockReport:
         business_quality_score=float(
             report.get("business_quality_score", report.get("total_score", 0.0)) or 0.0
         ),
-        valuation_margin_score=float(report.get("valuation_margin_score", 0.0) or 0.0),
+        valuation_safety_score=float(
+            report.get(
+                "valuation_safety_score",
+                report.get("valuation_margin_score", 0.0),
+            )
+            or 0.0
+        ),
         grade_label=str(report.get("grade_label", "")),
         grade_emoji=str(report.get("grade_emoji", "")),
         analyst_commentary=str(report.get("analyst_commentary", "")),
@@ -2406,10 +2416,11 @@ def _render_company_detail(report: StockReport) -> None:
     _render_valuation_trap_alert(report)
 
     quality = report.business_quality_score or report.total_score
+    val_score = report.valuation_safety_score
     _render_fx_metric_row(
         [
-            ("企業品質分", _fmt1(quality), "Business Quality · 滿分100"),
-            ("估值安全邊際", _fmt1(report.valuation_margin_score), "Forward P/E · PEG · FCF Yield"),
+            ("企業品質分", _fmt1(quality), f"Business Quality · 封頂95"),
+            ("估值安全分", _fmt1(val_score), "Forward P/E · PEG · FCF Yield · 封頂95"),
             ("等級", _format_grade(report)),
             (
                 "發放率",
@@ -2498,7 +2509,7 @@ def _render_core_scoring_tab() -> None:
         [
             ("分析標的", str(len(reports))),
             ("高品質 (≥85)", str(len(top))),
-            ("估值紅燈 (<60)", str(len(val_traps))),
+            ("估值紅燈 (<50)", str(len(val_traps))),
             ("評分權重", _strategy_short_name(mode), weight_caption),
             (
                 "均品質分",
@@ -2784,17 +2795,16 @@ def _render_sidebar() -> None:
     st.sidebar.header("量化評分標準")
     st.sidebar.markdown(
         """
-        **雙軌計分（Quality vs Valuation）**
-        - **企業品質分** (100)：護城河 · 現金流 · 財務安全 · 營收
-        - **估值安全邊際** (100)：Forward P/E · PEG · FCF Yield
-        - **<60 估值紅燈**：品質再高也須警惕買太貴
+        **Red Team Protocol · 雙軌計分（封頂 95）**
+        - **企業品質分**：護城河 · 現金流 · 財務 · 營收
+        - **估值安全分**：Forward P/E · PEG · FCF Yield
+        - **<50 估值紅燈**：品質極優但估值過高
 
         **🛡️ 價值模式品質權重**：35/25/25/15 + 死亡懲罰
 
-        **🚀 動能模式**：基本面30 + Surprise25 + PEG25 + Timing15
-        - 技術面降級為 Timing 輔助，不主導決策
+        **🚀 動能模式**：基本面30 + Surprise25 + PEG25 + Timing15 + 風險緩衝5
 
-        **等級**：依企業品質分映射 · 紅隊 AI 強制漏洞審查
+        **等級**：依企業品質分 · 紅隊 AI 強制【🩸漏洞審查】
         """
     )
     st.sidebar.header("逆向轉機股雷達")
@@ -2805,7 +2815,7 @@ def _render_sidebar() -> None:
         2. 估值吸引力（52週高點 / PEG）
         3. FCF > 0 · 淨槓桿 < 3x · 利息保障 > 3x
         4. 毛利率 YoY 穩定
-        5. **3Y 營收 CAGR > 0**（拒絕萎縮本業）
+        5. **3Y 營收 CAGR > 0** 或 **季毛利率 > 產業中位數/無結構崩塌**
         6. 🛡️ 100分防禦評分 · Gemini 錯殺標籤
         """
     )

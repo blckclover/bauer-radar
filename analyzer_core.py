@@ -53,11 +53,14 @@ VALUE_SCORE_DEATH_CAP = 69.0
 FCF_PAYOUT_EXTRA_PENALTY = 10.0
 # Turnaround radar — anti-bankruptcy gate (shared with death penalty)
 NET_DEBT_EBITDA_MAX = 3.0
-# 🚀 Growth momentum — nerfed technicals; quality vs valuation split
+# Red Team Protocol — absolute score ceiling (no 100/100 «perfect safety»)
+SCORE_CAP = 95.0
+# 🚀 Growth momentum — nerfed technicals; quality vs valuation split (30/25/25/15/5)
 WEIGHT_GROWTH_FUNDAMENTAL = 30.0   # revenue / CapEx fundamental growth
 WEIGHT_GROWTH_SURPRISE = 25.0      # EPS surprise / revision
 WEIGHT_GROWTH_PEG_VAL = 25.0       # PEG relative-growth valuation
 WEIGHT_GROWTH_TECH_TIMING = 15.0   # SMA timing auxiliary only (demoted)
+WEIGHT_GROWTH_RISK_BUFFER = 5.0    # balance-sheet / red-flag risk cushion
 # Legacy aliases (backward compat for helpers)
 WEIGHT_GROWTH_FORWARD = WEIGHT_GROWTH_FUNDAMENTAL + WEIGHT_GROWTH_PEG_VAL
 WEIGHT_GROWTH_MOMENTUM = WEIGHT_GROWTH_TECH_TIMING
@@ -90,6 +93,21 @@ TURNAROUND_LOOKBACK = "6mo"
 TURNAROUND_MIN_DRAWDOWN_PCT = 15.0
 TURNAROUND_REVENUE_CAGR_YEARS = 3
 TURNAROUND_STRUCTURAL_GM_DECLINE_PP = 5.0
+# Sector gross-margin median benchmarks (%, approximate) for anti-decay filter
+SECTOR_GM_MEDIAN_PCT: dict[str, float] = {
+    "Technology": 52.0,
+    "Healthcare": 58.0,
+    "Consumer Defensive": 32.0,
+    "Consumer Cyclical": 28.0,
+    "Industrials": 35.0,
+    "Energy": 38.0,
+    "Utilities": 42.0,
+    "Real Estate": 55.0,
+    "Basic Materials": 30.0,
+    "Communication Services": 45.0,
+    "Financial Services": 0.0,
+}
+DEFAULT_SECTOR_GM_MEDIAN_PCT = 35.0
 # Valuation attractiveness — price vs 52-week high OR trailing PEG
 TURNAROUND_52W_HIGH_RATIO_MAX = 0.75   # current / 52w high < 0.75 → ≥25% off highs
 TURNAROUND_PEG_MAX = 1.5
@@ -366,8 +384,8 @@ class StockReport:
     beta: float | None = None
     score_details: list[ScoreDetail] = field(default_factory=list)
     total_score: float = 0.0                       # legacy alias → business_quality_score
-    business_quality_score: float = 0.0            # Business Quality 0–100
-    valuation_margin_score: float = 0.0            # Valuation Margin 0–100
+    business_quality_score: float = 0.0            # Business Quality 0–100 (capped)
+    valuation_safety_score: float = 0.0            # Valuation Safety 0–100 (capped)
     grade_label: str = ""
     grade_emoji: str = ""
     analyst_commentary: str = ""
@@ -387,8 +405,13 @@ class StockReport:
             return None
         return (
             self.business_quality_score >= 70
-            and self.valuation_margin_score >= 60
+            and self.valuation_safety_score >= 50
         )
+
+    @property
+    def valuation_margin_score(self) -> float:
+        """Legacy alias — Red Team Protocol uses valuation_safety_score."""
+        return self.valuation_safety_score
 
 
 @lru_cache(maxsize=1)
@@ -1359,21 +1382,41 @@ def fetch_master_metrics(
     )
 
 
-def _anti_value_trap_filter(ticker: yf.Ticker) -> bool:
-    """
-    Anti-value-trap gate: reject names whose core business is shrinking.
+def _cap_red_team_score(score: float) -> float:
+    """Red Team Protocol — no score may exceed SCORE_CAP (absolute safety forbidden)."""
+    return round(min(max(float(score), 0.0), SCORE_CAP), 1)
 
-    Pass when 3Y revenue CAGR > 0. When CAGR is unknown, require latest-quarter
-    gross margin to show no structural collapse (YoY decline ≤ threshold).
-    Any confirmed 3Y revenue decline → hard reject regardless of drawdown.
+
+def _sector_gm_median_pct(info: dict) -> float:
+    """Approximate sector gross-margin median for anti-decay comparison."""
+    sector = str(info.get("sector") or "").strip()
+    if sector in SECTOR_GM_MEDIAN_PCT:
+        med = SECTOR_GM_MEDIAN_PCT[sector]
+        if med > 0:
+            return med
+    return DEFAULT_SECTOR_GM_MEDIAN_PCT
+
+
+def _anti_value_trap_filter(ticker: yf.Ticker, info: dict | None = None) -> bool:
     """
+    Anti-decay gate (Red Team Protocol):
+
+    Pass when ANY of:
+      · 3Y revenue CAGR > 0
+      · latest-quarter gross margin > sector median
+      · gross margin shows no structural collapse (YoY decline ≤ threshold)
+    """
+    info = info or {}
     cagr_3y = fetch_revenue_cagr_3y(ticker)
-    if cagr_3y is not None:
-        return cagr_3y > 0
+    if cagr_3y is not None and cagr_3y > 0:
+        return True
 
-    margin_ok, _, gm_change = _gross_margin_filter(ticker)
-    if gm_change is None:
-        return False
+    margin_ok, gm_pct, _ = _gross_margin_filter(ticker)
+    if gm_pct is not None:
+        sector_med = _sector_gm_median_pct(info)
+        if sector_med > 0 and gm_pct > sector_med:
+            return True
+
     return margin_ok
 
 
@@ -1671,7 +1714,7 @@ def _screen_single_turnaround(
         return None
 
     # Filter 5 — anti-value-trap: reject shrinking core businesses.
-    if not _anti_value_trap_filter(ticker):
+    if not _anti_value_trap_filter(ticker, info):
         return None
 
     rd_expense, rd_year = fetch_latest_rd_expense(sym, ticker=ticker)
@@ -2708,7 +2751,51 @@ def score_growth_peg_valuation_component(master: MasterMetrics) -> ScoreDetail:
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
 
+def score_growth_risk_buffer_component(
+    master: MasterMetrics,
+    beta: float | None = None,
+) -> ScoreDetail:
+    """Risk buffer (5): deduct for red flags — balance sheet, volatility, margin/CapEx traps."""
+    max_pts = WEIGHT_GROWTH_RISK_BUFFER
+    category = "風險緩衝"
+    earned = max_pts
+    parts: list[str] = ["基準滿分"]
+
+    if master.operating_margin_red_flag:
+        earned -= 2.0
+        parts.append("營業利益率紅旗 -2")
+    if master.capex_red_flag:
+        earned -= 1.5
+        parts.append("CapEx 效率陷阱 -1.5")
+    if master.net_debt_ebitda is not None and master.net_debt_ebitda > NET_DEBT_EBITDA_MAX:
+        earned -= 2.0
+        parts.append(f"淨槓桿 {master.net_debt_ebitda:.1f}x -2")
+    if beta is not None and beta > 2.5:
+        earned -= 1.0
+        parts.append(f"高 Beta {beta:.2f} -1")
+
+    earned = max(0.0, min(earned, max_pts))
+    rationale = " · ".join(parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
+def score_valuation_safety_component(
+    master: MasterMetrics,
+    info: dict | None = None,
+) -> ScoreDetail:
+    """Valuation Safety (100): Forward P/E + PEG + FCF Yield — isolated from quality."""
+    return _score_valuation_safety_inner(master, info)
+
+
 def score_valuation_margin_component(
+    master: MasterMetrics,
+    info: dict | None = None,
+) -> ScoreDetail:
+    """Legacy alias → Valuation Safety component."""
+    return score_valuation_safety_component(master, info)
+
+
+def _score_valuation_safety_inner(
     master: MasterMetrics,
     info: dict | None = None,
 ) -> ScoreDetail:
@@ -2718,7 +2805,7 @@ def score_valuation_margin_component(
     Isolated from Business Quality — exposes 'great company, bad price' traps.
     """
     max_pts = 100.0
-    category = "估值安全邊際"
+    category = "估值安全分"
     info = info or {}
     earned = 0.0
     parts: list[str] = []
@@ -2779,7 +2866,7 @@ def score_valuation_margin_component(
         earned += 8.0
         parts.append("FCF Yield 缺失")
 
-    rationale = " · ".join(parts) + f"，估值邊際 {earned:.1f}/{max_pts:.0f} 分。"
+    rationale = " · ".join(parts) + f"，估值安全 {earned:.1f}/{max_pts:.0f} 分。"
     return ScoreDetail(category, max_pts, round(min(earned, max_pts), 1), rationale)
 
 
@@ -2929,18 +3016,18 @@ def _format_master_commentary_context(report: StockReport) -> str:
         else STRATEGY_LABEL_VALUE
     )
     quality = report.business_quality_score or report.total_score
-    valuation = report.valuation_margin_score
+    valuation = report.valuation_safety_score
     lines = [
         f"Ticker: {report.symbol}",
         f"Company: {report.company_name}",
         f"Strategy: {mode_label}",
-        f"Business Quality Score: {quality:.1f}/100",
-        f"Valuation Margin Score: {valuation:.1f}/100",
+        f"Business Quality Score: {quality:.1f}/100 (cap {SCORE_CAP:.0f})",
+        f"Valuation Safety Score: {valuation:.1f}/100 (cap {SCORE_CAP:.0f})",
         f"Grade (quality-based): {report.grade_emoji} {report.grade_label}",
     ]
-    if quality >= 85 and valuation < 60:
+    if quality >= 70 and valuation < 50:
         lines.append(
-            "⚠ VALUATION TRAP ALERT: Business quality elite but valuation margin <60 — "
+            "⚠ VALUATION TRAP ALERT: Business quality strong but Valuation Safety <50 — "
             "Red Team MUST attack overvaluation / priced-in perfection."
         )
     lines.extend([
@@ -2982,12 +3069,12 @@ def _format_master_commentary_context(report: StockReport) -> str:
 
 def _build_value_analyst_commentary(report: StockReport) -> str:
     quality = report.business_quality_score or report.total_score
-    valuation = report.valuation_margin_score
+    valuation = report.valuation_safety_score
     sections: list[str] = [
         "AI 首席分析師決策點評",
         f"{report.symbol} · {report.company_name}",
         "策略戰術：🛡️ 價值防禦模式",
-        f"綜合評分（雙軌）：企業品質 {quality:.1f}/100 · 估值安全邊際 {valuation:.1f}/100 — "
+        f"Red Team 雙軌：企業品質 {quality:.1f}/95 · 估值安全 {valuation:.1f}/95 — "
         f"{report.grade_emoji} {report.grade_label}",
         "",
         "【評分明細（微觀原因）】",
@@ -3052,7 +3139,7 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
         "建議與 產業景氣、估值與個人風險偏好 一併考量。"
     )
 
-    if quality >= 85 and valuation < 60:
+    if quality >= 70 and valuation < 50:
         sections.append(
             "\n⚠️ 品質極優，但估值過高，注意安全邊際。"
             "紅隊必須質疑：當前價格已透支多少未來的完美預期？"
@@ -3080,7 +3167,7 @@ def _format_growth_commentary_context(report: StockReport) -> str:
         f"Company: {report.company_name}",
         f"Strategy: {STRATEGY_LABEL_GROWTH}",
         f"Business Quality: {report.business_quality_score or report.total_score:.1f}/100",
-        f"Valuation Margin: {report.valuation_margin_score:.1f}/100",
+        f"Valuation Safety: {report.valuation_safety_score:.1f}/100",
         f"Grade: {report.grade_emoji} {report.grade_label}",
         "",
         "Score breakdown (FCF/Dividend/Payout excluded — weight 0):",
@@ -3120,12 +3207,12 @@ def _format_growth_commentary_context(report: StockReport) -> str:
 
 def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
     quality = report.business_quality_score or report.total_score
-    valuation = report.valuation_margin_score
+    valuation = report.valuation_safety_score
     sections: list[str] = [
         "AI 首席分析師決策點評",
         f"{report.symbol} · {report.company_name}",
         "策略戰術：🚀 動能成長模式 · 紅隊審查視角",
-        f"雙軌得分：企業品質 {quality:.1f}/100 · 估值邊際 {valuation:.1f}/100 — "
+        f"Red Team 雙軌：企業品質 {quality:.1f}/95 · 估值安全 {valuation:.1f}/95 — "
         f"{report.grade_emoji} {report.grade_label}",
         "",
         "【評分明細（動能引擎）】",
@@ -3445,9 +3532,10 @@ def compute_scores(
     master: MasterMetrics | None = None,
 ) -> tuple[list[ScoreDetail], float, float, str, str]:
     """
-    Dual-track scoring: Business Quality (100) + Valuation Margin (100).
+    Dual-track scoring: Business Quality (100) + Valuation Safety (100).
 
-    Returns (score_details, business_quality_score, valuation_margin_score, emoji, label).
+    Both tracks capped at SCORE_CAP (95). Returns
+    (score_details, business_quality_score, valuation_safety_score, emoji, label).
     """
     mode = normalize_strategy_mode(strategy_mode)
     master = master or MasterMetrics()
@@ -3460,6 +3548,7 @@ def compute_scores(
         )
         peg_val = score_growth_peg_valuation_component(master)
         tech = score_growth_technical_timing_component(trend_signal)
+        risk_buf = score_growth_risk_buffer_component(master, beta)
         excluded = [
             _growth_excluded_component(
                 "FCF 連續為正", "🚀 成長模式：歷史 FCF 不計分（權重 0）。"
@@ -3471,15 +3560,15 @@ def compute_scores(
                 "股息發放率", "🚀 成長模式：發放率不計分（權重 0）。"
             ),
         ]
-        details = excluded + [fund, surp, peg_val, tech]
+        details = excluded + [fund, surp, peg_val, tech, risk_buf]
         quality_raw = fund.earned + surp.earned
         quality_max = WEIGHT_GROWTH_FUNDAMENTAL + WEIGHT_GROWTH_SURPRISE
-        business_quality = round(min(100.0, quality_raw / quality_max * 100.0), 1)
-        valuation_margin = round(
-            min(100.0, peg_val.earned / WEIGHT_GROWTH_PEG_VAL * 100.0), 1
+        business_quality = _cap_red_team_score(quality_raw / quality_max * 100.0)
+        valuation_safety = _cap_red_team_score(
+            peg_val.earned / WEIGHT_GROWTH_PEG_VAL * 100.0
         )
         emoji, label = grade_from_score(business_quality, growth=True)
-        return details, business_quality, valuation_margin, emoji, label
+        return details, business_quality, valuation_safety, emoji, label
 
     quality_details = [
         score_value_quality_component(master),
@@ -3487,12 +3576,14 @@ def compute_scores(
         score_value_cashflow_component(master, div_rows),
         score_value_revenue_stability_component(master),
     ]
-    business_quality = _apply_value_death_penalties(quality_details, master)
-    val_detail = score_valuation_margin_component(master, info)
-    valuation_margin = val_detail.earned
+    business_quality = _cap_red_team_score(
+        _apply_value_death_penalties(quality_details, master)
+    )
+    val_detail = score_valuation_safety_component(master, info)
+    valuation_safety = _cap_red_team_score(val_detail.earned)
     details = quality_details + [val_detail]
     emoji, label = grade_from_score(business_quality, growth=False)
-    return details, business_quality, valuation_margin, emoji, label
+    return details, business_quality, valuation_safety, emoji, label
 
 
 def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
@@ -3536,7 +3627,7 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
         score_details=score_details,
         total_score=quality,
         business_quality_score=quality,
-        valuation_margin_score=valuation,
+        valuation_safety_score=valuation,
         grade_label=label,
         grade_emoji=emoji,
         fcf_pass=fcf_pass,
@@ -3641,7 +3732,7 @@ def reports_to_summary_df(
     growth_mode = is_growth_strategy(strategy_mode)
     for r in reports:
         quality = r.business_quality_score or r.total_score
-        valuation = r.valuation_margin_score
+        valuation = r.valuation_safety_score
         grade_emoji, grade_label = grade_from_score(quality, growth=growth_mode)
         grade_display = f"{grade_emoji} {grade_label}"
         if growth_mode:
@@ -3649,19 +3740,20 @@ def reports_to_summary_df(
                 "Ticker": r.symbol,
                 "Company": r.company_name,
                 "企業品質分": quality,
-                "估值安全邊際": valuation,
+                "估值安全分": valuation,
                 "等級": grade_display,
                 "基本面增長分": _detail_score(r, "基本面增長"),
                 "預期修正分": _detail_score(r, "預期修正", "Surprise"),
                 "PEG估值分": _detail_score(r, "PEG", "估值相對"),
                 "Timing輔助": _detail_score(r, "Timing", "技術面輔助"),
+                "風險緩衝": _detail_score(r, "風險緩衝"),
             }
         else:
             row = {
                 "Ticker": r.symbol,
                 "Company": r.company_name,
                 "企業品質分": quality,
-                "估值安全邊際": valuation,
+                "估值安全分": valuation,
                 "等級": grade_display,
                 "護城河分": _detail_score(r, "企業品質", "護城河"),
                 "現金流品質分": _detail_score(r, "現金流"),
