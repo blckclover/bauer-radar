@@ -38,11 +38,12 @@ STRATEGY_LABEL_TO_MODE: dict[str, str] = {
     STRATEGY_LABEL_GROWTH: STRATEGY_GROWTH,
 }
 
-# --- Master-grade scoring weights (expected-value / risk-premium model) ---
-# 🛡️ Value defence — Graham margin-of-safety + Buffett moat
-WEIGHT_VALUE_MOAT = 50.0       # ROIC/ROE + gross-margin pricing power + interest coverage
-WEIGHT_VALUE_SURPRISE = 20.0   # earnings surprise (consensus repricing trigger)
-WEIGHT_VALUE_CASHFLOW = 30.0   # FCF discipline + dividend / payout regularity
+# --- Master-grade scoring weights (DGI value defence model) ---
+# 🛡️ Value defence — quality moat / dividend safety / balance sheet / growth floor
+WEIGHT_VALUE_QUALITY = 40.0    # ROIC + gross-margin stability + operating margin
+WEIGHT_VALUE_DIVIDEND = 30.0   # FCF payout ratio + dividend growth streak
+WEIGHT_VALUE_SAFETY = 20.0     # Net Debt/EBITDA + interest coverage
+WEIGHT_VALUE_GROWTH = 10.0     # 5Y revenue CAGR anti-stagnation floor
 # 🚀 Growth momentum — Soros reflexivity + PEG scissors + right-side trend
 WEIGHT_GROWTH_FORWARD = 40.0   # PEG asymmetry + CapEx expansion lead indicator
 WEIGHT_GROWTH_MOMENTUM = 40.0  # Close > SMA20 & SMA50 mid-term MA cluster support
@@ -107,6 +108,28 @@ TOTAL_REVENUE_ROW_NAMES = (
     "TotalRevenue",
     "Total Revenue",
     "OperatingRevenue",
+)
+EBITDA_ROW_NAMES = (
+    "EBITDA",
+    "NormalizedEBITDA",
+    "Ebitda",
+)
+TOTAL_DEBT_ROW_NAMES = (
+    "TotalDebt",
+    "Total Debt",
+    "LongTermDebt",
+    "Long Term Debt And Capital Lease Obligation",
+)
+CASH_ROW_NAMES = (
+    "CashAndCashEquivalents",
+    "Cash And Cash Equivalents",
+    "CashCashEquivalentsAndShortTermInvestments",
+)
+STOCKHOLDER_EQUITY_ROW_NAMES = (
+    "StockholdersEquity",
+    "Total Stockholder Equity",
+    "CommonStockEquity",
+    "Total Equity Gross Minority Interest",
 )
 # Operating-margin YoY decline ≥ this many pp triggers a pricing-power red flag
 OPERATING_MARGIN_RED_FLAG_PP = 2.0
@@ -260,11 +283,16 @@ class MasterMetrics:
     peg_ratio: float | None = None          # trailingPegRatio — growth/valuation scissors
     capex_growth: float | None = None       # YoY growth of quarterly CapEx (expansion lead)
     capex_latest: float | None = None       # latest quarterly CapEx magnitude (abs, USD)
-    roe: float | None = None                # returnOnEquity
-    roa: float | None = None                # returnOnAssets (ROIC proxy)
-    gross_margins: float | None = None      # pricing power proxy
+    roe: float | None = None                # returnOnEquity (secondary to ROIC)
+    roa: float | None = None                # returnOnAssets (ROIC fallback)
+    roic: float | None = None               # returnOnCapitalEmployed or strict ROIC
+    gross_margins: float | None = None      # pricing power proxy (TTM)
+    gross_margin_volatility: float | None = None  # max-min gross margin range (pp, 3-5Y)
     interest_coverage: float | None = None  # EBIT / |interest expense|
+    net_debt_ebitda: float | None = None    # (totalDebt - cash) / EBITDA
+    fcf_payout_ratio: float | None = None   # |dividends paid| / FCF
     revenue_growth: float | None = None     # revenueGrowth (fallback signal)
+    revenue_cagr_5y: float | None = None    # 5-year revenue CAGR from filings
     surprise_latest_pct: float | None = None  # latest EPS surprise %
     surprise_beat_streak: int = 0           # consecutive recent beats
     surprise_sample: int = 0                # number of reported quarters compared
@@ -796,6 +824,191 @@ def compute_interest_coverage(ticker: yf.Ticker) -> float | None:
     return round(ebit / interest, 2)
 
 
+def fetch_roic(info: dict, ticker: yf.Ticker) -> tuple[float | None, float | None]:
+    """Return (roic, roa). ROIC priority: returnOnCapitalEmployed → strict ROIC → ROA."""
+    roa = _safe_info_float(info, "returnOnAssets")
+    roce = _safe_info_float(info, "returnOnCapitalEmployed")
+    if roce is not None:
+        return roce, roa
+
+    try:
+        bs = ticker.get_balance_sheet(freq="yearly")
+        inc = ticker.get_income_stmt(freq="yearly")
+    except Exception:
+        return roa, roa
+
+    if bs is None or bs.empty or inc is None or inc.empty:
+        return roa, roa
+
+    ebit_row = _pick_row(inc, *EBIT_ROW_NAMES)
+    debt_row = _pick_row(bs, *TOTAL_DEBT_ROW_NAMES)
+    equity_row = _pick_row(bs, *STOCKHOLDER_EQUITY_ROW_NAMES)
+    cash_row = _pick_row(bs, *CASH_ROW_NAMES)
+    if ebit_row is None or equity_row is None:
+        return roa, roa
+
+    try:
+        latest_col = sorted(inc.columns, reverse=True)[0]
+        ebit = float(ebit_row.get(latest_col))
+        equity = float(equity_row.get(latest_col))
+        debt = float(debt_row.get(latest_col)) if debt_row is not None else 0.0
+        cash = float(cash_row.get(latest_col)) if cash_row is not None else 0.0
+    except (TypeError, ValueError, IndexError):
+        return roa, roa
+
+    if pd.isna(ebit) or pd.isna(equity):
+        return roa, roa
+
+    invested_capital = debt + equity - cash
+    if invested_capital <= 0:
+        return roa, roa
+
+    roic = ebit / invested_capital
+    return round(roic, 4), roa
+
+
+def fetch_net_debt_ebitda(info: dict, ticker: yf.Ticker) -> float | None:
+    """Net Debt / EBITDA — leverage signal for DGI safety screen."""
+    direct = _safe_info_float(info, "netDebtToEbitda")
+    if direct is not None and direct >= 0:
+        return round(direct, 2)
+
+    total_debt = _safe_info_float(info, "totalDebt")
+    cash = _safe_info_float(info, "totalCash") or _safe_info_float(info, "cash")
+    ebitda = _safe_info_float(info, "ebitda")
+
+    if total_debt is not None and cash is not None and ebitda is not None and ebitda > 0:
+        return round((total_debt - cash) / ebitda, 2)
+
+    try:
+        bs = ticker.get_balance_sheet(freq="yearly")
+        inc = ticker.get_income_stmt(freq="yearly")
+    except Exception:
+        return None
+    if bs is None or bs.empty:
+        return None
+
+    debt_row = _pick_row(bs, *TOTAL_DEBT_ROW_NAMES)
+    cash_row = _pick_row(bs, *CASH_ROW_NAMES)
+    if debt_row is None:
+        return None
+
+    try:
+        latest_col = sorted(bs.columns, reverse=True)[0]
+        debt = float(debt_row.get(latest_col))
+        cash_val = float(cash_row.get(latest_col)) if cash_row is not None else 0.0
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    if ebitda is None and inc is not None and not inc.empty:
+        ebitda_row = _pick_row(inc, *EBITDA_ROW_NAMES)
+        if ebitda_row is not None:
+            try:
+                ebitda = float(ebitda_row.get(latest_col))
+            except (TypeError, ValueError):
+                ebitda = None
+
+    if ebitda is None or pd.isna(ebitda) or ebitda <= 0:
+        return None
+
+    net_debt = debt - cash_val
+    return round(net_debt / ebitda, 2)
+
+
+def fetch_fcf_payout_ratio(
+    symbol: str,
+    ticker: yf.Ticker,
+    info: dict,
+) -> float | None:
+    """FCF payout = |cash dividends paid| / free cash flow (latest fiscal year).
+
+    Falls back to yfinance payoutRatio when FCF-based ratio is unavailable.
+    """
+    try:
+        cf = ticker.get_cashflow(freq="yearly")
+    except Exception:
+        cf = None
+
+    if cf is not None and not cf.empty:
+        div_row = _pick_row(cf, "CashDividendsPaid", "Cash Dividends Paid")
+        fcf_row = _pick_row(cf, "FreeCashFlow", "Free Cash Flow")
+        if div_row is not None and fcf_row is not None:
+            for col in sorted(cf.columns, reverse=True):
+                try:
+                    div = abs(float(div_row.get(col)))
+                    fcf = float(fcf_row.get(col))
+                except (TypeError, ValueError):
+                    continue
+                if pd.notna(div) and pd.notna(fcf) and fcf > 0:
+                    return round(div / fcf, 4)
+
+    return fetch_payout_ratio(symbol, ticker=ticker)
+
+
+def fetch_revenue_cagr_5y(ticker: yf.Ticker) -> float | None:
+    """5-year revenue CAGR from annual income statements."""
+    try:
+        inc = ticker.get_income_stmt(freq="yearly")
+    except Exception:
+        return None
+    if inc is None or inc.empty:
+        return None
+
+    rev_row = _pick_row(inc, *TOTAL_REVENUE_ROW_NAMES)
+    if rev_row is None:
+        return None
+
+    col_dates = sorted(inc.columns, reverse=True)
+    revenues: list[float] = []
+    for col in col_dates[:6]:
+        try:
+            val = float(rev_row.get(col))
+        except (TypeError, ValueError):
+            continue
+        if pd.notna(val) and val > 0:
+            revenues.append(val)
+
+    if len(revenues) < 2:
+        return None
+
+    years = len(revenues) - 1
+    if years <= 0 or revenues[-1] <= 0:
+        return None
+
+    cagr = (revenues[0] / revenues[-1]) ** (1.0 / years) - 1.0
+    return round(cagr, 4)
+
+
+def fetch_gross_margin_volatility(ticker: yf.Ticker, years: int = 5) -> float | None:
+    """Max-min gross margin range (percentage points) over recent fiscal years."""
+    try:
+        inc = ticker.get_income_stmt(freq="yearly")
+    except Exception:
+        return None
+    if inc is None or inc.empty:
+        return None
+
+    gross_row = _pick_row(inc, *GROSS_PROFIT_ROW_NAMES)
+    rev_row = _pick_row(inc, *TOTAL_REVENUE_ROW_NAMES)
+    if gross_row is None or rev_row is None:
+        return None
+
+    margins: list[float] = []
+    for col in sorted(inc.columns, reverse=True)[:years]:
+        try:
+            g = float(gross_row.get(col))
+            r = float(rev_row.get(col))
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        if pd.notna(g) and pd.notna(r) and r > 0:
+            margins.append(g / r)
+
+    if len(margins) < 2:
+        return None
+
+    return round((max(margins) - min(margins)) * 100.0, 2)
+
+
 def fetch_capex_growth(ticker: yf.Ticker) -> tuple[float | None, float | None]:
     """YoY growth of quarterly CapEx as an expansion / industry-tailwind lead signal.
 
@@ -1001,16 +1214,22 @@ def fetch_master_metrics(
     capex_flag, capex_msg = _evaluate_capex_red_flag(
         capex_growth, margin_trend.get("operating_margin_change_pp")
     )
+    roic, roa = fetch_roic(info, t)
 
     return MasterMetrics(
         peg_ratio=_safe_info_float(info, "trailingPegRatio"),
         capex_growth=capex_growth,
         capex_latest=capex_latest,
         roe=_safe_info_float(info, "returnOnEquity"),
-        roa=_safe_info_float(info, "returnOnAssets"),
+        roa=roa,
+        roic=roic,
         gross_margins=_safe_info_float(info, "grossMargins"),
+        gross_margin_volatility=fetch_gross_margin_volatility(t),
         interest_coverage=compute_interest_coverage(t),
+        net_debt_ebitda=fetch_net_debt_ebitda(info, t),
+        fcf_payout_ratio=fetch_fcf_payout_ratio(symbol, t, info),
         revenue_growth=_safe_info_float(info, "revenueGrowth"),
+        revenue_cagr_5y=fetch_revenue_cagr_5y(t),
         surprise_latest_pct=(surprise or {}).get("latest_surprise_pct"),
         surprise_beat_streak=(surprise or {}).get("beat_streak", 0),
         surprise_sample=(surprise or {}).get("sample", 0),
@@ -1834,93 +2053,204 @@ def _growth_excluded_component(category: str, note: str) -> ScoreDetail:
     return ScoreDetail(category, 0.0, 0.0, note)
 
 
-def score_moat_quality_component(master: MasterMetrics) -> ScoreDetail:
-    """🛡️ Business moat & quality (50): ROE + ROA + gross-margin pricing power + interest coverage."""
-    max_pts = WEIGHT_VALUE_MOAT
-    category = "商業護城河與質量"
+def score_value_quality_component(master: MasterMetrics) -> ScoreDetail:
+    """🛡️ Enterprise quality & moat (40): ROIC + GM stability + operating margin."""
+    max_pts = WEIGHT_VALUE_QUALITY
+    category = "企業品質與護城河"
     earned = 0.0
     parts: list[str] = []
 
-    # ROE — capital allocation quality (max 15)
-    roe = master.roe
-    if roe is not None:
-        if roe >= 0.20:
-            sub, tag = 15.0, "卓越 ≥20%"
-        elif roe >= 0.15:
-            sub, tag = 12.0, "優異 15%–20%"
-        elif roe >= 0.10:
-            sub, tag = 9.0, "穩健 10%–15%"
-        elif roe > 0:
-            sub, tag = 4.5, "偏低 <10%"
+    # ROIC — true capital efficiency (max 15); priority over ROE
+    roic = master.roic if master.roic is not None else master.roa
+    if roic is not None:
+        if roic >= 0.15:
+            sub, tag = 15.0, "卓越 ≥15%"
+        elif roic >= 0.12:
+            sub, tag = 12.0, "優異 12%–15%"
+        elif roic >= 0.10:
+            sub, tag = 9.0, "穩健 10%–12%"
+        elif roic >= 0.07:
+            sub, tag = 6.0, "普通 7%–10%"
+        elif roic >= 0.04:
+            sub, tag = 3.0, "偏弱 4%–7%"
+        elif roic > 0:
+            sub, tag = 1.5, "低 <4%"
         else:
-            sub, tag = 0.0, "為負（資本回報受損）"
+            sub, tag = 0.0, "為負（資本配置失敗）"
         earned += sub
-        parts.append(f"ROE {roe*100:.1f}%（{tag}）")
+        src = "ROIC" if master.roic is not None else "ROA proxy"
+        parts.append(f"{src} {roic*100:.1f}%（{tag}）")
+        if master.roe is not None and master.roic is not None and master.roe > master.roic * 1.8:
+            parts.append(f"⚠ ROE {master.roe*100:.1f}% 顯著高於 ROIC，留意槓桿撐高假象")
     else:
         earned += 15.0 * 0.30
-        parts.append("ROE 數據缺失（給予中性基礎）")
+        parts.append("ROIC 數據缺失（給予中性基礎）")
 
-    # ROA / ROIC proxy — asset efficiency (max 10)
-    roa = master.roa
-    if roa is not None:
-        if roa >= 0.10:
-            sub, tag = 10.0, "高效 ≥10%"
-        elif roa >= 0.05:
-            sub, tag = 7.0, "良好 5%–10%"
-        elif roa >= 0.02:
-            sub, tag = 4.0, "普通 2%–5%"
-        elif roa > 0:
-            sub, tag = 1.5, "偏弱 <2%"
+    # Gross margin stability — pricing power persistence (max 10)
+    gm_vol = master.gross_margin_volatility
+    if gm_vol is not None:
+        if gm_vol <= 5.0:
+            sub, tag = 10.0, "極穩定 ≤5pp"
+        elif gm_vol <= 10.0:
+            sub, tag = 7.0, "穩健 5–10pp"
+        elif gm_vol <= 15.0:
+            sub, tag = 4.0, "波動 10–15pp"
+        elif gm_vol <= 20.0:
+            sub, tag = 2.0, "不穩 15–20pp"
         else:
-            sub, tag = 0.0, "為負"
+            sub, tag = 0.0, "劇烈波動 >20pp"
         earned += sub
-        parts.append(f"ROA {roa*100:.1f}%（{tag}）")
+        parts.append(f"毛利率波動 {gm_vol:.1f}pp（{tag}）")
     else:
         earned += 10.0 * 0.30
-        parts.append("ROA 數據缺失")
+        parts.append("毛利率穩定度數據不足")
 
-    # Gross margin — pricing power / switching-cost proxy (max 15)
-    gm = master.gross_margins
-    if gm is not None:
-        if gm >= 0.50:
-            sub, tag = 15.0, "強定價權 ≥50%"
-        elif gm >= 0.40:
-            sub, tag = 12.0, "穩固 40%–50%"
-        elif gm >= 0.30:
-            sub, tag = 9.0, "中等 30%–40%"
-        elif gm >= 0.20:
-            sub, tag = 6.0, "偏低 20%–30%"
-        elif gm > 0:
-            sub, tag = 3.0, "薄利 <20%"
+    # Operating margin — unit economics (max 15)
+    om = master.ttm_operating_margin
+    if om is None and master.operating_margin_latest is not None:
+        om = master.operating_margin_latest / 100.0
+    if om is not None:
+        if om >= 0.20:
+            sub, tag = 15.0, "強勢 ≥20%"
+        elif om >= 0.15:
+            sub, tag = 12.0, "優良 15%–20%"
+        elif om >= 0.10:
+            sub, tag = 9.0, "穩健 10%–15%"
+        elif om >= 0.05:
+            sub, tag = 5.0, "普通 5%–10%"
+        elif om > 0:
+            sub, tag = 2.0, "薄利 <5%"
         else:
             sub, tag = 0.0, "為負"
         earned += sub
-        parts.append(f"毛利率 {gm*100:.1f}%（{tag}）")
+        parts.append(f"營業利益率 {om*100:.1f}%（{tag}）")
     else:
         earned += 15.0 * 0.30
-        parts.append("毛利率數據缺失")
+        parts.append("營業利益率數據缺失")
 
-    # Interest coverage — balance-sheet durability (max 10)
+    rationale = " · ".join(parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
+def score_value_dividend_component(
+    master: MasterMetrics,
+    div_rows: list[YearDividend],
+) -> ScoreDetail:
+    """🛡️ Dividend & cashflow quality (30): FCF payout + dividend growth streak."""
+    max_pts = WEIGHT_VALUE_DIVIDEND
+    category = "股息與現金流品質"
+    earned = 0.0
+    parts: list[str] = []
+
+    # FCF payout ratio (max 15)
+    fcf_pay = master.fcf_payout_ratio
+    if fcf_pay is not None:
+        if fcf_pay > 0.90:
+            sub, tag = 0.0, "危險 >90%（股息裁減風險極高）"
+        elif fcf_pay <= 0.50:
+            sub, tag = 15.0, "安全 ≤50%"
+        elif fcf_pay <= 0.70:
+            sub, tag = 11.0, "穩健 50%–70%"
+        elif fcf_pay <= 0.80:
+            sub, tag = 7.0, "偏緊 70%–80%"
+        else:
+            sub, tag = 3.0, "警戒 80%–90%"
+        earned += sub
+        parts.append(f"FCF 支付率 {fcf_pay*100:.1f}%（{tag}）")
+    else:
+        earned += 15.0 * 0.35
+        parts.append("FCF 支付率數據不足（給予中性基礎）")
+
+    # Dividend growth & payment stability (max 15)
+    div_detail = score_dividend_growth_component(div_rows)
+    div_part = div_detail.earned / WEIGHT_DIV * 15.0
+    earned += div_part
+    parts.append(f"股息成長 {div_part:.1f}/15 — {div_detail.rationale.split('，本項')[0]}")
+
+    rationale = " · ".join(parts) + f"，合計 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
+def score_value_safety_component(master: MasterMetrics) -> ScoreDetail:
+    """🛡️ Financial safety (20): Net Debt/EBITDA + interest coverage."""
+    max_pts = WEIGHT_VALUE_SAFETY
+    category = "財務安全防線"
+    earned = 0.0
+    parts: list[str] = []
+
+    # Net Debt / EBITDA (max 10)
+    nd_ebitda = master.net_debt_ebitda
+    if nd_ebitda is not None:
+        if nd_ebitda > 3.0:
+            sub, tag = 0.0, "高槓桿 >3x"
+        elif nd_ebitda <= 2.0:
+            sub, tag = 10.0, "穩健 ≤2x"
+        elif nd_ebitda <= 2.5:
+            sub, tag = 8.0, "可接受 2–2.5x"
+        else:
+            sub, tag = 5.0, "偏緊 2.5–3x"
+        earned += sub
+        parts.append(f"淨債務/EBITDA {nd_ebitda:.1f}x（{tag}）")
+    else:
+        earned += 10.0 * 0.50
+        parts.append("淨債務/EBITDA 數據不足")
+
+    # Interest coverage (max 10)
     cov = master.interest_coverage
     if cov is not None:
-        if cov >= 8:
-            sub, tag = 10.0, "護城河深厚 ≥8x"
-        elif cov >= 5:
-            sub, tag = 8.0, "穩健 5–8x"
-        elif cov >= 3:
-            sub, tag = 5.5, "可接受 3–5x"
+        if cov >= 5.0:
+            sub, tag = 10.0, "充裕 ≥5x"
+        elif cov >= 4.0:
+            sub, tag = 8.0, "穩健 4–5x"
+        elif cov >= 3.0:
+            sub, tag = 5.0, "及格 3–4x"
         elif cov >= 1.5:
-            sub, tag = 3.0, "偏緊 1.5–3x"
+            sub, tag = 2.0, "偏緊 1.5–3x"
         else:
             sub, tag = 0.0, "脆弱 <1.5x"
         earned += sub
         parts.append(f"利息保障 {cov:.1f}x（{tag}）")
     else:
-        # No meaningful interest expense → debt-light, treat as durable.
-        earned += 10.0 * 0.80
+        earned += 10.0 * 0.85
         parts.append("低負債結構（無顯著利息支出）")
 
     rationale = " · ".join(parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
+def score_value_growth_floor_component(master: MasterMetrics) -> ScoreDetail:
+    """🛡️ Anti-inflation growth floor (10): 5Y revenue CAGR."""
+    max_pts = WEIGHT_VALUE_GROWTH
+    category = "抗通膨成長底線"
+    cagr = master.revenue_cagr_5y
+
+    if cagr is not None:
+        if cagr < 0:
+            earned, tag = 0.0, "負成長（衰退型價值陷阱風險）"
+        elif cagr >= 0.05:
+            earned, tag = max_pts, "強勁 ≥5%"
+        elif cagr >= 0.03:
+            earned, tag = 7.0, "溫和 3%–5%"
+        elif cagr >= 0:
+            earned, tag = 4.0, "停滯 0%–3%"
+        else:
+            earned, tag = 0.0, "衰退"
+        rationale = f"5Y 營收 CAGR {cagr*100:+.1f}%（{tag}），本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    else:
+        rev = master.revenue_growth or master.ttm_revenue_growth
+        if rev is not None and rev >= 0.05:
+            earned = max_pts * 0.70
+            rationale = (
+                f"5Y CAGR 不足，以 TTM 營收增速 {rev*100:+.1f}% 輔助，"
+                f"本項得 {earned:.1f}/{max_pts:.0f} 分。"
+            )
+        elif rev is not None and rev < 0:
+            earned = 0.0
+            rationale = f"TTM 營收衰退 {rev*100:+.1f}%，本項得 0/{max_pts:.0f} 分。"
+        else:
+            earned = max_pts * 0.35
+            rationale = f"營收成長數據不足，給予中性基礎 {earned:.1f}/{max_pts:.0f} 分。"
+
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
 
@@ -1960,32 +2290,6 @@ def score_earnings_surprise_component(
     rationale = (
         f"最新一季 Surprise {latest_txt} · 樣本 {sample} 季 · {tag}，"
         f"本項得 {earned:.1f}/{max_pts:.0f} 分。"
-    )
-    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
-
-
-def score_value_cashflow_component(
-    fcf_rows: list[YearFCF],
-    div_rows: list[YearDividend],
-    payout: float | None,
-) -> ScoreDetail:
-    """🛡️ Cashflow discipline (30): FCF stability + dividend regularity + payout health."""
-    max_pts = WEIGHT_VALUE_CASHFLOW
-    category = "股息與現金流紀律"
-
-    fcf_detail = score_fcf_component(fcf_rows)
-    div_detail = score_dividend_growth_component(div_rows)
-    payout_detail = score_payout_component(payout)
-
-    # Rescale sub-components into the 30-pt envelope: FCF 18 / dividend 8 / payout 4.
-    fcf_part = fcf_detail.earned / WEIGHT_FCF * 18.0
-    div_part = div_detail.earned / WEIGHT_DIV * 8.0
-    payout_part = payout_detail.earned / WEIGHT_PAYOUT * 4.0
-    earned = fcf_part + div_part + payout_part
-
-    rationale = (
-        f"FCF 紀律 {fcf_part:.1f}/18 · 股息規律 {div_part:.1f}/8 · "
-        f"發放率 {payout_part:.1f}/4，合計 {earned:.1f}/{max_pts:.0f} 分。"
     )
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
@@ -2154,7 +2458,12 @@ def format_master_metrics_block(master: MasterMetrics) -> str:
             f"- Trailing PEG (trailingPegRatio): {master.peg_ratio if master.peg_ratio is not None else 'N/A'}",
             "",
             "[C] RETURN QUALITY & CONSENSUS:",
-            f"- ROE: {_fmt_pct(master.roe)} | ROA (ROIC proxy): {_fmt_pct(master.roa)}",
+            f"- ROIC: {_fmt_pct(master.roic)} | ROA: {_fmt_pct(master.roa)} | ROE: {_fmt_pct(master.roe)}",
+            f"- Gross Margin Volatility (3-5Y range): "
+            f"{f'{master.gross_margin_volatility:.1f}pp' if master.gross_margin_volatility is not None else 'N/A'}",
+            f"- Net Debt / EBITDA: {master.net_debt_ebitda if master.net_debt_ebitda is not None else 'N/A'}",
+            f"- FCF Payout Ratio: {_fmt_pct(master.fcf_payout_ratio)}",
+            f"- 5Y Revenue CAGR: {_fmt_pct(master.revenue_cagr_5y)}",
             f"- Interest Coverage (latest annual): {cov}",
             (
                 f"- Earnings Surprise (latest quarter): {surprise} · "
@@ -2253,24 +2562,36 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
 
     m = report.master
     sections.append("")
-    sections.append("#### 前瞻硬指標（期望值輸入）")
+    sections.append("#### DGI 防禦硬指標")
+    roic_txt = _fmt_pct(m.roic) if m.roic is not None else _fmt_pct(m.roa)
     sections.append(
-        f"- 護城河質量：ROE {_fmt_pct(m.roe)} · ROA {_fmt_pct(m.roa)} · "
-        f"毛利率 {_fmt_pct(m.gross_margins)} · 利息保障 "
-        f"{f'{m.interest_coverage:.1f}x' if m.interest_coverage is not None else '低負債/未知'}"
+        f"- **ROIC / 資本回報**：{roic_txt} · ROE {_fmt_pct(m.roe)}"
+        + (" · ⚠ ROE 顯著高於 ROIC" if m.roe and m.roic and m.roe > m.roic * 1.8 else "")
     )
-    surprise_txt = (
-        f"{m.surprise_latest_pct:+.1f}%" if m.surprise_latest_pct is not None else "N/A"
+    fcf_pay = _fmt_pct(m.fcf_payout_ratio)
+    nd_ebitda = f"{m.net_debt_ebitda:.1f}x" if m.net_debt_ebitda is not None else "N/A"
+    rev_cagr = _fmt_pct(m.revenue_cagr_5y)
+    sections.append(
+        f"- **FCF 支付率**：{fcf_pay} · **淨債務/EBITDA** {nd_ebitda} · "
+        f"**5Y 營收 CAGR** {rev_cagr}"
+    )
+    cov_txt = f"{m.interest_coverage:.1f}x" if m.interest_coverage is not None else "低負債/未知"
+    gm_vol = (
+        f"{m.gross_margin_volatility:.1f}pp"
+        if m.gross_margin_volatility is not None
+        else "N/A"
     )
     sections.append(
-        f"- 預期偏差 Surprise：最新 {surprise_txt} · 連續超預期 {m.surprise_beat_streak} 季"
+        f"- **利息保障** {cov_txt} · **毛利率波動** {gm_vol} · "
+        f"**營業利益率** {_fmt_pct(m.ttm_operating_margin)}"
     )
 
     sections.append("")
     sections.append("#### 投資風格提示")
     sections.append(
-        "- 本模式以 **商業護城河質量(50) + 預期偏差(20) + 現金流紀律(30)** 計分，"
-        "對應葛拉漢安全邊際與巴菲特護城河；建議與 **產業景氣、估值與個人風險偏好** 一併考量。"
+        "- 本模式以 **企業品質(40) + 股息現金流(30) + 財務安全(20) + 成長底線(10)** 計分，"
+        "聚焦 ROIC 真實護城河、FCF 股息安全網與抗衰退底線；"
+        "建議與 **產業景氣、估值與個人風險偏好** 一併考量。"
     )
 
     if report.total_score >= 85:
@@ -2593,13 +2914,12 @@ def compute_scores(
         emoji, label = grade_from_score(total, growth=True)
         return details, total, emoji, label
 
-    # 🛡️ Value defence — moat 50 / surprise 20 / cashflow discipline 30.
+    # 🛡️ Value defence — quality 40 / dividend 30 / safety 20 / growth floor 10.
     details = [
-        score_moat_quality_component(master),
-        score_earnings_surprise_component(
-            master, category="預期偏差 Surprise", max_pts=WEIGHT_VALUE_SURPRISE
-        ),
-        score_value_cashflow_component(fcf_rows, div_rows, payout),
+        score_value_quality_component(master),
+        score_value_dividend_component(master, div_rows),
+        score_value_safety_component(master),
+        score_value_growth_floor_component(master),
     ]
     total = round(sum(d.earned for d in details), 1)
     emoji, label = grade_from_score(total, growth=False)
@@ -2769,9 +3089,10 @@ def reports_to_summary_df(
                 "Company": r.company_name,
                 "綜合安全得分": r.total_score,
                 "等級": grade_display,
-                "護城河分": _detail_score(r, "護城河", "質量"),
-                "預期偏差分": _detail_score(r, "預期", "Surprise"),
-                "現金流紀律分": _detail_score(r, "現金流", "股息"),
+                "企業品質分": _detail_score(r, "企業品質", "護城河"),
+                "股息現金流分": _detail_score(r, "股息", "現金流"),
+                "財務安全分": _detail_score(r, "財務安全"),
+                "成長底線分": _detail_score(r, "成長底線", "抗通膨"),
             }
         rows.append(row)
     return pd.DataFrame(rows)

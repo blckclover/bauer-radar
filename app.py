@@ -52,7 +52,7 @@ GRADE_COLORS = {
     "趨勢待確認": "#ef4444",
 }
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
-SCORE_COLUMNS_VALUE = ("綜合安全得分", "護城河分", "預期偏差分", "現金流紀律分")
+SCORE_COLUMNS_VALUE = ("綜合安全得分", "企業品質分", "股息現金流分", "財務安全分", "成長底線分")
 SCORE_COLUMNS_GROWTH = ("綜合安全得分", "前瞻增長分", "技術面分", "預期修正分")
 GLOBAL_STRATEGY_KEY = "global_strategy_mode"
 ACTIVE_STRATEGY_KEY = "active_strategy"
@@ -123,7 +123,7 @@ def _strategy_weight_caption(mode: str | None = None) -> str:
     active = mode or _current_strategy_mode()
     if is_growth_strategy(active):
         return "前瞻增長40 (PEG+CapEx) + 技術右側40 + 預期修正20（FCF/股息不計分）"
-    return "商業護城河50 (ROIC/ROE/毛利率/利息保障) + 預期偏差20 + 現金流紀律30"
+    return "企業品質40 (ROIC/毛利率穩定/營業利益率) + 股息現金流30 (FCF支付率/股息成長) + 財務安全20 (淨債務EBITDA/利息保障) + 成長底線10 (5Y營收CAGR)"
 
 
 def _on_strategy_mode_change() -> None:
@@ -1799,9 +1799,14 @@ def _coerce_master(raw: object) -> MasterMetrics:
         capex_latest=_rget(raw, "capex_latest"),
         roe=_rget(raw, "roe"),
         roa=_rget(raw, "roa"),
+        roic=_rget(raw, "roic"),
         gross_margins=_rget(raw, "gross_margins"),
+        gross_margin_volatility=_rget(raw, "gross_margin_volatility"),
         interest_coverage=_rget(raw, "interest_coverage"),
+        net_debt_ebitda=_rget(raw, "net_debt_ebitda"),
+        fcf_payout_ratio=_rget(raw, "fcf_payout_ratio"),
         revenue_growth=_rget(raw, "revenue_growth"),
+        revenue_cagr_5y=_rget(raw, "revenue_cagr_5y"),
         surprise_latest_pct=_rget(raw, "surprise_latest_pct"),
         surprise_beat_streak=_rget(raw, "surprise_beat_streak", 0),
         surprise_sample=_rget(raw, "surprise_sample", 0),
@@ -1952,11 +1957,16 @@ def _render_master_metric_row(report: object) -> None:
             ("近一季 Surprise", surprise_val, surprise_sub),
         ]
     else:
+        roic_v = _rget(m, "roic")
+        roe_v = _rget(m, "roe")
+        fcf_pay_v = _rget(m, "fcf_payout_ratio")
+        nd_ebitda_v = _rget(m, "net_debt_ebitda")
+        rev_cagr_v = _rget(m, "revenue_cagr_5y")
         items = [
-            ("ROE", _pct(roe_v), "股東資金回報質量"),
-            ("毛利率", _pct(gross_v), "定價權 / 轉嫁通膨"),
-            ("利息保障倍數", cov, "EBIT / 利息 · 護城河"),
-            ("近一季 Surprise", surprise_val, surprise_sub),
+            ("ROIC", _pct(roic_v) if roic_v is not None else _pct(roe_v), "資本回報 · 優先於 ROE"),
+            ("FCF 支付率", _pct(fcf_pay_v), "股息 / 自由現金流"),
+            ("淨債務/EBITDA", f"{float(nd_ebitda_v):.1f}x" if nd_ebitda_v is not None else "N/A", "槓桿安全線"),
+            ("5Y 營收 CAGR", _pct(rev_cagr_v), "抗衰退成長底線"),
         ]
     _render_fx_metric_row(items)
 
@@ -2297,10 +2307,11 @@ def _render_sidebar() -> None:
     st.sidebar.header("量化評分標準")
     st.sidebar.markdown(
         """
-        **🛡️ 價值防禦模式**
-        - **商業護城河與質量** (50)：ROIC/ROE · 毛利率 · 利息保障
-        - **預期偏差 Surprise** (20)：是否連續超越市場預期
-        - **股息與現金流紀律** (30)：FCF 穩定度 · 配息規律
+        **🛡️ 價值防禦模式（DGI 量化）**
+        - **企業品質與護城河** (40)：ROIC · 毛利率穩定度 · 營業利益率
+        - **股息與現金流品質** (30)：FCF 支付率 · 股息連續成長
+        - **財務安全防線** (20)：淨債務/EBITDA · 利息保障倍數
+        - **抗通膨成長底線** (10)：5Y 營收 CAGR（負成長直接 0 分）
 
         **🚀 動能成長模式**
         - **前瞻增長不對稱性** (40)：PEG 剪刀差 + CapEx 擴張率
