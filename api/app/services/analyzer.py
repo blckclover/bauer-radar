@@ -29,8 +29,10 @@ from analyzer_core import (  # noqa: E402
     normalize_strategy_mode,
 )
 
+from app.config import settings
 from app.schemas.scorecard import (
     AnalyzeResponse,
+    FcfHistoryPoint,
     MetricItem,
     NarrativeResponse,
     QualityScore,
@@ -39,6 +41,7 @@ from app.schemas.scorecard import (
     ScoreDimension,
     ValuationScore,
 )
+from app.services.cache import cache_get, cache_set
 
 StrategyMode = Literal["value", "growth"]
 
@@ -275,6 +278,20 @@ def _build_red_team_findings(report: StockReport) -> list[RedTeamFinding]:
     return findings
 
 
+def _build_fcf_history(report: StockReport) -> list[FcfHistoryPoint]:
+    points: list[FcfHistoryPoint] = []
+    for row in report.fcf_history or []:
+        points.append(
+            FcfHistoryPoint(
+                fiscal_year=int(row.fiscal_year),
+                free_cash_flow=float(row.free_cash_flow),
+                period_end=str(row.period_end or ""),
+                source=str(row.source or ""),
+            )
+        )
+    return points
+
+
 def _report_to_scorecard(report: StockReport) -> ScorecardResult:
     mode = _normalize_mode(report.strategy_mode)
     growth = mode == "growth"
@@ -327,6 +344,12 @@ def analyze_ticker(ticker: str, *, mode: str = STRATEGY_VALUE) -> AnalyzeRespons
         raise AnalyzerServiceError("無效的股票代號。", status_code=400, code="invalid_ticker")
 
     strategy = normalize_strategy_mode(mode)
+    cache_key = f"analyze:{sym}:{strategy}"
+    if settings.enable_analyze_cache:
+        cached = cache_get(cache_key)
+        if isinstance(cached, AnalyzeResponse):
+            return cached.model_copy(update={"data_source": "cache"})
+
     try:
         report = analyze_symbol(sym, strategy_mode=strategy)
     except Exception as exc:
@@ -336,12 +359,18 @@ def analyze_ticker(ticker: str, *, mode: str = STRATEGY_VALUE) -> AnalyzeRespons
     if commentary and _RATE_LIMIT_PATTERN.search(commentary):
         commentary = None
 
-    return AnalyzeResponse(
+    response = AnalyzeResponse(
         scorecard=_report_to_scorecard(report),
         red_team_findings=_build_red_team_findings(report),
         analyst_commentary=commentary,
+        fcf_history=_build_fcf_history(report),
         data_source="live",
     )
+
+    if settings.enable_analyze_cache:
+        cache_set(cache_key, response, ttl_seconds=settings.cache_ttl_seconds)
+
+    return response
 
 
 def get_narrative(ticker: str, *, mode: str = STRATEGY_VALUE) -> NarrativeResponse:

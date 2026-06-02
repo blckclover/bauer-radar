@@ -3072,6 +3072,168 @@ def _format_master_commentary_context(report: StockReport) -> str:
     return "\n".join(lines)
 
 
+def _sleep_gemini_retry(attempt: int) -> None:
+    """Pause before next Gemini retry (exponential backoff + jitter)."""
+    from llm_processor import gemini_retry_sleep_seconds
+
+    time.sleep(gemini_retry_sleep_seconds(attempt))
+
+
+def _build_red_team_attack_block(report: StockReport) -> list[str]:
+    """Deterministic 2–3 red-team attack lines when LLM is offline."""
+    m = report.master
+    quality = float(report.business_quality_score or report.total_score or 0.0)
+    valuation = float(report.valuation_safety_score or 0.0)
+    growth = is_growth_strategy(report.strategy_mode)
+    attacks: list[str] = []
+
+    if quality >= 70 and valuation < 50:
+        attacks.append(
+            f"品質分 {quality:.0f} 但估值安全僅 {valuation:.0f}：屬「好公司、貴價格」陷阱，"
+            "市場可能已透支未來完美預期。"
+        )
+    if m.peg_ratio is not None and m.peg_ratio > 1.8:
+        attacks.append(
+            f"前瞻 PEG {m.peg_ratio:.2f} 偏高：若 CapEx 無法轉化為毛利，"
+            "高成長敘事易淪為估值下修。"
+        )
+    elif m.peg_ratio is not None and m.peg_ratio > 1.35:
+        attacks.append(
+            f"PEG {m.peg_ratio:.2f} 未見明顯安全邊際，股價已提前反映中高速成長假設。"
+        )
+    if m.fcf_payout_ratio is not None and m.fcf_payout_ratio > FCF_PAYOUT_DEATH_THRESHOLD:
+        attacks.append(
+            f"FCF 支付率 {m.fcf_payout_ratio * 100:.1f}% 透支股息承諾，"
+            f"裁息或舉債填缺口風險上升（>{FCF_PAYOUT_DEATH_THRESHOLD * 100:.0f}% 門檻）。"
+        )
+    elif m.fcf_payout_ratio is not None and m.fcf_payout_ratio > 0.75:
+        attacks.append(
+            f"FCF 支付率 {m.fcf_payout_ratio * 100:.1f}% 偏高，"
+            "自由現金流對股東回饋的緩衝有限。"
+        )
+    if m.net_debt_ebitda is not None and m.net_debt_ebitda > NET_DEBT_EBITDA_DEATH_THRESHOLD:
+        attacks.append(
+            f"淨債務/EBITDA {m.net_debt_ebitda:.1f}x 逾 {NET_DEBT_EBITDA_DEATH_THRESHOLD:.0f}x 死亡線，"
+            f"財務安全應視為一票否決級風險（品質分封頂 {VALUE_SCORE_DEATH_CAP:.0f}）。"
+        )
+    elif m.net_debt_ebitda is not None and m.net_debt_ebitda > 2.0:
+        attacks.append(
+            f"淨槓桿 {m.net_debt_ebitda:.1f}x 仍處高區間，利率與再融資敏感度偏高。"
+        )
+    if m.interest_coverage is not None and m.interest_coverage < 3.0:
+        attacks.append(
+            f"利息保障倍數僅 {m.interest_coverage:.1f}x，"
+            "景氣下行時利息支出對利潤侵蝕顯著。"
+        )
+    if m.operating_margin_red_flag:
+        msg = (m.operating_margin_red_flag_msg or "").strip()
+        attacks.append(
+            f"營業利益率紅旗：{msg}" if msg else "營業利益率同比惡化，定價權/成本轉嫁能力存疑。"
+        )
+    if m.capex_red_flag:
+        msg = (m.capex_red_flag_msg or "").strip()
+        attacks.append(
+            f"CapEx 警訊：{msg}" if msg else "CapEx 異常波動，需質疑擴張能否轉為毛利。"
+        )
+    if growth:
+        if m.surprise_latest_pct is not None and m.surprise_latest_pct < 0:
+            attacks.append(
+                f"最新 Surprise {m.surprise_latest_pct:+.1f}% 為負，"
+                "預期修正向下風險尚未解除。"
+            )
+        elif (m.surprise_beat_streak or 0) == 0 and (m.surprise_sample or 0) > 0:
+            attacks.append("缺乏連續超預期紀錄，動能敘事缺少盈利驗證支撐。")
+        ts = report.trend_signal or {}
+        sig = str(ts.get("current_signal", "") or "")
+        if sig == "Sell":
+            attacks.append("技術面 Death Cross：中期動能衰竭，不宜過度解讀反彈。")
+        elif sig == "Wait":
+            attacks.append("價格仍處弱勢通道，右側結構未確認。")
+    if quality < 65:
+        attacks.append(
+            f"企業品質分僅 {quality:.0f}，護城河與現金流紀律不足以支撐積極倉位。"
+        )
+    if valuation < 45:
+        attacks.append(
+            f"估值安全分 {valuation:.0f} 偏低，即使基本面尚可，風險報酬比仍不利做多。"
+        )
+    if report.fcf_pass is False:
+        note = (report.fcf_note or "自由現金流不穩定").strip()
+        attacks.append(f"FCF 紀律未通過：{note}")
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for line in attacks:
+        if line in seen:
+            continue
+        seen.add(line)
+        unique.append(line)
+        if len(unique) >= 3:
+            break
+    while len(unique) < 2:
+        unique.append(
+            "離線紅隊：請人工複核 Forward P/E、PEG 與 FCF Yield 是否與敘事一致，"
+            "避免單邊樂觀偏誤。"
+        )
+    return unique[:3]
+
+
+def _red_team_section_lines(report: StockReport) -> list[str]:
+    """Red-team attack block matching LLM prompt contract (2–3 bullets)."""
+    lines = ["", "【🩸 紅隊漏洞審查 (Red Team Attack)】"]
+    for attack in _build_red_team_attack_block(report):
+        lines.append(f"- {attack}")
+    return lines
+
+
+def _value_debt_decline_section_lines(report: StockReport) -> list[str]:
+    """Value-mode second red-team section: leverage & decline risks."""
+    m = report.master
+    bullets: list[str] = []
+    if m.net_debt_ebitda is not None:
+        bullets.append(
+            f"淨債務/EBITDA {m.net_debt_ebitda:.1f}x："
+            + (
+                "已觸發死亡懲罰區間，再融資與利息成本可能壓縮股東回報。"
+                if m.net_debt_ebitda > NET_DEBT_EBITDA_DEATH_THRESHOLD
+                else "槓桿偏高時，景氣反轉易放大每股盈利波動。"
+            )
+        )
+    if m.interest_coverage is not None and m.interest_coverage < 5.0:
+        bullets.append(
+            f"利息保障 {m.interest_coverage:.1f}x 偏弱，"
+            "利率上行或 EBIT 下滑將直接侵蝕自由現金流。"
+        )
+    if m.revenue_cagr_5y is not None and m.revenue_cagr_5y < 0:
+        bullets.append(
+            f"5Y 營收 CAGR {_fmt_pct(m.revenue_cagr_5y)} 為負，"
+            "衰退型價值陷阱風險高於單純「便宜」標籤。"
+        )
+    if m.roe and m.roic and m.roe > m.roic * 1.8:
+        bullets.append(
+            f"ROE {_fmt_pct(m.roe)} 顯著高於 ROIC {_fmt_pct(m.roic)}，"
+            "護城河敘事可能由槓桿而非真實資本回報支撐。"
+        )
+    if not bullets:
+        bullets.append(
+            "離線模式：仍須人工核對債務契約、到期牆與景氣敏感度，"
+            "避免低估週期性下行。"
+        )
+    lines = ["", "【債務槓桿與衰退風險】"]
+    for b in bullets[:2]:
+        lines.append(f"- {b}")
+    return lines
+
+
+def _safe_narrative_fallback_text(raw: str | None) -> str:
+    """Sanitize static summary fallback — never cache or show poisoned API text."""
+    from llm_processor import accept_llm_cache_result
+
+    if not raw:
+        return ""
+    return accept_llm_cache_result(str(raw).strip()) or ""
+
+
 def _build_value_analyst_commentary(report: StockReport) -> str:
     quality = report.business_quality_score or report.total_score
     valuation = report.valuation_safety_score
@@ -3136,6 +3298,9 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
         f"營業利益率 {_fmt_pct(m.ttm_operating_margin)}"
     )
 
+    sections.extend(_red_team_section_lines(report))
+    sections.extend(_value_debt_decline_section_lines(report))
+
     sections.append("")
     sections.append("【投資風格提示】")
     sections.append(
@@ -3145,10 +3310,7 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
     )
 
     if quality >= 70 and valuation < 50:
-        sections.append(
-            "\n⚠️ 品質極優，但估值過高，注意安全邊際。"
-            "紅隊必須質疑：當前價格已透支多少未來的完美預期？"
-        )
+        sections.append("\n⚠️ 品質極優但估值安全不足 — 詳見上方紅隊區塊。")
     elif quality >= 85:
         sections.append(
             "\n結論：護城河與現金流紀律俱佳；仍須確認估值邊際是否提供足夠安全墊。"
@@ -3266,6 +3428,15 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
             f"最新 Surprise {surprise_txt}（連續超預期 {m.surprise_beat_streak} 季）",
         ]
     )
+    sections.extend(_red_team_section_lines(report))
+    sections.extend(
+        [
+            "",
+            "【嚴格空頭風險與對手競爭防禦】",
+            "- 動能模式不評 FCF/股息；須防「敘事先行、盈利後驗」的估值透支。",
+            "- 若 PEG 與 Surprise 無法同步改善，波段多單風險報酬比惡化。",
+        ]
+    )
     sections.append(
         "\n機構視角結論：本模式 零權重 評估 FCF / 股息 / 發放率，避免對燒錢新創的防禦偏見。"
         "聚焦 PEG 剪刀差 + CapEx 擴張、右側通道支撐 與 預期修正動態。"
@@ -3303,7 +3474,7 @@ def _cached_llm_value_commentary(symbol: str, strategy_mode: str, context: str) 
         except Exception as exc:
             print(f"Warning: value commentary failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
         if attempt < 3:
-            time.sleep(10)
+            _sleep_gemini_retry(attempt)
     _notify_llm_busy()
     return None
 
@@ -3324,7 +3495,7 @@ def _cached_llm_growth_commentary(symbol: str, strategy_mode: str, context: str)
         except Exception as exc:
             print(f"Warning: growth commentary failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
         if attempt < 3:
-            time.sleep(10)
+            _sleep_gemini_retry(attempt)
     _notify_llm_busy()
     return None
 
@@ -3358,7 +3529,7 @@ def _cached_llm_investment_scorecard(
         except Exception as exc:
             print(f"Warning: scorecard failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
         if attempt < 3:
-            time.sleep(10)
+            _sleep_gemini_retry(attempt)
     _notify_llm_busy()
     return None
 
@@ -3376,7 +3547,7 @@ def _cached_llm_turnaround_reason_tag(symbol: str, strategy_mode: str, context: 
         except Exception as exc:
             print(f"Warning: reason tag failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
         if attempt < 3:
-            time.sleep(10)
+            _sleep_gemini_retry(attempt)
     from llm_processor import _fallback_turnaround_reason_tag
 
     return _fallback_turnaround_reason_tag(context)
@@ -3404,7 +3575,7 @@ def _cached_llm_value_narrative(
         except Exception as exc:
             print(f"Warning: value narrative failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
         if attempt < 3:
-            time.sleep(10)
+            _sleep_gemini_retry(attempt)
     _notify_llm_busy()
     return None
 
@@ -3448,7 +3619,7 @@ def _cached_llm_growth_narrative(
         except Exception as exc:
             print(f"Warning: growth narrative failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
         if attempt < 3:
-            time.sleep(10)
+            _sleep_gemini_retry(attempt)
     _notify_llm_busy()
     return None
 
@@ -3786,7 +3957,7 @@ def build_company_narrative(
         if not text and summary:
             text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
         if not text and summary:
-            text = summary.strip()
+            text = _safe_narrative_fallback_text(summary)
         return NarrativeResult(text=text or "", live_news_degraded=degraded)
 
     if not summary:
@@ -3796,7 +3967,7 @@ def build_company_narrative(
         )
     text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
     if not text:
-        text = summary.strip()
+        text = _safe_narrative_fallback_text(summary)
     return NarrativeResult(text=text or "", live_news_degraded=False)
 
 

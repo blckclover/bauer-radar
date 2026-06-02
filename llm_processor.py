@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
 import time
 
@@ -58,7 +59,15 @@ FILTER_PROMPT = (
 )
 MODEL_NAME = "gemini-2.5-flash"
 _GEMINI_MAX_RETRIES = 3
-_GEMINI_RETRY_SLEEP_SEC = 10
+_GEMINI_RETRY_MAX_SLEEP_SEC = 60.0
+
+
+def gemini_retry_sleep_seconds(attempt: int) -> float:
+    """Exponential backoff with jitter after failed attempt (1-based index)."""
+    if attempt < 1:
+        attempt = 1
+    sleep_time = (2**attempt) + random.uniform(0, 1)
+    return min(sleep_time, _GEMINI_RETRY_MAX_SLEEP_SEC)
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
@@ -70,7 +79,7 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
 
 
 def _generate_content_with_backoff(client: genai.Client, *, model: str, contents: str) -> str:
-    """Call Gemini with exponential-style backoff on 429 / transient failures."""
+    """Call Gemini with exponential backoff + jitter on 429 / transient failures."""
     last_exc: Exception | None = None
     for attempt in range(1, _GEMINI_MAX_RETRIES + 1):
         try:
@@ -93,7 +102,9 @@ def _generate_content_with_backoff(client: genai.Client, *, model: str, contents
                 f"Warning: Gemini {kind} error (attempt {attempt}/{_GEMINI_MAX_RETRIES}): {exc}"
             )
             if attempt < _GEMINI_MAX_RETRIES:
-                time.sleep(_GEMINI_RETRY_SLEEP_SEC)
+                delay = gemini_retry_sleep_seconds(attempt)
+                logger.info("Gemini retry backoff: sleeping %.2fs", delay)
+                time.sleep(delay)
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("Gemini API failed after retries")

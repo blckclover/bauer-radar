@@ -3,7 +3,10 @@ import { AlertTriangle, ArrowLeft } from "lucide-react";
 import { Suspense } from "react";
 
 import { MetricCard, MetricCardGrid } from "@/components/shared/MetricCard";
+import { DataFreshnessBar } from "@/components/shared/DataFreshnessBar";
 import { RedTeamAlert } from "@/components/shared/RedTeamAlert";
+import { FcfHistoryChart } from "@/components/stock/FcfHistoryChart";
+import { StockNarrative } from "@/components/stock/StockNarrative";
 import { MethodologyPanel } from "@/components/stock/MethodologyPanel";
 import { StockHeroScores } from "@/components/stock/StockHeroScores";
 import { StockModeToggle } from "@/components/stock/StockModeToggle";
@@ -18,12 +21,13 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { hasDeathPenalty, sanitizeRedTeamFindings, type StockAnalysisResult } from "@/lib/api";
 import { getStrategyWeights } from "@/lib/mockData";
-import type { StrategyMode } from "@/types";
+import type { NarrativeResult, StrategyMode } from "@/types";
 
 interface StockDetailViewProps {
   ticker: string;
   mode: StrategyMode;
   result: StockAnalysisResult;
+  narrative: NarrativeResult;
 }
 
 function DataSourceBanner({ result }: { result: StockAnalysisResult }) {
@@ -58,7 +62,12 @@ function DataSourceBanner({ result }: { result: StockAnalysisResult }) {
   );
 }
 
-export function StockDetailView({ ticker, mode, result }: StockDetailViewProps) {
+export function StockDetailView({
+  ticker,
+  mode,
+  result,
+  narrative,
+}: StockDetailViewProps) {
   const { scorecard } = result.data;
   const redTeamFindings = sanitizeRedTeamFindings(result.data.redTeamFindings);
   const deathPenalty = hasDeathPenalty(result.data);
@@ -95,8 +104,17 @@ export function StockDetailView({ ticker, mode, result }: StockDetailViewProps) 
                 {scorecard.companyName || ticker.toUpperCase()}
               </h1>
               <p className="text-sm text-muted-foreground">
-                個股深度分析 · Phase 3 · GET /api/v1/analyze/{ticker.toUpperCase()}
+                個股深度分析 · Phase 5 · analyze + narrative API
               </p>
+              <DataFreshnessBar
+                dataSource={
+                  result.usedMock
+                    ? "mock"
+                    : (result.data.dataSource ?? "live")
+                }
+                updatedAt={result.fetchedAt}
+                className="mt-1"
+              />
             </div>
             <Suspense fallback={<div className="h-10 w-64 animate-pulse rounded-lg bg-muted" />}>
               <StockModeToggle mode={mode} />
@@ -161,6 +179,12 @@ export function StockDetailView({ ticker, mode, result }: StockDetailViewProps) 
             </div>
           </section>
         ) : null}
+
+        <Separator />
+
+        <StockNarrative narrative={narrative} />
+
+        <FcfHistoryChart points={result.data.fcfHistory ?? []} />
 
         {redTeamFindings.length > 0 ? (
           <>

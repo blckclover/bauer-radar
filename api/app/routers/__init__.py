@@ -1,5 +1,5 @@
 """API routers."""
 
-from app.routers import analyze, narrative
+from app.routers import analyze, hunter, narrative
 
-__all__ = ["analyze", "narrative"]
+__all__ = ["analyze", "hunter", "narrative"]

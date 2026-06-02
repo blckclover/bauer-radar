@@ -1,7 +1,7 @@
 import { notFound } from "next/navigation";
 
 import { StockDetailView } from "@/components/stock/StockDetailView";
-import { getStockAnalysis } from "@/lib/api";
+import { getStockAnalysis, getStockNarrative } from "@/lib/api";
 import { parseStrategyMode } from "@/lib/schemas";
 
 interface StockPageProps {
@@ -20,13 +20,17 @@ export default async function StockPage({ params, searchParams }: StockPageProps
   }
 
   const mode = parseStrategyMode(rawMode);
-  const result = await getStockAnalysis(ticker, mode);
+  const [result, narrative] = await Promise.all([
+    getStockAnalysis(ticker, mode),
+    getStockNarrative(ticker, mode),
+  ]);
 
   return (
     <StockDetailView
       ticker={ticker.toUpperCase()}
       mode={mode}
       result={result}
+      narrative={narrative}
     />
   );
 }

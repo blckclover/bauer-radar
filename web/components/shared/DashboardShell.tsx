@@ -1,7 +1,8 @@
 "use client";
 
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { AlertTriangle, Loader2, Radar, Search } from "lucide-react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 
 import { DashboardSidebar } from "@/components/shared/DashboardSidebar";
@@ -28,6 +29,7 @@ import {
   useWatchlistQueries,
 } from "@/hooks/useDashboardQueries";
 import { getStrategyWeights } from "@/lib/mockData";
+import { ENABLE_MOCK_FALLBACK } from "@/lib/config";
 import type { StrategyMode, WatchlistEntry } from "@/types";
 
 function WatchlistTable({
@@ -93,9 +95,11 @@ function WatchlistTable({
 }
 
 export function DashboardShell() {
+  const router = useRouter();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [strategyMode, setStrategyMode] = useState<StrategyMode>("value");
   const [watchlistInput, setWatchlistInput] = useState("AAPL, MSFT, NVDA");
+  const [stockSearch, setStockSearch] = useState("");
   const [activeTickers, setActiveTickers] = useState<string[]>(() =>
     parseTickerList("AAPL, MSFT, NVDA")
   );
@@ -129,6 +133,12 @@ export function DashboardShell() {
     }
   }
 
+  function handleStockSearch() {
+    const sym = stockSearch.trim().toUpperCase();
+    if (!sym) return;
+    router.push(`/stock/${encodeURIComponent(sym)}?mode=${strategyMode}`);
+  }
+
   return (
     <div className="flex min-h-screen bg-background">
       <DashboardSidebar
@@ -142,7 +152,7 @@ export function DashboardShell() {
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-xs font-semibold uppercase tracking-wider text-emerald-400/90">
-                Dividend Analyzer · Phase 2
+                Dividend Analyzer · Phase 5
               </p>
               <h1 className="text-2xl font-bold tracking-tight text-foreground">
                 股息安全 · 綜合分析儀表板
@@ -151,6 +161,10 @@ export function DashboardShell() {
                 FastAPI + Next.js ·{" "}
                 {isMock ? "Mock Fallback" : "Live API"}
                 {isFetching && !heroLoading ? " · 更新中…" : ""}
+                {" · "}
+                <Link href="/reversal-scan" className="text-primary hover:underline">
+                  轉機雷達
+                </Link>
               </p>
             </div>
             <StrategyModeToggle mode={strategyMode} onChange={setStrategyMode} />
@@ -167,7 +181,9 @@ export function DashboardShell() {
                 ) : isMock ? (
                   <p>
                     無法連線 FastAPI（{String(heroError?.message ?? "offline")}），
-                    目前顯示 Mock Data。
+                    {ENABLE_MOCK_FALLBACK
+                      ? "目前顯示 Mock Fallback。"
+                      : "請確認 API 已啟動。"}
                   </p>
                 ) : (
                   <p>{String(heroError?.message ?? "資料載入發生錯誤")}</p>
@@ -181,6 +197,57 @@ export function DashboardShell() {
               </div>
             </div>
           )}
+
+          <div className="grid gap-4 md:grid-cols-2">
+            <Card className="border-emerald-500/30 bg-emerald-500/5">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Radar className="h-5 w-5 text-emerald-400" />
+                  逆向轉機股雷達
+                </CardTitle>
+                <CardDescription>
+                  大盤跌幅篩選 · FCF 防禦 · Red Team 警示
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <Button asChild size="lg" className="w-full sm:w-auto">
+                  <Link href={`/reversal-scan?mode=${strategyMode}`}>
+                    前往轉機雷達
+                  </Link>
+                </Button>
+              </CardContent>
+            </Card>
+
+            <Card className="border-border/60 bg-card/50">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Search className="h-5 w-5 text-primary" />
+                  個股深度分析
+                </CardTitle>
+                <CardDescription>
+                  輸入 Ticker 跳轉至 /stock/{"{ticker}"}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-3 sm:flex-row">
+                <Input
+                  value={stockSearch}
+                  onChange={(e) => setStockSearch(e.target.value.toUpperCase())}
+                  placeholder="AAPL"
+                  aria-label="個股搜尋代號"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleStockSearch();
+                  }}
+                />
+                <Button
+                  type="button"
+                  className="shrink-0"
+                  onClick={handleStockSearch}
+                >
+                  前往分析
+                </Button>
+              </CardContent>
+            </Card>
+          </div>
 
           <Card className="border-border/60 bg-card/50">
             <CardHeader>

@@ -8,6 +8,7 @@ import {
   parseTickerList,
   sanitizeRedTeamFindings,
 } from "@/lib/api";
+import { ENABLE_MOCK_FALLBACK } from "@/lib/config";
 import type { AnalyzeResponse, StrategyMode, WatchlistEntry } from "@/types";
 
 const STALE_TIME_MS = 60 * 60 * 1000;
@@ -15,7 +16,11 @@ const STALE_TIME_MS = 60 * 60 * 1000;
 export function useAnalyzeQuery(ticker: string, mode: StrategyMode) {
   return useQuery({
     queryKey: ["analyze", ticker, mode] as const,
-    queryFn: ({ signal }) => fetchAnalyze(ticker, mode, { signal }),
+    queryFn: ({ signal }) =>
+      fetchAnalyze(ticker, mode, {
+        signal,
+        fallbackToMock: ENABLE_MOCK_FALLBACK,
+      }),
     enabled: Boolean(ticker),
     staleTime: STALE_TIME_MS,
     retry: (failureCount, error) => {
@@ -34,7 +39,10 @@ export function useWatchlistQueries(tickers: string[], mode: StrategyMode) {
     queries: tickers.map((ticker) => ({
       queryKey: ["analyze", ticker, mode] as const,
       queryFn: ({ signal }: { signal?: AbortSignal }) =>
-        fetchAnalyze(ticker, mode, { signal }),
+        fetchAnalyze(ticker, mode, {
+          signal,
+          fallbackToMock: ENABLE_MOCK_FALLBACK,
+        }),
       enabled: Boolean(ticker),
       staleTime: STALE_TIME_MS,
       retry: 1,

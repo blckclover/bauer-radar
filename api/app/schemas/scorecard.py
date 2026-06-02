@@ -47,6 +47,13 @@ class MetricItem(ApiModel):
     tooltip: Optional[str] = None
 
 
+class FcfHistoryPoint(ApiModel):
+    fiscal_year: int
+    free_cash_flow: float
+    period_end: str = ""
+    source: str = ""
+
+
 RedTeamSeverity = Literal["critical", "warning", "info"]
 
 
@@ -72,7 +79,8 @@ class AnalyzeResponse(ApiModel):
     scorecard: ScorecardResult
     red_team_findings: list[RedTeamFinding] = Field(default_factory=list, alias="redTeamFindings")
     analyst_commentary: Optional[str] = Field(default=None, alias="analystCommentary")
-    data_source: Literal["live", "cache"] = Field(default="live", alias="dataSource")
+    fcf_history: list[FcfHistoryPoint] = Field(default_factory=list, alias="fcfHistory")
+    data_source: Literal["live", "cache", "mock"] = Field(default="live", alias="dataSource")
 
 
 class NarrativeResponse(ApiModel):

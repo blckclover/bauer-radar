@@ -57,7 +57,72 @@ export const analyzeResponseSchema = z.object({
   scorecard: scorecardResultSchema,
   redTeamFindings: z.array(redTeamFindingSchema).default([]),
   analystCommentary: z.string().nullable().optional(),
+  fcfHistory: z
+    .array(
+      z.object({
+        fiscalYear: z.number(),
+        freeCashFlow: z.number(),
+        periodEnd: z.string().optional(),
+        source: z.string().optional(),
+      })
+    )
+    .default([]),
   dataSource: z.enum(["live", "cache", "mock"]).optional(),
+});
+
+export const narrativeResponseSchema = z.object({
+  symbol: z.string(),
+  text: z.string().default(""),
+  liveNewsDegraded: z.boolean().default(false),
+  strategyMode: strategyModeSchema,
+});
+
+export const turnaroundCandidateSchema = z.object({
+  symbol: z.string(),
+  companyName: z.string(),
+  drawdownPct: z.number(),
+  currentPrice: z.number(),
+  sixMonthHigh: z.number(),
+  latestFcf: z.number(),
+  latestFcfFiscalYear: z.number().nullable().optional(),
+  fcfSource: z.string().optional(),
+  interestCoverage: z.number().nullable().optional(),
+  grossMargin: z.number().nullable().optional(),
+  grossMarginYoyChangePp: z.number().nullable().optional(),
+  netDebtEbitda: z.number().nullable().optional(),
+  fiftyTwoWeekHigh: z.number().nullable().optional(),
+  priceVs52wHigh: z.number().nullable().optional(),
+  pegRatio: z.number().nullable().optional(),
+  valueDefenseScore: z.number().nullable().optional(),
+  valueGradeEmoji: z.string().optional(),
+  valueGradeLabel: z.string().optional(),
+  reasonTag: z.string().optional(),
+  reasonComment: z.string().optional(),
+  redTeamFlag: z.boolean().default(false),
+});
+
+export const hunterScanResponseSchema = z.object({
+  candidates: z.array(turnaroundCandidateSchema).default([]),
+  scannedCount: z.number(),
+  hitCount: z.number(),
+  universe: z.string(),
+  universeSource: z.string(),
+  minDropPercent: z.number(),
+});
+
+export const hunterScanTaskCreatedSchema = z.object({
+  taskId: z.string(),
+});
+
+export const hunterTaskStatusSchema = z.object({
+  taskId: z.string(),
+  status: z.enum(["pending", "running", "completed", "failed", "cancelled"]),
+  progress: z.number().default(0),
+  message: z.string().default(""),
+  result: hunterScanResponseSchema.nullable().optional(),
+  error: z.string().nullable().optional(),
+  errorCode: z.string().nullable().optional(),
+  updatedAt: z.string().nullable().optional(),
 });
 
 export type AnalyzeResponseValidated = z.infer<typeof analyzeResponseSchema>;

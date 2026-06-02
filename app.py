@@ -56,6 +56,14 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+st.warning(
+    "⚠️ **此 Streamlit 版本即將退役** — 請改用 Next.js 新介面："
+    " [http://localhost:3000](http://localhost:3000) · "
+    "功能包含 Dashboard、個股深度分析、逆向轉機股雷達。"
+    " Streamlit 僅保留作為後備工具。",
+    icon="🚀",
+)
+
 GRADE_COLORS = {
     "財務防禦確立": "#22c55e",
     "體質穩健": "#eab308",
@@ -2688,8 +2696,8 @@ def _coerce_report(report: object) -> StockReport:
     div_history = [_coerce_year_div(y) for y in (report.get("div_history") or [])]
 
     return StockReport(
-        symbol=str(report.get("symbol", "")),
-        company_name=str(report.get("company_name", "")),
+        symbol=str(report.get("symbol") or ""),
+        company_name=str(report.get("company_name") or ""),
         fcf_history=fcf_history,
         div_history=div_history,
         payout_ratio=report.get("payout_ratio"),
@@ -2706,15 +2714,15 @@ def _coerce_report(report: object) -> StockReport:
             )
             or 0.0
         ),
-        grade_label=str(report.get("grade_label", "")),
-        grade_emoji=str(report.get("grade_emoji", "")),
-        analyst_commentary=str(report.get("analyst_commentary", "")),
+        grade_label=str(report.get("grade_label") or ""),
+        grade_emoji=str(report.get("grade_emoji") or ""),
+        analyst_commentary=str(report.get("analyst_commentary") or ""),
         fcf_pass=report.get("fcf_pass"),
-        fcf_note=str(report.get("fcf_note", "")),
+        fcf_note=str(report.get("fcf_note") or ""),
         div_pass=report.get("div_pass"),
-        div_note=str(report.get("div_note", "")),
+        div_note=str(report.get("div_note") or ""),
         trend_signal=report.get("trend_signal"),
-        strategy_mode=str(report.get("strategy_mode", STRATEGY_VALUE)),
+        strategy_mode=str(report.get("strategy_mode") or STRATEGY_VALUE),
         master=master,
         investment_scorecard=[
             _coerce_scorecard_item(row)
