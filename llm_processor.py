@@ -22,30 +22,42 @@ GROWTH_LEXICON_CONSTRAINT = (
     "等機構級別、客觀、冷靜的金融語言。"
 )
 
-GROWTH_ANALYST_SYSTEM_PROMPT = (
-    "你現在是頂級風險投資家 (VC) 與趨勢交易員的雙面首席分析師。"
-    "請根據提供的量化評分與技術面物理事實，用繁體中文撰寫決策點評。"
-    "強制約束："
-    "1. 絕對不准提及 FCF、自由現金流、股息、配息、發放率，也不准因這些項目給負評；"
-    "2. 若 Price above BOTH SMA20 and SMA50 為 true，"
-    "必須客觀指出「價格站上中期均線群 · 右側結構確立」，"
-    "並描述為確認價格轉入中期上升軌道的動能標的；"
-    "3. 聚焦營收/R&D 孵化潛力、Beta 彈性、中期均線動能結構；"
-    "4. 結構：① 綜合得分解讀 ② 技術面結構 ③ 成長敘事 ④ 風險邊界（各 1-2 句）；"
-    "5. 150–250 字，禁止 Markdown 標題與 ** 符號，用列點或短段落。"
-    f"6. {GROWTH_LEXICON_CONSTRAINT}"
+MASTER_ANALYST_SYSTEM_PROMPT = (
+    "你現在是華爾街頂級量化對沖基金的首席分析師，深諳《全球 18 位最偉大的投資家》"
+    "（葛拉漢的安全邊際、巴菲特的護城河、索羅斯的反身性敘事變革）所傳承的成功模型。"
+    "請以「期望值計算與風險溢價」的大師級前瞻視角，結合我提供的硬數據"
+    "（trailingPEG、CapEx 擴張率、Earnings Surprise、ROE/ROA、毛利率、利息保障倍數、"
+    "中期均線結構），用繁體中文撰寫一份冰冷、客觀、機構級的深度前瞻點評。"
+    "嚴格輸出且僅輸出以下三大前瞻點評（標題請完整保留）："
+    "1.【前瞻核心壁壘與定價權】：結合毛利率穩定度與 ROE/ROA，分析其客戶切換成本與"
+    "轉嫁通膨（漲價）能力，判定其商業護城河質量。"
+    "2.【未來 12 個月核心催化劑與預期管理】：列出最關鍵的分析師預期修正節點、"
+    "臨床試驗、或大廠 CapEx 乘數效應下的訂單兌現時間表（具體到月份/季度）。"
+    "3.【前瞻期望值與不對稱勝率】：理性評估其財務存續期（Cash Runway 與股權稀釋風險），"
+    "並判斷目前「價格站上中期均線群」是否正在提前反應（Price in）未來利多，"
+    "結論此標的是否屬於『下行有資產支撐、上行無天花板』的不對稱風險機會。"
+    "全域約束："
+    "(a) 若策略為動能成長模式，絕對不准提及或因 FCF、自由現金流、股息、配息、發放率給予負評；"
+    "(b) 200–320 字，禁止任何客套開場白，直接從第 1 點開始；"
+    "(c) 禁止 Markdown 標題符號（#）與粗體 ** 符號，三大點以【】標題分段。"
+    f"(d) {GROWTH_LEXICON_CONSTRAINT}"
 )
 
+# Backward-compatible alias (older imports referenced the growth-only name)
+GROWTH_ANALYST_SYSTEM_PROMPT = MASTER_ANALYST_SYSTEM_PROMPT
+
 NARRATIVE_GROWTH_LIVE_PROMPT = (
-    "你現在是矽谷頂級科技風投 (VC) 的首席產業分析師。"
-    "你手上有一份該公司的【官方長期業務摘要】以及【過去兩週的即時市場與技術新聞】。"
-    "請幫我揉合這兩者，提煉成 3 點極具洞察力的繁體中文報告，嚴格遵守以下結構，絕對禁止任何客套廢話："
-    "1. 【核心商業基因】：用一句話點穿這家公司底層靠什麼核心技術/業務賺錢（來自靜態摘要）。"
-    "2. 【最新科技嘗試與技術動態】：結合【即時新聞】，指出最近數週的研發投入、"
-    "新產品、法說會指引或重大商業合作。"
-    "3. 【右側動能催化劑 (Catalyst)】：結合技術面結構與最新消息，"
-    "分析資金配置邏輯（例如：板塊輪動、競爭格局變化、訂單能見度提升）。"
-    "注意：字數嚴格控制在 200 字內，語氣客觀、機構級、不帶情緒渲染。"
+    "你現在是矽谷頂級科技風投 (VC) 兼對沖基金的首席產業分析師。"
+    "你手上有【官方長期業務摘要】【過去兩週即時市場與技術新聞】，以及一組"
+    "【前瞻硬指標】（trailingPEG、CapEx 擴張率、Earnings Surprise、毛利率）。"
+    "請以『期望值與風險溢價』的前瞻視角揉合上述資訊，提煉成 3 點冰冷、機構級的繁體中文報告，"
+    "嚴格遵守以下結構，絕對禁止任何客套廢話："
+    "1. 【前瞻核心壁壘與定價權】：結合毛利率與業務摘要，點穿其核心技術護城河與轉嫁通膨的定價權。"
+    "2. 【未來 12 個月核心催化劑與預期管理】：結合即時新聞與 CapEx 乘數效應，"
+    "指出最關鍵的研發投入、法說會指引、訂單兌現或分析師預期修正節點（具體到季度）。"
+    "3. 【前瞻期望值與不對稱勝率】：結合 PEG 剪刀差、Surprise 趨勢與技術面結構，"
+    "分析資金配置邏輯，判斷目前價格是否已提前反應利多，評估其不對稱風險報酬。"
+    "注意：字數嚴格控制在 220 字內，語氣客觀、機構級、不帶情緒渲染。"
     "禁止 Markdown 符號（**、#、```），禁止客套開場白，直接從第 1 點開始輸出。"
     f"{GROWTH_LEXICON_CONSTRAINT}"
 )
@@ -168,8 +180,9 @@ def generate_growth_narrative_text(
     *,
     live_news_text: str = "",
     trend_signal: dict | None = None,
+    master_text: str = "",
 ) -> str:
-    """Growth-mode narrative: fuse static summary + live news + technical catalyst."""
+    """Growth-mode narrative: fuse static summary + live news + master metrics + technical catalyst."""
     context_parts = [f"Ticker: {symbol.upper()}"]
     if sector:
         context_parts.append(f"Sector: {sector}")
@@ -182,6 +195,8 @@ def generate_growth_narrative_text(
         context_parts.append(f"\n【過去兩週即時市場與技術新聞】\n{live_news_text.strip()}")
     else:
         context_parts.append("\n【過去兩週即時市場與技術新聞】\n（即時新聞流暫不可用，請僅依靜態摘要與技術面推論。）")
+    if master_text.strip():
+        context_parts.append(f"\n【前瞻硬指標 Master Variables】\n{master_text.strip()}")
     context_parts.append(f"\n{_format_trend_context(trend_signal)}")
     user_block = "\n".join(context_parts)
 
@@ -203,8 +218,8 @@ def generate_growth_narrative_text(
         return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"
 
 
-def generate_growth_analyst_commentary(context: str) -> str | None:
-    """VC / trend-trader commentary for growth strategy mode; None triggers fallback."""
+def generate_master_analyst_commentary(context: str) -> str | None:
+    """Master-grade EV / risk-premium commentary (both modes); None triggers fallback."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return None
@@ -213,9 +228,14 @@ def generate_growth_analyst_commentary(context: str) -> str | None:
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
             model=MODEL_NAME,
-            contents=f"{GROWTH_ANALYST_SYSTEM_PROMPT}\n\n{context.strip()}",
+            contents=f"{MASTER_ANALYST_SYSTEM_PROMPT}\n\n{context.strip()}",
         )
         text = (response.text or "").strip()
         return text or None
     except Exception:
         return None
+
+
+# Backward-compatible alias
+def generate_growth_analyst_commentary(context: str) -> str | None:
+    return generate_master_analyst_commentary(context)

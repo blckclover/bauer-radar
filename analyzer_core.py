@@ -37,11 +37,31 @@ STRATEGY_LABEL_TO_MODE: dict[str, str] = {
     STRATEGY_LABEL_VALUE: STRATEGY_VALUE,
     STRATEGY_LABEL_GROWTH: STRATEGY_GROWTH,
 }
+
+# --- Master-grade scoring weights (expected-value / risk-premium model) ---
+# 🛡️ Value defence — Graham margin-of-safety + Buffett moat
+WEIGHT_VALUE_MOAT = 50.0       # ROIC/ROE + gross-margin pricing power + interest coverage
+WEIGHT_VALUE_SURPRISE = 20.0   # earnings surprise (consensus repricing trigger)
+WEIGHT_VALUE_CASHFLOW = 30.0   # FCF discipline + dividend / payout regularity
+# 🚀 Growth momentum — Soros reflexivity + PEG scissors + right-side trend
+WEIGHT_GROWTH_FORWARD = 40.0   # PEG asymmetry + CapEx expansion lead indicator
+WEIGHT_GROWTH_MOMENTUM = 40.0  # Close > SMA20 & SMA50 mid-term MA cluster support
+WEIGHT_GROWTH_SURPRISE = 20.0  # analyst EPS upward-revision / surprise trend
+
+# Legacy growth weights retained for backward-compatible helpers
 WEIGHT_GROWTH_REVENUE = 40.0
-WEIGHT_GROWTH_MOMENTUM = 40.0
 WEIGHT_GROWTH_BETA = 20.0
 PENALTY_FCF_PER_YEAR = 10.0
 PENALTY_DIV_PER_YEAR = 8.0
+
+# CapEx (capital expenditure) rows in yfinance quarterly cash-flow statements
+CAPEX_CF_ROW_NAMES = (
+    "Capital Expenditure",
+    "CapitalExpenditures",
+    "Capital Expenditures",
+    "PurchaseOfPPE",
+)
+EARNINGS_SURPRISE_LOOKBACK = 8
 
 SEC_USER_AGENT = "DividendAnalyzer/3.0 (research@example.com)"
 SEC_HEADERS = {"User-Agent": SEC_USER_AGENT}
@@ -221,6 +241,24 @@ class ScoreDetail:
 
 
 @dataclass
+class MasterMetrics:
+    """Forward-looking master-grade financial variables for EV / risk-premium scoring."""
+
+    peg_ratio: float | None = None          # trailingPegRatio — growth/valuation scissors
+    capex_growth: float | None = None       # YoY growth of quarterly CapEx (expansion lead)
+    capex_latest: float | None = None       # latest quarterly CapEx magnitude (abs, USD)
+    roe: float | None = None                # returnOnEquity
+    roa: float | None = None                # returnOnAssets (ROIC proxy)
+    gross_margins: float | None = None      # pricing power proxy
+    interest_coverage: float | None = None  # EBIT / |interest expense|
+    revenue_growth: float | None = None     # revenueGrowth (fallback signal)
+    surprise_latest_pct: float | None = None  # latest EPS surprise %
+    surprise_beat_streak: int = 0           # consecutive recent beats
+    surprise_sample: int = 0                # number of reported quarters compared
+    surprise_beats: int = 0                 # beats within the sample
+
+
+@dataclass
 class StockReport:
     symbol: str
     company_name: str
@@ -240,6 +278,7 @@ class StockReport:
     div_note: str = ""
     trend_signal: dict[str, float | str | None] | None = None
     strategy_mode: str = STRATEGY_VALUE
+    master: MasterMetrics = field(default_factory=MasterMetrics)
 
     @property
     def overall_pass(self) -> bool | None:
@@ -690,6 +729,164 @@ def fetch_latest_rd_expense(
     except Exception:
         pass
     return None, None
+
+
+def compute_interest_coverage(ticker: yf.Ticker) -> float | None:
+    """EBIT / |interest expense| from the latest annual income statement.
+
+    Returns None when there is no meaningful interest expense (debt-light) or
+    when data is unavailable; never raises.
+    """
+    try:
+        income = ticker.get_income_stmt(freq="yearly")
+    except Exception:
+        return None
+    if income is None or income.empty:
+        return None
+
+    ebit_row = _pick_row(income, *EBIT_ROW_NAMES)
+    interest_row = _pick_row(income, *INTEREST_EXPENSE_ROW_NAMES)
+    if ebit_row is None or interest_row is None:
+        return None
+    try:
+        latest_col = sorted(income.columns, reverse=True)[0]
+        ebit = float(ebit_row.get(latest_col))
+        interest = abs(float(interest_row.get(latest_col)))
+    except (TypeError, ValueError, IndexError):
+        return None
+    if pd.isna(ebit) or pd.isna(interest) or interest <= 0:
+        return None
+    return round(ebit / interest, 2)
+
+
+def fetch_capex_growth(ticker: yf.Ticker) -> tuple[float | None, float | None]:
+    """YoY growth of quarterly CapEx as an expansion / industry-tailwind lead signal.
+
+    Compares the latest quarter's CapEx magnitude against the year-ago quarter
+    (4 quarters back). Returns (growth_ratio, latest_abs_capex). Never raises.
+    """
+    try:
+        cashflow = ticker.quarterly_cashflow
+    except Exception:
+        return None, None
+    if cashflow is None or cashflow.empty:
+        return None, None
+
+    capex_row = _pick_row(cashflow, *CAPEX_CF_ROW_NAMES)
+    if capex_row is None:
+        return None, None
+
+    cols = sorted(cashflow.columns, reverse=True)
+    if not cols:
+        return None, None
+    try:
+        latest = abs(float(capex_row.get(cols[0])))
+    except (TypeError, ValueError):
+        return None, None
+    if pd.isna(latest):
+        return None, None
+
+    if len(cols) < 5:
+        return None, round(latest, 2)
+    try:
+        year_ago = abs(float(capex_row.get(cols[4])))
+    except (TypeError, ValueError):
+        return None, round(latest, 2)
+    if pd.isna(year_ago) or year_ago <= 0:
+        return None, round(latest, 2)
+    return round((latest - year_ago) / year_ago, 4), round(latest, 2)
+
+
+def fetch_earnings_surprise(ticker: yf.Ticker) -> dict | None:
+    """Compare EPS Estimate vs Actual across recent quarters.
+
+    Returns a dict with the latest surprise %, consecutive beat streak, and
+    beat count over the sampled window. None when data is unavailable.
+    """
+    df = None
+    try:
+        df = ticker.get_earnings_dates(limit=EARNINGS_SURPRISE_LOOKBACK + 4)
+    except Exception:
+        try:
+            df = ticker.earnings_dates
+        except Exception:
+            df = None
+    if df is None or getattr(df, "empty", True):
+        return None
+
+    est_col = next((c for c in df.columns if "Estimate" in str(c)), None)
+    act_col = next(
+        (c for c in df.columns if "Reported" in str(c) or "Actual" in str(c)),
+        None,
+    )
+    if est_col is None or act_col is None:
+        return None
+
+    rows: list[tuple[object, float, float]] = []
+    for idx, row in df.iterrows():
+        est = row.get(est_col)
+        act = row.get(act_col)
+        if est is None or act is None or pd.isna(est) or pd.isna(act):
+            continue
+        rows.append((idx, float(est), float(act)))
+    if not rows:
+        return None
+
+    try:
+        rows.sort(key=lambda r: r[0], reverse=True)
+    except Exception:
+        pass
+    rows = rows[:EARNINGS_SURPRISE_LOOKBACK]
+
+    latest_idx, latest_est, latest_act = rows[0]
+    latest_pct = (
+        (latest_act - latest_est) / abs(latest_est) * 100.0
+        if latest_est != 0
+        else None
+    )
+
+    beat_streak = 0
+    for _, est, act in rows:
+        if act > est:
+            beat_streak += 1
+        else:
+            break
+    beats = sum(1 for _, est, act in rows if act > est)
+
+    return {
+        "latest_surprise_pct": round(latest_pct, 1) if latest_pct is not None else None,
+        "beat_streak": beat_streak,
+        "beats": beats,
+        "sample": len(rows),
+    }
+
+
+def fetch_master_metrics(
+    symbol: str,
+    info: dict | None,
+    ticker: yf.Ticker | None = None,
+) -> MasterMetrics:
+    """Aggregate forward-looking master-grade variables (PEG, CapEx, ROIC/ROE, surprise)."""
+    info = info or {}
+    t = ticker or yf.Ticker(symbol)
+
+    capex_growth, capex_latest = fetch_capex_growth(t)
+    surprise = fetch_earnings_surprise(t)
+
+    return MasterMetrics(
+        peg_ratio=_safe_info_float(info, "trailingPegRatio"),
+        capex_growth=capex_growth,
+        capex_latest=capex_latest,
+        roe=_safe_info_float(info, "returnOnEquity"),
+        roa=_safe_info_float(info, "returnOnAssets"),
+        gross_margins=_safe_info_float(info, "grossMargins"),
+        interest_coverage=compute_interest_coverage(t),
+        revenue_growth=_safe_info_float(info, "revenueGrowth"),
+        surprise_latest_pct=(surprise or {}).get("latest_surprise_pct"),
+        surprise_beat_streak=(surprise or {}).get("beat_streak", 0),
+        surprise_sample=(surprise or {}).get("sample", 0),
+        surprise_beats=(surprise or {}).get("beats", 0),
+    )
 
 
 def _passes_right_side_filter(
@@ -1414,7 +1611,7 @@ def score_growth_momentum_component(
 ) -> ScoreDetail:
     """Momentum structure — full score when price clears both SMA20 and SMA50."""
     max_pts = WEIGHT_GROWTH_MOMENTUM
-    category = "技術面動能結構"
+    category = "技術面右側通道支撐"
     if not trend:
         return ScoreDetail(
             category,
@@ -1496,6 +1693,218 @@ def _growth_excluded_component(category: str, note: str) -> ScoreDetail:
     return ScoreDetail(category, 0.0, 0.0, note)
 
 
+def score_moat_quality_component(master: MasterMetrics) -> ScoreDetail:
+    """🛡️ Business moat & quality (50): ROE + ROA + gross-margin pricing power + interest coverage."""
+    max_pts = WEIGHT_VALUE_MOAT
+    category = "商業護城河與質量"
+    earned = 0.0
+    parts: list[str] = []
+
+    # ROE — capital allocation quality (max 15)
+    roe = master.roe
+    if roe is not None:
+        if roe >= 0.20:
+            sub, tag = 15.0, "卓越 ≥20%"
+        elif roe >= 0.15:
+            sub, tag = 12.0, "優異 15%–20%"
+        elif roe >= 0.10:
+            sub, tag = 9.0, "穩健 10%–15%"
+        elif roe > 0:
+            sub, tag = 4.5, "偏低 <10%"
+        else:
+            sub, tag = 0.0, "為負（資本回報受損）"
+        earned += sub
+        parts.append(f"ROE {roe*100:.1f}%（{tag}）")
+    else:
+        earned += 15.0 * 0.30
+        parts.append("ROE 數據缺失（給予中性基礎）")
+
+    # ROA / ROIC proxy — asset efficiency (max 10)
+    roa = master.roa
+    if roa is not None:
+        if roa >= 0.10:
+            sub, tag = 10.0, "高效 ≥10%"
+        elif roa >= 0.05:
+            sub, tag = 7.0, "良好 5%–10%"
+        elif roa >= 0.02:
+            sub, tag = 4.0, "普通 2%–5%"
+        elif roa > 0:
+            sub, tag = 1.5, "偏弱 <2%"
+        else:
+            sub, tag = 0.0, "為負"
+        earned += sub
+        parts.append(f"ROA {roa*100:.1f}%（{tag}）")
+    else:
+        earned += 10.0 * 0.30
+        parts.append("ROA 數據缺失")
+
+    # Gross margin — pricing power / switching-cost proxy (max 15)
+    gm = master.gross_margins
+    if gm is not None:
+        if gm >= 0.50:
+            sub, tag = 15.0, "強定價權 ≥50%"
+        elif gm >= 0.40:
+            sub, tag = 12.0, "穩固 40%–50%"
+        elif gm >= 0.30:
+            sub, tag = 9.0, "中等 30%–40%"
+        elif gm >= 0.20:
+            sub, tag = 6.0, "偏低 20%–30%"
+        elif gm > 0:
+            sub, tag = 3.0, "薄利 <20%"
+        else:
+            sub, tag = 0.0, "為負"
+        earned += sub
+        parts.append(f"毛利率 {gm*100:.1f}%（{tag}）")
+    else:
+        earned += 15.0 * 0.30
+        parts.append("毛利率數據缺失")
+
+    # Interest coverage — balance-sheet durability (max 10)
+    cov = master.interest_coverage
+    if cov is not None:
+        if cov >= 8:
+            sub, tag = 10.0, "護城河深厚 ≥8x"
+        elif cov >= 5:
+            sub, tag = 8.0, "穩健 5–8x"
+        elif cov >= 3:
+            sub, tag = 5.5, "可接受 3–5x"
+        elif cov >= 1.5:
+            sub, tag = 3.0, "偏緊 1.5–3x"
+        else:
+            sub, tag = 0.0, "脆弱 <1.5x"
+        earned += sub
+        parts.append(f"利息保障 {cov:.1f}x（{tag}）")
+    else:
+        # No meaningful interest expense → debt-light, treat as durable.
+        earned += 10.0 * 0.80
+        parts.append("低負債結構（無顯著利息支出）")
+
+    rationale = " · ".join(parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
+def score_earnings_surprise_component(
+    master: MasterMetrics,
+    *,
+    category: str,
+    max_pts: float,
+) -> ScoreDetail:
+    """Earnings surprise (consensus repricing): reward consecutive beats / upward revision."""
+    streak = master.surprise_beat_streak or 0
+    latest = master.surprise_latest_pct
+    sample = master.surprise_sample or 0
+
+    if sample == 0:
+        return ScoreDetail(
+            category,
+            max_pts,
+            round(max_pts * 0.35, 1),
+            "近期財報預期偏差數據不足，給予中性基礎分（35%）。",
+        )
+
+    if streak >= 4:
+        earned, tag = max_pts, f"連續 {streak} 季超越市場預期（強勁預期上調動能）"
+    elif streak == 3:
+        earned, tag = max_pts * 0.85, "連續 3 季超預期"
+    elif streak == 2:
+        earned, tag = max_pts * 0.70, "連續 2 季超預期"
+    elif streak == 1:
+        earned, tag = max_pts * 0.55, "最近一季超越市場預期"
+    elif latest is not None and latest > 0:
+        earned, tag = max_pts * 0.50, "最新一季正向偏差但動能不連續"
+    else:
+        earned, tag = max_pts * 0.20, "最新一季不及市場預期（預期下修風險）"
+
+    latest_txt = f"{latest:+.1f}%" if latest is not None else "N/A"
+    rationale = (
+        f"最新一季 Surprise {latest_txt} · 樣本 {sample} 季 · {tag}，"
+        f"本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    )
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
+def score_value_cashflow_component(
+    fcf_rows: list[YearFCF],
+    div_rows: list[YearDividend],
+    payout: float | None,
+) -> ScoreDetail:
+    """🛡️ Cashflow discipline (30): FCF stability + dividend regularity + payout health."""
+    max_pts = WEIGHT_VALUE_CASHFLOW
+    category = "股息與現金流紀律"
+
+    fcf_detail = score_fcf_component(fcf_rows)
+    div_detail = score_dividend_growth_component(div_rows)
+    payout_detail = score_payout_component(payout)
+
+    # Rescale sub-components into the 30-pt envelope: FCF 18 / dividend 8 / payout 4.
+    fcf_part = fcf_detail.earned / WEIGHT_FCF * 18.0
+    div_part = div_detail.earned / WEIGHT_DIV * 8.0
+    payout_part = payout_detail.earned / WEIGHT_PAYOUT * 4.0
+    earned = fcf_part + div_part + payout_part
+
+    rationale = (
+        f"FCF 紀律 {fcf_part:.1f}/18 · 股息規律 {div_part:.1f}/8 · "
+        f"發放率 {payout_part:.1f}/4，合計 {earned:.1f}/{max_pts:.0f} 分。"
+    )
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
+def score_forward_asymmetry_component(master: MasterMetrics) -> ScoreDetail:
+    """🚀 Forward growth asymmetry (40): PEG scissors + CapEx expansion lead indicator."""
+    max_pts = WEIGHT_GROWTH_FORWARD
+    category = "前瞻增長不對稱性"
+    earned = 0.0
+    parts: list[str] = []
+
+    # PEG scissors — growth priced cheaply (max 24)
+    peg = master.peg_ratio
+    if peg is not None and peg > 0:
+        if peg <= 1.0:
+            sub, tag = 24.0, "PEG ≤1（增長被低估，剪刀差顯著）"
+        elif peg <= 1.5:
+            sub, tag = 18.0, "PEG 1.0–1.5（估值合理）"
+        elif peg <= 2.0:
+            sub, tag = 12.0, "PEG 1.5–2.0（估值偏滿）"
+        elif peg <= 3.0:
+            sub, tag = 6.0, "PEG 2.0–3.0（增長溢價偏貴）"
+        else:
+            sub, tag = 2.0, "PEG >3（增長定價過度）"
+        earned += sub
+        parts.append(f"前瞻 PEG {peg:.2f}（{tag}）")
+    else:
+        rev = master.revenue_growth
+        if rev is not None and rev > 0:
+            sub = min(24.0, 24.0 * (rev / 0.20))
+            earned += sub
+            parts.append(f"PEG 缺失 · 以營收成長 {rev*100:.1f}% 代理（{sub:.1f}/24）")
+        else:
+            earned += 24.0 * 0.40
+            parts.append("PEG 與營收成長數據缺失（給予中性基礎）")
+
+    # CapEx expansion — industry tailwind / order visibility (max 16)
+    cg = master.capex_growth
+    if cg is not None:
+        cg_pct = cg * 100
+        if cg >= 0.30:
+            sub, tag = 16.0, "資本支出大幅擴張 ≥30%（產業擴張領先訊號）"
+        elif cg >= 0.15:
+            sub, tag = 12.0, "擴張 15%–30%"
+        elif cg >= 0.0:
+            sub, tag = 8.0, "溫和擴張 0%–15%"
+        elif cg >= -0.15:
+            sub, tag = 4.0, "資本支出收縮 0% 至 -15%"
+        else:
+            sub, tag = 2.0, "大幅收縮 <-15%（擴張動能轉弱）"
+        earned += sub
+        parts.append(f"CapEx YoY {cg_pct:+.1f}%（{tag}）")
+    else:
+        earned += 16.0 * 0.40
+        parts.append("CapEx 動態數據缺失")
+
+    rationale = " · ".join(parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
 def grade_from_score(total: float, *, growth: bool = False) -> tuple[str, str]:
     if growth:
         if total >= 85:
@@ -1504,10 +1913,10 @@ def grade_from_score(total: float, *, growth: bool = False) -> tuple[str, str]:
             return "🟡", "動能蓄勢中"
         return "🔴", "趨勢待確認"
     if total >= 85:
-        return "🟢", "頂級穩健"
+        return "🛡️", "財務防禦確立"
     if total >= 70:
-        return "🟡", "良好"
-    return "🔴", "高風險"
+        return "🟡", "體質穩健"
+    return "🔴", "防禦不足"
 
 
 def evaluate_fcf(rows: list[YearFCF]) -> tuple[bool | None, str]:
@@ -1529,6 +1938,87 @@ def evaluate_dividends(history: list[YearDividend]) -> tuple[bool | None, str]:
     if all(g is not None and g > 0 for g in recent):
         return True, f"{YEARS_REQUIRED} consecutive YoY DPS increases"
     return False, "Dividend growth streak broken"
+
+
+def _fmt_pct(value: float | None, *, scale: bool = True) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value * 100:.1f}%" if scale else f"{value:.1f}%"
+
+
+def format_master_metrics_block(master: MasterMetrics) -> str:
+    """Readable block of forward-looking master variables for AI prompt context."""
+    if master is None:
+        master = MasterMetrics()
+    capex = (
+        f"{master.capex_growth * 100:+.1f}% YoY" if master.capex_growth is not None else "N/A"
+    )
+    cov = f"{master.interest_coverage:.1f}x" if master.interest_coverage is not None else "低負債/未知"
+    surprise = (
+        f"{master.surprise_latest_pct:+.1f}%" if master.surprise_latest_pct is not None else "N/A"
+    )
+    lines = [
+        "Master forward-looking variables (期望值/風險溢價輸入):",
+        f"- Trailing PEG: {master.peg_ratio if master.peg_ratio is not None else 'N/A'}",
+        f"- CapEx 擴張率 (季 YoY): {capex}",
+        f"- ROE: {_fmt_pct(master.roe)} | ROA(ROIC proxy): {_fmt_pct(master.roa)}",
+        f"- 毛利率 (定價權 proxy): {_fmt_pct(master.gross_margins)}",
+        f"- 利息保障倍數: {cov}",
+        f"- 營收成長 (revenueGrowth): {_fmt_pct(master.revenue_growth)}",
+        (
+            f"- Earnings Surprise: 最新 {surprise} · "
+            f"連續超預期 {master.surprise_beat_streak} 季 · "
+            f"樣本 {master.surprise_sample} 季中 {master.surprise_beats} 季超預期"
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def _format_master_commentary_context(report: StockReport) -> str:
+    mode_label = (
+        STRATEGY_LABEL_GROWTH
+        if is_growth_strategy(report.strategy_mode)
+        else STRATEGY_LABEL_VALUE
+    )
+    lines = [
+        f"Ticker: {report.symbol}",
+        f"Company: {report.company_name}",
+        f"Strategy: {mode_label}",
+        f"Total Score: {report.total_score}/100",
+        f"Grade: {report.grade_emoji} {report.grade_label}",
+        "",
+        format_master_metrics_block(report.master),
+        "",
+        "Score breakdown:",
+    ]
+    for d in report.score_details:
+        if is_growth_strategy(report.strategy_mode) and d.max_points <= 0:
+            continue
+        lines.append(f"- {d.category}: {d.earned}/{d.max_points} — {d.rationale}")
+    if report.trend_signal:
+        ts = report.trend_signal
+        try:
+            price = float(ts.get("current_price", 0))
+            sma_20 = float(ts.get("sma_20", 0))
+            sma_50 = float(ts.get("sma_50", 0))
+            above_both = price > sma_20 and price > sma_50
+        except (TypeError, ValueError):
+            above_both = False
+        lines.extend(
+            [
+                "",
+                "Technical facts:",
+                f"- Signal: {ts.get('current_signal')}",
+                f"- Price: {ts.get('current_price')} | SMA20: {ts.get('sma_20')} | SMA50: {ts.get('sma_50')}",
+                f"- Price above BOTH SMA20 and SMA50: {above_both}",
+                f"- As of: {ts.get('as_of_date')}",
+            ]
+        )
+        if above_both:
+            lines.append(
+                "- 技術結構：價格已站上中期均線群，呈現右側打底結構（中期上升軌道支撐）。"
+            )
+    return "\n".join(lines)
 
 
 def _build_value_analyst_commentary(report: StockReport) -> str:
@@ -1567,26 +2057,41 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
     else:
         sections.append("- 趨勢數據不足，無法計算 SMA 交叉訊號。")
 
+    m = report.master
+    sections.append("")
+    sections.append("#### 前瞻硬指標（期望值輸入）")
+    sections.append(
+        f"- 護城河質量：ROE {_fmt_pct(m.roe)} · ROA {_fmt_pct(m.roa)} · "
+        f"毛利率 {_fmt_pct(m.gross_margins)} · 利息保障 "
+        f"{f'{m.interest_coverage:.1f}x' if m.interest_coverage is not None else '低負債/未知'}"
+    )
+    surprise_txt = (
+        f"{m.surprise_latest_pct:+.1f}%" if m.surprise_latest_pct is not None else "N/A"
+    )
+    sections.append(
+        f"- 預期偏差 Surprise：最新 {surprise_txt} · 連續超預期 {m.surprise_beat_streak} 季"
+    )
+
     sections.append("")
     sections.append("#### 投資風格提示")
     sections.append(
-        "- 100 分制衡量 **FCF 紀律、股息成長、發放率與 Beta**；"
-        "建議與 **產業景氣、估值與個人風險偏好** 一併考量，非直接買賣訊號。"
+        "- 本模式以 **商業護城河質量(50) + 預期偏差(20) + 現金流紀律(30)** 計分，"
+        "對應葛拉漢安全邊際與巴菲特護城河；建議與 **產業景氣、估值與個人風險偏好** 一併考量。"
     )
 
     if report.total_score >= 85:
         sections.append(
-            "\n> **結論**：財務紀律面向表現優秀，可作為核心底倉候選；"
+            "\n> **結論**：護城河與現金流紀律俱佳，財務防禦確立，可作為核心底倉候選；"
             "仍須追蹤產業景氣與估值。"
         )
     elif report.total_score >= 70:
         sections.append(
-            "\n> **結論**：整體良好，但存在可改進項（見 ⚠️ 項目）；"
+            "\n> **結論**：體質穩健，但存在可改進項（見 ⚠️ 項目）；"
             "適合觀察名單或分批佈局。"
         )
     else:
         sections.append(
-            "\n> **結論**：風險偏高，建議降低倉位權重或等待 FCF/股息紀律修復後再評估。"
+            "\n> **結論**：防禦不足，建議降低倉位權重或等待護城河質量與現金流紀律修復後再評估。"
         )
 
     return "\n".join(sections)
@@ -1674,26 +2179,46 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
                 breakout_line,
             ]
         )
+    m = report.master
+    peg_txt = f"{m.peg_ratio:.2f}" if m.peg_ratio is not None else "N/A"
+    capex_txt = f"{m.capex_growth*100:+.1f}% YoY" if m.capex_growth is not None else "N/A"
+    surprise_txt = (
+        f"{m.surprise_latest_pct:+.1f}%" if m.surprise_latest_pct is not None else "N/A"
+    )
+    sections.extend(
+        [
+            "",
+            "#### 前瞻硬指標（不對稱性輸入）",
+            f"- 前瞻 PEG **{peg_txt}** · CapEx 擴張率 **{capex_txt}** · "
+            f"最新 Surprise **{surprise_txt}**（連續超預期 {m.surprise_beat_streak} 季）",
+        ]
+    )
     sections.append(
-        "\n> **機構視角結論**：本模式 **零權重** 評估 FCF / 股息 / 發放率。"
-        "聚焦 **營收/R&D 孵化潛力** 與 **中期均線動能結構**。"
+        "\n> **機構視角結論**：本模式 **零權重** 評估 FCF / 股息 / 發放率，避免對燒錢新創的防禦偏見。"
+        "聚焦 **PEG 剪刀差 + CapEx 擴張**、**右側通道支撐** 與 **預期修正動態**。"
     )
     return "\n".join(sections)
 
 
 def build_analyst_commentary(report: StockReport) -> str:
-    if is_growth_strategy(report.strategy_mode):
-        from llm_processor import generate_growth_analyst_commentary
+    from llm_processor import generate_master_analyst_commentary
 
-        context = _format_growth_commentary_context(report)
-        llm_text = generate_growth_analyst_commentary(context)
-        if llm_text:
-            return (
-                "### AI 首席分析師決策點評\n"
-                f"**{report.symbol} · {report.company_name}** · "
-                "**策略戰術**：🚀 動能成長模式 · VC / 趨勢交易視角\n\n"
-                f"{llm_text.strip()}"
-            )
+    growth = is_growth_strategy(report.strategy_mode)
+    strategy_tagline = (
+        "🚀 動能成長模式 · 索羅斯敘事變革 / PEG 剪刀差 / 右側動能視角"
+        if growth
+        else "🛡️ 價值防禦模式 · 葛拉漢安全邊際 / 巴菲特護城河視角"
+    )
+    context = _format_master_commentary_context(report)
+    llm_text = generate_master_analyst_commentary(context)
+    if llm_text:
+        return (
+            "### AI 首席分析師決策點評\n"
+            f"**{report.symbol} · {report.company_name}** · "
+            f"**策略戰術**：{strategy_tagline}\n\n"
+            f"{llm_text.strip()}"
+        )
+    if growth:
         return _build_growth_analyst_commentary_fallback(report)
     return _build_value_analyst_commentary(report)
 
@@ -1720,20 +2245,23 @@ def compute_scores(
     info: dict | None = None,
     symbol: str = "",
     ticker: yf.Ticker | None = None,
+    master: MasterMetrics | None = None,
 ) -> tuple[list[ScoreDetail], float, str, str]:
     mode = normalize_strategy_mode(strategy_mode)
+    master = master or MasterMetrics()
+
     if mode == STRATEGY_GROWTH:
-        revenue_growth = _safe_info_float(info or {}, "revenueGrowth")
+        # 🚀 Forward asymmetry (PEG + CapEx) 40 / right-side technical 40 / surprise 20.
         scored = [
-            score_revenue_potential_component(
-                revenue_growth, info or {}, symbol, ticker=ticker
-            ),
+            score_forward_asymmetry_component(master),
             score_growth_momentum_component(trend_signal),
-            score_growth_beta_component(beta),
+            score_earnings_surprise_component(
+                master, category="預期修正動態", max_pts=WEIGHT_GROWTH_SURPRISE
+            ),
         ]
         excluded = [
             _growth_excluded_component(
-                "FCF 連續為正", "🚀 成長模式：FCF 不計分（權重 0）。"
+                "FCF 連續為正", "🚀 成長模式：歷史 FCF 不計分（權重 0，避免對燒錢新創的防禦偏見）。"
             ),
             _growth_excluded_component(
                 "股息連續成長", "🚀 成長模式：股息不計分（權重 0）。"
@@ -1747,11 +2275,13 @@ def compute_scores(
         emoji, label = grade_from_score(total, growth=True)
         return details, total, emoji, label
 
+    # 🛡️ Value defence — moat 50 / surprise 20 / cashflow discipline 30.
     details = [
-        score_fcf_component(fcf_rows),
-        score_dividend_growth_component(div_rows),
-        score_payout_component(payout),
-        score_beta_component(beta),
+        score_moat_quality_component(master),
+        score_earnings_surprise_component(
+            master, category="預期偏差 Surprise", max_pts=WEIGHT_VALUE_SURPRISE
+        ),
+        score_value_cashflow_component(fcf_rows, div_rows, payout),
     ]
     total = round(sum(d.earned for d in details), 1)
     emoji, label = grade_from_score(total, growth=False)
@@ -1770,6 +2300,7 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
     payout = fetch_payout_ratio(sym, ticker=ticker)
     beta = _safe_beta(info)
     trend = detect_trend_signals(sym)
+    master = fetch_master_metrics(sym, info, ticker=ticker)
 
     fcf_pass, fcf_note = evaluate_fcf(fcf_rows)
     div_pass, div_note = evaluate_dividends(div_rows)
@@ -1783,6 +2314,7 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
         info=info,
         symbol=sym,
         ticker=ticker,
+        master=master,
     )
 
     report = StockReport(
@@ -1802,6 +2334,7 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
         div_note=div_note,
         trend_signal=trend,
         strategy_mode=mode,
+        master=master,
     )
     report.analyst_commentary = build_analyst_commentary(report)
     return report
@@ -1833,6 +2366,9 @@ def build_company_narrative(
 
         trend = detect_trend_signals(yf_ticker)
         live_block = format_live_news_block(live_news)
+        info = _safe_ticker_info(yf_ticker, sym)
+        master = fetch_master_metrics(sym, info, ticker=yf_ticker)
+        master_block = format_master_metrics_block(master)
         text = generate_growth_narrative_text(
             sym,
             summary,
@@ -1840,6 +2376,7 @@ def build_company_narrative(
             industry,
             live_news_text=live_block,
             trend_signal=trend,
+            master_text=master_block,
         )
         if text.startswith("⚠️") and summary:
             text = generate_company_narrative_text(sym, summary, sector, industry)
@@ -1900,9 +2437,9 @@ def reports_to_summary_df(
                 "Company": r.company_name,
                 "綜合安全得分": r.total_score,
                 "等級": grade_display,
-                "營收潛力分": _detail_score(r, "營收", "預期"),
-                "技術面分": _detail_score(r, "動能", "技術"),
-                "Beta彈性分": _detail_score(r, "Beta", "彈性"),
+                "前瞻增長分": _detail_score(r, "前瞻", "增長", "不對稱"),
+                "技術面分": _detail_score(r, "技術", "右側", "動能"),
+                "預期修正分": _detail_score(r, "預期", "Surprise"),
             }
         else:
             row = {
@@ -1910,10 +2447,9 @@ def reports_to_summary_df(
                 "Company": r.company_name,
                 "綜合安全得分": r.total_score,
                 "等級": grade_display,
-                "FCF分": _detail_score(r, "FCF"),
-                "股息分": _detail_score(r, "股息"),
-                "發放率分": _detail_score(r, "發放率"),
-                "Beta分": _detail_score(r, "Beta"),
+                "護城河分": _detail_score(r, "護城河", "質量"),
+                "預期偏差分": _detail_score(r, "預期", "Surprise"),
+                "現金流紀律分": _detail_score(r, "現金流", "股息"),
             }
         rows.append(row)
     return pd.DataFrame(rows)

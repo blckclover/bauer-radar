@@ -38,13 +38,16 @@ st.set_page_config(
 )
 
 GRADE_COLORS = {
-    "頂級穩健": "#22c55e",
-    "良好": "#eab308",
-    "高風險": "#ef4444",
+    "財務防禦確立": "#22c55e",
+    "體質穩健": "#eab308",
+    "防禦不足": "#ef4444",
+    "右側結構確立": "#22c55e",
+    "動能蓄勢中": "#eab308",
+    "趨勢待確認": "#ef4444",
 }
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
-SCORE_COLUMNS_VALUE = ("綜合安全得分", "FCF分", "股息分", "發放率分", "Beta分")
-SCORE_COLUMNS_GROWTH = ("綜合安全得分", "營收潛力分", "技術面分", "Beta彈性分")
+SCORE_COLUMNS_VALUE = ("綜合安全得分", "護城河分", "預期偏差分", "現金流紀律分")
+SCORE_COLUMNS_GROWTH = ("綜合安全得分", "前瞻增長分", "技術面分", "預期修正分")
 GLOBAL_STRATEGY_KEY = "global_strategy_mode"
 ACTIVE_STRATEGY_KEY = "active_strategy"
 DEFAULT_HUNTER_UNIVERSE = "AAPL, MSFT, NVDA, INTC, BA, DIS, JNJ, KO"
@@ -113,8 +116,8 @@ def _strategy_short_name(mode: str | None = None) -> str:
 def _strategy_weight_caption(mode: str | None = None) -> str:
     active = mode or _current_strategy_mode()
     if is_growth_strategy(active):
-        return "營收潛力40 + 技術動能40 + Beta彈性20（FCF/股息不計分）"
-    return "FCF40 + 股息30 + 發放率20 + Beta10"
+        return "前瞻增長40 (PEG+CapEx) + 技術右側40 + 預期修正20（FCF/股息不計分）"
+    return "商業護城河50 (ROIC/ROE/毛利率/利息保障) + 預期偏差20 + 現金流紀律30"
 
 
 def _on_strategy_mode_change() -> None:
@@ -659,9 +662,9 @@ def _format_grade(report: StockReport) -> str:
 
 def _grade_tone(value: object) -> str:
     text = str(value)
-    if "頂級" in text or "右側結構" in text:
+    if "財務防禦確立" in text or "右側結構" in text:
         return "tone-green"
-    if "良好" in text or "動能蓄勢" in text:
+    if "體質穩健" in text or "動能蓄勢" in text:
         return "tone-yellow"
     return "tone-red"
 
@@ -798,9 +801,9 @@ def _style_summary_table(df: pd.DataFrame):
 
     def color_grade(val):
         text = str(val)
-        if "頂級" in text or "右側結構" in text:
+        if "財務防禦確立" in text or "右側結構" in text:
             color = "#4ade80"
-        elif "良好" in text or "動能蓄勢" in text:
+        elif "體質穩健" in text or "動能蓄勢" in text:
             color = "#facc15"
         else:
             color = "#f87171"
@@ -1659,6 +1662,42 @@ def _format_dividend_table(report: StockReport) -> pd.DataFrame:
     return out
 
 
+def _render_master_metric_row(report: StockReport) -> None:
+    """Forward-looking master variables (PEG / CapEx / ROE / margin / surprise)."""
+    m = report.master
+
+    def _pct(v: float | None) -> str:
+        return f"{v * 100:.1f}%" if v is not None else "N/A"
+
+    peg = f"{m.peg_ratio:.2f}" if m.peg_ratio is not None else "N/A"
+    capex = f"{m.capex_growth * 100:+.1f}%" if m.capex_growth is not None else "N/A"
+    cov = f"{m.interest_coverage:.1f}x" if m.interest_coverage is not None else "低負債"
+    if m.surprise_latest_pct is not None:
+        surprise_val = f"{m.surprise_latest_pct:+.1f}%"
+        surprise_sub = f"連續超預期 {m.surprise_beat_streak} 季"
+    elif m.surprise_sample:
+        surprise_val = "—"
+        surprise_sub = f"連續超預期 {m.surprise_beat_streak} 季"
+    else:
+        surprise_val, surprise_sub = "N/A", "預期偏差數據不足"
+
+    if is_growth_strategy(report.strategy_mode):
+        items = [
+            ("前瞻 PEG", peg, "成長/估值剪刀差"),
+            ("CapEx 擴張率", capex, "季 YoY · 產業擴張領先"),
+            ("毛利率", _pct(m.gross_margins), "定價權 proxy"),
+            ("近一季 Surprise", surprise_val, surprise_sub),
+        ]
+    else:
+        items = [
+            ("ROE", _pct(m.roe), "股東資金回報質量"),
+            ("毛利率", _pct(m.gross_margins), "定價權 / 轉嫁通膨"),
+            ("利息保障倍數", cov, "EBIT / 利息 · 護城河"),
+            ("近一季 Surprise", surprise_val, surprise_sub),
+        ]
+    _render_fx_metric_row(items)
+
+
 def _render_company_detail(report: StockReport) -> None:
     mode_label = _strategy_label_for_mode(report.strategy_mode)
     st.markdown(
@@ -1681,6 +1720,7 @@ def _render_company_detail(report: StockReport) -> None:
             ("Beta", _fmt1(report.beta) if report.beta is not None else "N/A"),
         ]
     )
+    _render_master_metric_row(report)
 
     chart_col, side_col = st.columns([0.67, 0.33], gap="medium")
     with chart_col:
@@ -1754,7 +1794,7 @@ def _render_core_scoring_tab() -> None:
     _render_fx_metric_row(
         [
             ("分析標的", str(len(reports))),
-            ("頂級穩健 (≥85)", str(len(top))),
+            ("高分標的 (≥85)", str(len(top))),
             ("評分權重", _strategy_short_name(mode), weight_caption),
             (
                 "均分",
@@ -1992,12 +2032,18 @@ def _render_sidebar() -> None:
     st.sidebar.header("量化評分標準")
     st.sidebar.markdown(
         """
-        - **FCF** (40)：連續 5 年為正
-        - **股息** (30)：連續 5 年成長
-        - **發放率** (20)：30–65% 滿分
-        - **Beta** (10)：≤0.8 滿分
+        **🛡️ 價值防禦模式**
+        - **商業護城河與質量** (50)：ROIC/ROE · 毛利率 · 利息保障
+        - **預期偏差 Surprise** (20)：是否連續超越市場預期
+        - **股息與現金流紀律** (30)：FCF 穩定度 · 配息規律
 
-        **等級**：≥85 🟢 | 70–84 🟡 | <70 🔴
+        **🚀 動能成長模式**
+        - **前瞻增長不對稱性** (40)：PEG 剪刀差 + CapEx 擴張率
+        - **技術面右側通道支撐** (40)：Close > SMA20 & SMA50
+        - **預期修正動態** (20)：EPS 預期上調 / Surprise 趨勢
+        - *歷史 FCF / 股息權重歸零*
+
+        **等級**：防禦 ≥85 🛡️財務防禦確立 · 成長 ≥85 📈右側結構確立
         """
     )
     st.sidebar.header("逆向轉機股雷達")
