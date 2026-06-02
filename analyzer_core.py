@@ -38,12 +38,19 @@ STRATEGY_LABEL_TO_MODE: dict[str, str] = {
     STRATEGY_LABEL_GROWTH: STRATEGY_GROWTH,
 }
 
-# --- Master-grade scoring weights (DGI value defence model) ---
-# 🛡️ Value defence — quality moat / dividend safety / balance sheet / growth floor
-WEIGHT_VALUE_QUALITY = 40.0    # ROIC + gross-margin stability + operating margin
-WEIGHT_VALUE_DIVIDEND = 30.0   # FCF payout ratio + dividend growth streak
-WEIGHT_VALUE_SAFETY = 20.0     # Net Debt/EBITDA + interest coverage
-WEIGHT_VALUE_GROWTH = 10.0     # 5Y revenue CAGR anti-stagnation floor
+# --- Master-grade scoring weights (DGI value defence — master asymmetric model) ---
+# 🛡️ Value defence — 35 / 25 / 25 / 15 with death penalties
+WEIGHT_VALUE_QUALITY = 35.0     # ROIC + gross-margin stability + operating margin
+WEIGHT_VALUE_SAFETY = 25.0      # Net Debt/EBITDA + interest coverage
+WEIGHT_VALUE_CASHFLOW = 25.0    # FCF payout ratio + dividend growth streak
+WEIGHT_VALUE_REVENUE = 15.0     # 5Y revenue CAGR / revenue stability floor
+# Asymmetric death-penalty thresholds (value mode only)
+NET_DEBT_EBITDA_DEATH_THRESHOLD = 3.0
+FCF_PAYOUT_DEATH_THRESHOLD = 0.90
+VALUE_SCORE_DEATH_CAP = 69.0
+FCF_PAYOUT_EXTRA_PENALTY = 10.0
+# Turnaround radar — anti-bankruptcy gate (shared with death penalty)
+NET_DEBT_EBITDA_MAX = 3.0
 # 🚀 Growth momentum — Soros reflexivity + PEG scissors + right-side trend
 WEIGHT_GROWTH_FORWARD = 40.0   # PEG asymmetry + CapEx expansion lead indicator
 WEIGHT_GROWTH_MOMENTUM = 40.0  # Close > SMA20 & SMA50 mid-term MA cluster support
@@ -234,6 +241,7 @@ class TurnaroundOpportunity:
     interest_coverage: float | None = None
     gross_margin: float | None = None
     gross_margin_yoy_change_pp: float | None = None
+    net_debt_ebitda: float | None = None
 
 
 NEWS_LOOKBACK_DAYS = 14
@@ -1206,9 +1214,17 @@ def fetch_master_metrics(
     info: dict | None,
     ticker: yf.Ticker | None = None,
 ) -> MasterMetrics:
-    """Aggregate forward-looking master-grade variables (PEG, CapEx, ROIC/ROE, surprise)."""
+    """Aggregate master-grade variables; core metrics served from SQLite cache."""
+    from data_layer import get_financial_data
+
     info = info or {}
     t = ticker or yf.Ticker(symbol)
+    sym = symbol.upper().strip()
+
+    try:
+        cached = get_financial_data(sym)
+    except Exception:
+        cached = None
 
     capex_growth, capex_latest = fetch_capex_growth(t)
     surprise = fetch_earnings_surprise(t)
@@ -1216,22 +1232,38 @@ def fetch_master_metrics(
     capex_flag, capex_msg = _evaluate_capex_red_flag(
         capex_growth, margin_trend.get("operating_margin_change_pp")
     )
-    roic, roa = fetch_roic(info, t)
+
+    if cached is not None and cached.ticker:
+        roic, roa = cached.roic, cached.roa
+        if roic is None and roa is None:
+            roic, roa = fetch_roic(info, t)
+    else:
+        roic, roa = fetch_roic(info, t)
 
     return MasterMetrics(
         peg_ratio=_safe_info_float(info, "trailingPegRatio"),
         capex_growth=capex_growth,
         capex_latest=capex_latest,
-        roe=_safe_info_float(info, "returnOnEquity"),
+        roe=_safe_info_float(info, "returnOnEquity") or (cached.roe if cached else None),
         roa=roa,
         roic=roic,
         gross_margins=_safe_info_float(info, "grossMargins"),
-        gross_margin_volatility=fetch_gross_margin_volatility(t),
-        interest_coverage=compute_interest_coverage(t),
-        net_debt_ebitda=fetch_net_debt_ebitda(info, t),
-        fcf_payout_ratio=fetch_fcf_payout_ratio(symbol, t, info),
+        gross_margin_volatility=(
+            cached.gross_margin_volatility if cached else fetch_gross_margin_volatility(t)
+        ),
+        interest_coverage=(
+            cached.interest_coverage if cached else compute_interest_coverage(t)
+        ),
+        net_debt_ebitda=(
+            cached.net_debt_ebitda if cached else fetch_net_debt_ebitda(info, t)
+        ),
+        fcf_payout_ratio=(
+            cached.fcf_payout_ratio if cached else fetch_fcf_payout_ratio(sym, t, info)
+        ),
         revenue_growth=_safe_info_float(info, "revenueGrowth"),
-        revenue_cagr_5y=fetch_revenue_cagr_5y(t),
+        revenue_cagr_5y=(
+            cached.revenue_cagr_5y if cached else fetch_revenue_cagr_5y(t)
+        ),
         surprise_latest_pct=(surprise or {}).get("latest_surprise_pct"),
         surprise_beat_streak=(surprise or {}).get("beat_streak", 0),
         surprise_sample=(surprise or {}).get("sample", 0),
@@ -1350,6 +1382,13 @@ def _gross_margin_filter(
     return passed, round(gm_latest * 100.0, 1), round(change_pp, 1)
 
 
+def _net_debt_ebitda_filter(net_debt_ebitda: float | None) -> tuple[bool, float | None]:
+    """Anti-bankruptcy gate: Net Debt / EBITDA must be strictly below 3.0x."""
+    if net_debt_ebitda is None:
+        return False, None
+    return net_debt_ebitda < NET_DEBT_EBITDA_MAX, net_debt_ebitda
+
+
 def _screen_single_turnaround(
     symbol: str,
     min_drawdown_pct: float,
@@ -1358,18 +1397,25 @@ def _screen_single_turnaround(
     """
     Per-ticker pipeline with institutional defensive filters:
       price drawdown gate → positive FCF fact → right-side (Close > SMA20)
-      → interest-coverage moat → gross-margin pricing-power → R&D fact reserve.
+      → anti-bankruptcy (Net Debt/EBITDA < 3) → interest coverage > 3x
+      → gross-margin pricing-power → R&D fact reserve.
 
-    Wrapped in try/except at the caller; returns None if any gate fails or
-    data is missing (never raises).
+    Core metrics served from SQLite cache via data_layer for scan speed.
     """
+    from data_layer import get_financial_data
+
     sym = symbol.upper().strip()
     if not sym:
         return None
 
+    try:
+        fin = get_financial_data(sym)
+    except Exception:
+        return None
+
     ticker = yf.Ticker(sym)
     info = _safe_ticker_info(ticker, sym)
-    name = _company_name(info, sym)
+    name = fin.company_name or _company_name(info, sym)
 
     price_facts = _six_month_price_drawdown(ticker, period=lookback_period)
     if price_facts is None:
@@ -1379,22 +1425,35 @@ def _screen_single_turnaround(
     if drawdown_pct <= min_drawdown_pct:
         return None
 
-    fcf_val, fcf_year, fcf_source = fetch_latest_fcf_snapshot(sym, ticker=ticker)
+    fcf_val = fin.latest_fcf
+    fcf_year = fin.fcf_fiscal_year
+    fcf_source = fin.fcf_source or "cache/yfinance"
     if fcf_val is None or fcf_val <= 0:
-        return None
+        fcf_val, fcf_year, fcf_source = fetch_latest_fcf_snapshot(sym, ticker=ticker)
+        if fcf_val is None or fcf_val <= 0:
+            return None
 
     # Filter 1 — technical right-side: reject names still chinning below SMA20.
     right_side_ok, _trend = _passes_right_side_filter(ticker)
     if not right_side_ok:
         return None
 
-    # Filter 2 — debt moat: interest coverage (EBIT / interest) must clear 3.0x
-    # whenever the ticker actually carries interest expense.
-    coverage_ok, interest_coverage = _interest_coverage_filter(ticker)
+    # Filter 2 — anti-bankruptcy: Net Debt / EBITDA must stay below 3.0x.
+    nd_ebitda = fin.net_debt_ebitda
+    leverage_ok, nd_ebitda = _net_debt_ebitda_filter(nd_ebitda)
+    if not leverage_ok:
+        return None
+
+    # Filter 3 — debt moat: interest coverage must clear 3.0x when debt exists.
+    interest_coverage = fin.interest_coverage
+    if interest_coverage is not None:
+        coverage_ok = interest_coverage >= INTEREST_COVERAGE_MIN
+    else:
+        coverage_ok, interest_coverage = _interest_coverage_filter(ticker)
     if not coverage_ok:
         return None
 
-    # Filter 3 — pricing power: gross margin must not collapse YoY.
+    # Filter 4 — pricing power: gross margin must not collapse YoY.
     margin_ok, gross_margin, gm_change_pp = _gross_margin_filter(ticker)
     if not margin_ok:
         return None
@@ -1415,6 +1474,7 @@ def _screen_single_turnaround(
         interest_coverage=interest_coverage,
         gross_margin=gross_margin,
         gross_margin_yoy_change_pp=gm_change_pp,
+        net_debt_ebitda=nd_ebitda,
     )
 
 
@@ -1438,15 +1498,19 @@ def find_turnaround_opportunities(
     3. **Technical right-side filter** — latest Close must sit above SMA20;
        names still bleeding below the 20-day line are discarded.
 
-    4. **Debt-moat filter** — interest coverage (EBIT / interest expense) must
+    4. **Anti-bankruptcy filter** — Net Debt / EBITDA must be strictly < 3.0x.
+
+    5. **Debt-moat filter** — interest coverage (EBIT / interest expense) must
        clear 3.0x when the ticker carries interest expense.
 
-    5. **Pricing-power filter** — latest-quarter gross margin must not contract
+    6. **Pricing-power filter** — latest-quarter gross margin must not contract
        by more than 5 percentage points YoY.
 
-    6. **R&D fact reserve** — optional innovation signal (not a filter).
+    7. **R&D fact reserve** — optional innovation signal (not a filter).
 
-    7. **Fault isolation** — each ticker runs inside its own try/except;
+    8. **SQLite cache** — core metrics via `data_layer.get_financial_data`.
+
+    9. **Fault isolation** — each ticker runs inside its own try/except;
        one bad symbol never aborts the full scan.
 
     Returns candidates sorted by deepest drawdown first (largest % drop).
@@ -2056,27 +2120,27 @@ def _growth_excluded_component(category: str, note: str) -> ScoreDetail:
 
 
 def score_value_quality_component(master: MasterMetrics) -> ScoreDetail:
-    """🛡️ Enterprise quality & moat (40): ROIC + GM stability + operating margin."""
+    """🛡️ Enterprise quality (35): ROIC + GM stability + operating margin."""
     max_pts = WEIGHT_VALUE_QUALITY
     category = "企業品質與護城河"
     earned = 0.0
     parts: list[str] = []
 
-    # ROIC — true capital efficiency (max 15); priority over ROE
+    # ROIC — max 13
     roic = master.roic if master.roic is not None else master.roa
     if roic is not None:
         if roic >= 0.15:
-            sub, tag = 15.0, "卓越 ≥15%"
+            sub, tag = 13.0, "卓越 ≥15%"
         elif roic >= 0.12:
-            sub, tag = 12.0, "優異 12%–15%"
+            sub, tag = 10.5, "優異 12%–15%"
         elif roic >= 0.10:
-            sub, tag = 9.0, "穩健 10%–12%"
+            sub, tag = 8.0, "穩健 10%–12%"
         elif roic >= 0.07:
-            sub, tag = 6.0, "普通 7%–10%"
+            sub, tag = 5.0, "普通 7%–10%"
         elif roic >= 0.04:
-            sub, tag = 3.0, "偏弱 4%–7%"
+            sub, tag = 2.5, "偏弱 4%–7%"
         elif roic > 0:
-            sub, tag = 1.5, "低 <4%"
+            sub, tag = 1.0, "低 <4%"
         else:
             sub, tag = 0.0, "為負（資本配置失敗）"
         earned += sub
@@ -2085,41 +2149,41 @@ def score_value_quality_component(master: MasterMetrics) -> ScoreDetail:
         if master.roe is not None and master.roic is not None and master.roe > master.roic * 1.8:
             parts.append(f"⚠ ROE {master.roe*100:.1f}% 顯著高於 ROIC，留意槓桿撐高假象")
     else:
-        earned += 15.0 * 0.30
+        earned += 13.0 * 0.30
         parts.append("ROIC 數據缺失（給予中性基礎）")
 
-    # Gross margin stability — pricing power persistence (max 10)
+    # Gross margin stability — max 9
     gm_vol = master.gross_margin_volatility
     if gm_vol is not None:
         if gm_vol <= 5.0:
-            sub, tag = 10.0, "極穩定 ≤5pp"
+            sub, tag = 9.0, "極穩定 ≤5pp"
         elif gm_vol <= 10.0:
-            sub, tag = 7.0, "穩健 5–10pp"
+            sub, tag = 6.0, "穩健 5–10pp"
         elif gm_vol <= 15.0:
-            sub, tag = 4.0, "波動 10–15pp"
+            sub, tag = 3.5, "波動 10–15pp"
         elif gm_vol <= 20.0:
-            sub, tag = 2.0, "不穩 15–20pp"
+            sub, tag = 1.5, "不穩 15–20pp"
         else:
             sub, tag = 0.0, "劇烈波動 >20pp"
         earned += sub
         parts.append(f"毛利率波動 {gm_vol:.1f}pp（{tag}）")
     else:
-        earned += 10.0 * 0.30
+        earned += 9.0 * 0.30
         parts.append("毛利率穩定度數據不足")
 
-    # Operating margin — unit economics (max 15)
+    # Operating margin — max 13
     om = master.ttm_operating_margin
     if om is None and master.operating_margin_latest is not None:
         om = master.operating_margin_latest / 100.0
     if om is not None:
         if om >= 0.20:
-            sub, tag = 15.0, "強勢 ≥20%"
+            sub, tag = 13.0, "強勢 ≥20%"
         elif om >= 0.15:
-            sub, tag = 12.0, "優良 15%–20%"
+            sub, tag = 10.5, "優良 15%–20%"
         elif om >= 0.10:
-            sub, tag = 9.0, "穩健 10%–15%"
+            sub, tag = 8.0, "穩健 10%–15%"
         elif om >= 0.05:
-            sub, tag = 5.0, "普通 5%–10%"
+            sub, tag = 4.5, "普通 5%–10%"
         elif om > 0:
             sub, tag = 2.0, "薄利 <5%"
         else:
@@ -2127,103 +2191,101 @@ def score_value_quality_component(master: MasterMetrics) -> ScoreDetail:
         earned += sub
         parts.append(f"營業利益率 {om*100:.1f}%（{tag}）")
     else:
-        earned += 15.0 * 0.30
+        earned += 13.0 * 0.30
         parts.append("營業利益率數據缺失")
 
     rationale = " · ".join(parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
 
-def score_value_dividend_component(
+def score_value_cashflow_component(
     master: MasterMetrics,
     div_rows: list[YearDividend],
 ) -> ScoreDetail:
-    """🛡️ Dividend & cashflow quality (30): FCF payout + dividend growth streak."""
-    max_pts = WEIGHT_VALUE_DIVIDEND
-    category = "股息與現金流品質"
+    """🛡️ Cashflow quality (25): FCF payout + dividend growth streak."""
+    max_pts = WEIGHT_VALUE_CASHFLOW
+    category = "現金流品質"
     earned = 0.0
     parts: list[str] = []
 
-    # FCF payout ratio (max 15)
+    # FCF payout ratio — max 12.5
     fcf_pay = master.fcf_payout_ratio
     if fcf_pay is not None:
-        if fcf_pay > 0.90:
-            sub, tag = 0.0, "危險 >90%（股息裁減風險極高）"
+        if fcf_pay > FCF_PAYOUT_DEATH_THRESHOLD:
+            sub, tag = 0.0, f"危險 >{FCF_PAYOUT_DEATH_THRESHOLD*100:.0f}%（死亡懲罰觸發）"
         elif fcf_pay <= 0.50:
-            sub, tag = 15.0, "安全 ≤50%"
+            sub, tag = 12.5, "安全 ≤50%"
         elif fcf_pay <= 0.70:
-            sub, tag = 11.0, "穩健 50%–70%"
+            sub, tag = 9.0, "穩健 50%–70%"
         elif fcf_pay <= 0.80:
-            sub, tag = 7.0, "偏緊 70%–80%"
+            sub, tag = 6.0, "偏緊 70%–80%"
         else:
-            sub, tag = 3.0, "警戒 80%–90%"
+            sub, tag = 2.5, f"警戒 80%–{FCF_PAYOUT_DEATH_THRESHOLD*100:.0f}%"
         earned += sub
         parts.append(f"FCF 支付率 {fcf_pay*100:.1f}%（{tag}）")
     else:
-        earned += 15.0 * 0.35
+        earned += 12.5 * 0.35
         parts.append("FCF 支付率數據不足（給予中性基礎）")
 
-    # Dividend growth & payment stability (max 15)
     div_detail = score_dividend_growth_component(div_rows)
-    div_part = div_detail.earned / WEIGHT_DIV * 15.0
+    div_part = div_detail.earned / WEIGHT_DIV * 12.5
     earned += div_part
-    parts.append(f"股息成長 {div_part:.1f}/15 — {div_detail.rationale.split('，本項')[0]}")
+    parts.append(f"股息成長 {div_part:.1f}/12.5 — {div_detail.rationale.split('，本項')[0]}")
 
     rationale = " · ".join(parts) + f"，合計 {earned:.1f}/{max_pts:.0f} 分。"
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
 
 def score_value_safety_component(master: MasterMetrics) -> ScoreDetail:
-    """🛡️ Financial safety (20): Net Debt/EBITDA + interest coverage."""
+    """🛡️ Financial safety (25): Net Debt/EBITDA + interest coverage."""
     max_pts = WEIGHT_VALUE_SAFETY
     category = "財務安全防線"
     earned = 0.0
     parts: list[str] = []
 
-    # Net Debt / EBITDA (max 10)
+    # Net Debt / EBITDA — max 12.5
     nd_ebitda = master.net_debt_ebitda
     if nd_ebitda is not None:
-        if nd_ebitda > 3.0:
-            sub, tag = 0.0, "高槓桿 >3x"
+        if nd_ebitda > NET_DEBT_EBITDA_DEATH_THRESHOLD:
+            sub, tag = 0.0, f"高槓桿 >{NET_DEBT_EBITDA_DEATH_THRESHOLD:.0f}x（死亡懲罰觸發）"
         elif nd_ebitda <= 2.0:
-            sub, tag = 10.0, "穩健 ≤2x"
+            sub, tag = 12.5, "穩健 ≤2x"
         elif nd_ebitda <= 2.5:
-            sub, tag = 8.0, "可接受 2–2.5x"
+            sub, tag = 10.0, "可接受 2–2.5x"
         else:
-            sub, tag = 5.0, "偏緊 2.5–3x"
+            sub, tag = 6.0, f"偏緊 2.5–{NET_DEBT_EBITDA_DEATH_THRESHOLD:.0f}x"
         earned += sub
         parts.append(f"淨債務/EBITDA {nd_ebitda:.1f}x（{tag}）")
     else:
-        earned += 10.0 * 0.50
+        earned += 12.5 * 0.50
         parts.append("淨債務/EBITDA 數據不足")
 
-    # Interest coverage (max 10)
     cov = master.interest_coverage
     if cov is not None:
         if cov >= 5.0:
-            sub, tag = 10.0, "充裕 ≥5x"
+            sub, tag = 12.5, "充裕 ≥5x"
         elif cov >= 4.0:
-            sub, tag = 8.0, "穩健 4–5x"
+            sub, tag = 10.0, "穩健 4–5x"
         elif cov >= 3.0:
-            sub, tag = 5.0, "及格 3–4x"
+            sub, tag = 6.0, "及格 3–4x"
         elif cov >= 1.5:
-            sub, tag = 2.0, "偏緊 1.5–3x"
+            sub, tag = 2.5, "偏緊 1.5–3x"
         else:
             sub, tag = 0.0, "脆弱 <1.5x"
         earned += sub
         parts.append(f"利息保障 {cov:.1f}x（{tag}）")
     else:
-        earned += 10.0 * 0.85
+        earned += 12.5 * 0.85
         parts.append("低負債結構（無顯著利息支出）")
 
     rationale = " · ".join(parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
 
-def score_value_growth_floor_component(master: MasterMetrics) -> ScoreDetail:
-    """🛡️ Anti-inflation growth floor (10): 5Y revenue CAGR."""
-    max_pts = WEIGHT_VALUE_GROWTH
-    category = "抗通膨成長底線"
+def score_value_revenue_stability_component(master: MasterMetrics) -> ScoreDetail:
+    """🛡️ Revenue stability floor (15): 5Y revenue CAGR."""
+    max_pts = WEIGHT_VALUE_REVENUE
+    category = "營收穩定"
     cagr = master.revenue_cagr_5y
 
     if cagr is not None:
@@ -2232,9 +2294,9 @@ def score_value_growth_floor_component(master: MasterMetrics) -> ScoreDetail:
         elif cagr >= 0.05:
             earned, tag = max_pts, "強勁 ≥5%"
         elif cagr >= 0.03:
-            earned, tag = 7.0, "溫和 3%–5%"
+            earned, tag = 10.0, "溫和 3%–5%"
         elif cagr >= 0:
-            earned, tag = 4.0, "停滯 0%–3%"
+            earned, tag = 6.0, "停滯 0%–3%"
         else:
             earned, tag = 0.0, "衰退"
         rationale = f"5Y 營收 CAGR {cagr*100:+.1f}%（{tag}），本項得 {earned:.1f}/{max_pts:.0f} 分。"
@@ -2254,6 +2316,50 @@ def score_value_growth_floor_component(master: MasterMetrics) -> ScoreDetail:
             rationale = f"營收成長數據不足，給予中性基礎 {earned:.1f}/{max_pts:.0f} 分。"
 
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
+def _apply_value_death_penalties(
+    details: list[ScoreDetail],
+    master: MasterMetrics,
+) -> float:
+    """Asymmetric death penalties — safety/cashflow zero-out + cap / extra deduct."""
+    total = sum(d.earned for d in details)
+    cap_total = False
+
+    if (
+        master.net_debt_ebitda is not None
+        and master.net_debt_ebitda > NET_DEBT_EBITDA_DEATH_THRESHOLD
+    ):
+        for d in details:
+            if "財務安全" in d.category:
+                total -= d.earned
+                d.earned = 0.0
+                d.rationale += (
+                    f" 【不對稱死亡懲罰】淨債務/EBITDA {master.net_debt_ebitda:.1f}x > "
+                    f"{NET_DEBT_EBITDA_DEATH_THRESHOLD:.0f}x，財務安全類歸零，"
+                    f"總分封頂 {VALUE_SCORE_DEATH_CAP:.0f}。"
+                )
+        cap_total = True
+
+    if (
+        master.fcf_payout_ratio is not None
+        and master.fcf_payout_ratio > FCF_PAYOUT_DEATH_THRESHOLD
+    ):
+        for d in details:
+            if "現金流" in d.category:
+                total -= d.earned
+                d.earned = 0.0
+                d.rationale += (
+                    f" 【不對稱死亡懲罰】FCF 支付率 {master.fcf_payout_ratio*100:.1f}% > "
+                    f"{FCF_PAYOUT_DEATH_THRESHOLD*100:.0f}%，現金流類歸零，"
+                    f"額外扣 {FCF_PAYOUT_EXTRA_PENALTY:.0f} 分。"
+                )
+        total = max(0.0, total - FCF_PAYOUT_EXTRA_PENALTY)
+
+    if cap_total:
+        total = min(total, VALUE_SCORE_DEATH_CAP)
+
+    return round(total, 1)
 
 
 def score_earnings_surprise_component(
@@ -2601,8 +2707,8 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
     sections.append("")
     sections.append("【投資風格提示】")
     sections.append(
-        "- 本模式以 企業品質(40) + 股息現金流(30) + 財務安全(20) + 成長底線(10) 計分，"
-        "聚焦 ROIC 真實護城河、FCF 股息安全網與抗衰退底線；"
+        "- 本模式以 企業品質(35) + 財務安全(25) + 現金流品質(25) + 營收穩定(15) 計分，"
+        "含不對稱死亡懲罰（槓桿 >3x 封頂 69 分；FCF 支付率 >90% 歸零並扣 10 分）；"
         "建議與 產業景氣、估值與個人風險偏好 一併考量。"
     )
 
@@ -2926,14 +3032,14 @@ def compute_scores(
         emoji, label = grade_from_score(total, growth=True)
         return details, total, emoji, label
 
-    # 🛡️ Value defence — quality 40 / dividend 30 / safety 20 / growth floor 10.
+    # 🛡️ Value defence — quality 35 / safety 25 / cashflow 25 / revenue 15 + death penalties.
     details = [
         score_value_quality_component(master),
-        score_value_dividend_component(master, div_rows),
         score_value_safety_component(master),
-        score_value_growth_floor_component(master),
+        score_value_cashflow_component(master, div_rows),
+        score_value_revenue_stability_component(master),
     ]
-    total = round(sum(d.earned for d in details), 1)
+    total = _apply_value_death_penalties(details, master)
     emoji, label = grade_from_score(total, growth=False)
     return details, total, emoji, label
 
@@ -3102,9 +3208,9 @@ def reports_to_summary_df(
                 "綜合安全得分": r.total_score,
                 "等級": grade_display,
                 "企業品質分": _detail_score(r, "企業品質", "護城河"),
-                "股息現金流分": _detail_score(r, "股息", "現金流"),
+                "現金流品質分": _detail_score(r, "現金流"),
                 "財務安全分": _detail_score(r, "財務安全"),
-                "成長底線分": _detail_score(r, "成長底線", "抗通膨"),
+                "營收穩定分": _detail_score(r, "營收穩定"),
             }
         rows.append(row)
     return pd.DataFrame(rows)

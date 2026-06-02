@@ -52,7 +52,7 @@ GRADE_COLORS = {
     "趨勢待確認": "#ef4444",
 }
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
-SCORE_COLUMNS_VALUE = ("綜合安全得分", "企業品質分", "股息現金流分", "財務安全分", "成長底線分")
+SCORE_COLUMNS_VALUE = ("綜合安全得分", "企業品質分", "現金流品質分", "財務安全分", "營收穩定分")
 SCORE_COLUMNS_GROWTH = ("綜合安全得分", "前瞻增長分", "技術面分", "預期修正分")
 
 # Institutional factor glossary — surfaced via hover tooltips & glossary expander
@@ -71,7 +71,7 @@ METRIC_TOOLTIPS: dict[str, str] = {
     ),
     "5Y 營收 CAGR": (
         "五年營收複合成長率，用於排除「便宜但衰退」的價值陷阱；"
-        "負成長直接觸發成長底線 0 分。"
+        "負成長直接觸發營收穩定 0 分。"
     ),
     "綜合安全得分": "100 分制量化綜合評分，由四大維度加總；≥85 為機構級防禦/結構確立門檻。",
     "等級": "依當前策略模式動態映射：防禦模式 🛡️ 財務防禦確立；成長模式 📈 右側結構確立。",
@@ -86,18 +86,18 @@ METRIC_TOOLTIPS: dict[str, str] = {
 
 SCORE_WEIGHT_TOOLTIPS_VALUE: dict[str, str] = {
     "企業品質與護城河": (
-        "ROIC（15）+ 毛利率穩定度（10）+ 營業利益率（15）。"
+        "ROIC + 毛利率穩定度 + 營業利益率（35 分）。"
         "優先 ROIC 而非 ROE，排除槓桿假象。"
     ),
-    "股息與現金流品質": (
-        "FCF 支付率（15）+ 股息連續成長（15）。"
-        "支付率 >90% 直接 0 分，精準預測裁息風險。"
+    "現金流品質": (
+        "FCF 支付率 + 股息連續成長（25 分）。"
+        "支付率 >90% 觸發死亡懲罰：類別歸零並額外扣 10 分。"
     ),
     "財務安全防線": (
-        "淨債務/EBITDA（10）+ 利息保障（10）。"
-        "槓桿 >3x 或利息保障 <3x 觸發高風險評級。"
+        "淨債務/EBITDA + 利息保障（25 分）。"
+        "槓桿 >3x 觸發死亡懲罰：類別歸零且總分封頂 69。"
     ),
-    "抗通膨成長底線": "5Y 營收 CAGR（10）；負成長 = 0 分，避免買入衰退型死水公司。",
+    "營收穩定": "5Y 營收 CAGR（15 分）；負成長 = 0 分，避免衰退型價值陷阱。",
 }
 
 SCORE_WEIGHT_TOOLTIPS_GROWTH: dict[str, str] = {
@@ -183,7 +183,7 @@ def _strategy_weight_caption(mode: str | None = None) -> str:
     active = mode or _current_strategy_mode()
     if is_growth_strategy(active):
         return "前瞻增長40 (PEG+CapEx) + 技術右側40 + 預期修正20（FCF/股息不計分）"
-    return "企業品質40 (ROIC/毛利率穩定/營業利益率) + 股息現金流30 (FCF支付率/股息成長) + 財務安全20 (淨債務EBITDA/利息保障) + 成長底線10 (5Y營收CAGR)"
+    return "企業品質35 + 財務安全25 + 現金流品質25 + 營收穩定15（死亡懲罰：槓桿>3x封頂69 / FCF支付>90%扣10）"
 
 
 def _on_strategy_mode_change() -> None:
@@ -1269,6 +1269,9 @@ def _turnaround_to_dataframe(candidates: list[TurnaroundOpportunity]) -> pd.Data
         coverage = (
             f"{c.interest_coverage:.1f}x" if c.interest_coverage is not None else "低負債"
         )
+        nd_ebitda = (
+            f"{c.net_debt_ebitda:.1f}x" if c.net_debt_ebitda is not None else "—"
+        )
         if c.gross_margin is not None:
             margin = f"{c.gross_margin:.1f}%"
             if c.gross_margin_yoy_change_pp is not None:
@@ -1283,6 +1286,7 @@ def _turnaround_to_dataframe(candidates: list[TurnaroundOpportunity]) -> pd.Data
                 "相對半年高點跌幅": f"-{c.drawdown_pct:.1f}%",
                 "最新財年 FCF": _fmt_money_large(c.latest_fcf),
                 "利息保障倍數": coverage,
+                "淨債務/EBITDA": nd_ebitda,
                 "毛利率 (YoY)": margin,
                 "研發費 (R&D)": rd,
                 "FCF 來源": c.fcf_source,
@@ -2276,7 +2280,7 @@ def _render_master_metric_row(report: object) -> None:
             ("ROIC", _pct(roic_v) if roic_v is not None else _pct(roe_v), "資本回報 · 優先於 ROE"),
             ("FCF 支付率", _pct(fcf_pay_v), "股息 / 自由現金流"),
             ("淨債務/EBITDA", f"{float(nd_ebitda_v):.1f}x" if nd_ebitda_v is not None else "N/A", "槓桿安全線"),
-            ("5Y 營收 CAGR", _pct(rev_cagr_v), "抗衰退成長底線"),
+            ("5Y 營收 CAGR", _pct(rev_cagr_v), "營收穩定底線"),
         ]
     _render_fx_metric_row(items)
 
@@ -2454,7 +2458,8 @@ def _render_turnaround_hunter_tab() -> None:
     st.markdown(
         '<p class="subtitle">'
         "在<strong>市場恐慌（股價大跌）</strong>中，僅保留<strong>現金流為正、站上 20 日線、"
-        "債務護城河穩固且維持定價權</strong>的機構級轉機標的。"
+        "淨槓桿 &lt; 3x、利息保障 &gt; 3x 且維持定價權</strong>的機構級轉機標的。"
+        "（SQLite 快取加速掃描）"
         "</p>",
         unsafe_allow_html=True,
     )
@@ -2462,9 +2467,10 @@ def _render_turnaround_hunter_tab() -> None:
     _render_fx_metric_row(
         [
             ("價格濾網", "半年高點跌幅 > 15%", "且最新 Close 必須站上 SMA20（右側打底）"),
-            ("現金流濾網", "最新財年 FCF > 0", "SEC EDGAR 優先，Yahoo 備援"),
-            ("債務護城河", "利息保障倍數 > 3x", "EBIT / 利息費用，避開結構脆弱者"),
-            ("定價權濾網", "毛利率 YoY 穩定", "最新一季毛利率 YoY 跌幅 ≤ 5pp"),
+            ("現金流濾網", "最新財年 FCF > 0", "SQLite 快取 · SEC 優先"),
+            ("防破產濾網", "淨債務/EBITDA < 3x", "剔除高槓桿價值陷阱"),
+            ("債務護城河", "利息保障倍數 > 3x", "EBIT / 利息費用"),
+            ("定價權濾網", "毛利率 YoY 穩定", "YoY 跌幅 ≤ 5pp"),
             ("上次命中", str(len(st.session_state.hunter_results))),
         ]
     )
@@ -2505,11 +2511,11 @@ def _render_turnaround_hunter_tab() -> None:
 
     if index_key == "sp500":
         st.info(
-            "⏱ 標普 500 全市場 × 五道濾網（含均線、利息保障、毛利率 YoY）"
+            "⏱ 標普 500 全市場 × 六道濾網（含防破產、均線、利息保障、毛利率 YoY）"
             "需時約 **3–6 分鐘**，請耐心等候…"
         )
     elif index_key == "nasdaq100":
-        st.caption("⏱ 掃描納斯達克 100（五道濾網）約需 **1–2 分鐘**。")
+        st.caption("⏱ 掃描納斯達克 100（六道濾網 · SQLite 快取）約需 **1–2 分鐘**。")
     elif index_key == "dow30":
         st.caption("⏱ 道瓊 30 多濾網掃描，通常 **30–60 秒** 完成。")
 
@@ -2619,11 +2625,11 @@ def _render_sidebar() -> None:
     st.sidebar.header("量化評分標準")
     st.sidebar.markdown(
         """
-        **🛡️ 價值防禦模式（DGI 量化）**
-        - **企業品質與護城河** (40)：ROIC · 毛利率穩定度 · 營業利益率
-        - **股息與現金流品質** (30)：FCF 支付率 · 股息連續成長
-        - **財務安全防線** (20)：淨債務/EBITDA · 利息保障倍數
-        - **抗通膨成長底線** (10)：5Y 營收 CAGR（負成長直接 0 分）
+        **🛡️ 價值防禦模式（35/25/25/15 + 死亡懲罰）**
+        - **企業品質** (35)：ROIC · 毛利率穩定 · 營業利益率
+        - **財務安全** (25)：淨債務/EBITDA · 利息保障（>3x 封頂 69）
+        - **現金流品質** (25)：FCF 支付率 · 股息成長（>90% 扣 10）
+        - **營收穩定** (15)：5Y 營收 CAGR
 
         **🚀 動能成長模式**
         - **前瞻增長不對稱性** (40)：PEG 剪刀差 + CapEx 擴張率
@@ -2637,12 +2643,13 @@ def _render_sidebar() -> None:
     st.sidebar.header("逆向轉機股雷達")
     st.sidebar.markdown(
         """
-        **五道機構級防禦濾網：**
+        **六道機構級防禦濾網（SQLite 快取加速）：**
         1. 半年股價跌幅 **> 15%**
-        2. 最新財年 **FCF > 0**（SEC 優先）
+        2. 最新財年 **FCF > 0**
         3. 技術面 **Close > SMA20**（右側打底）
-        4. **利息保障倍數 > 3x**（EBIT / 利息）
-        5. **毛利率 YoY** 跌幅 ≤ 5pp（定價權）
+        4. **淨債務/EBITDA < 3x**（防破產）
+        5. **利息保障倍數 > 3x**
+        6. **毛利率 YoY** 跌幅 ≤ 5pp
 
         *R&D 事實為輔助參考，不作篩選*
         """
