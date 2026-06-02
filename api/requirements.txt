@@ -1,0 +1,10 @@
+# FastAPI backend — install from repo root or api/
+# pip install -r api/requirements.txt
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+
+# Re-use root analyzer (also needs root requirements.txt)
+# pandas, yfinance, requests, google-genai, streamlit (for LLM cache decorators)

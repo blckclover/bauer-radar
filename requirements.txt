@@ -17,3 +17,6 @@ rich>=13.0.0
 # --- System A: news RSS + LLM briefing (data_fetcher.py, llm_processor.py, daily_briefing.py) ---
 feedparser>=6.0.0
 google-genai>=1.0.0
+
+# --- FastAPI backend (api/) — also run: pip install -r api/requirements.txt ---
+# fastapi, uvicorn, pydantic listed in api/requirements.txt

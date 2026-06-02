@@ -75,7 +75,21 @@ export interface DashboardMockData {
 
 export type AsyncState = "idle" | "loading" | "success" | "error";
 
-export interface ComponentStateProps {
-  isLoading?: boolean;
-  error?: string | null;
+export interface AnalyzeResponse {
+  scorecard: ScorecardResult;
+  redTeamFindings: RedTeamFinding[];
+  analystCommentary?: string | null;
+  dataSource?: "live" | "cache" | "mock";
+}
+
+export interface NarrativeResponse {
+  symbol: string;
+  text: string;
+  liveNewsDegraded: boolean;
+  strategyMode: StrategyMode;
+}
+
+export interface ApiErrorBody {
+  detail?: string | { detail?: string; code?: string };
+  code?: string;
 }

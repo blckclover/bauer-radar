@@ -1,8 +1,11 @@
 export type {
+  AnalyzeResponse,
+  ApiErrorBody,
   AsyncState,
   ComponentStateProps,
   DashboardMockData,
   MetricItem,
+  NarrativeResponse,
   QualityScore,
   RedTeamFinding,
   RedTeamSeverity,
