@@ -37,12 +37,9 @@ STRATEGY_LABEL_TO_MODE: dict[str, str] = {
     STRATEGY_LABEL_VALUE: STRATEGY_VALUE,
     STRATEGY_LABEL_GROWTH: STRATEGY_GROWTH,
 }
-WEIGHT_GROWTH_FCF = 25.0
-WEIGHT_GROWTH_DIV = 10.0
-WEIGHT_GROWTH_PAYOUT = 10.0
-WEIGHT_GROWTH_BETA = 5.0
-WEIGHT_GROWTH_REVENUE = 25.0
-WEIGHT_GROWTH_SMA = 25.0
+WEIGHT_GROWTH_REVENUE = 40.0
+WEIGHT_GROWTH_MOMENTUM = 40.0
+WEIGHT_GROWTH_BETA = 20.0
 PENALTY_FCF_PER_YEAR = 10.0
 PENALTY_DIV_PER_YEAR = 8.0
 
@@ -1028,50 +1025,97 @@ def score_beta_component(beta: float | None) -> ScoreDetail:
     return ScoreDetail("Beta 波動", max_pts, earned, rationale)
 
 
-def _rescale_score_detail(detail: ScoreDetail, new_max: float) -> ScoreDetail:
-    """Scale a value-mode component to growth-mode weight cap."""
-    if detail.max_points <= 0:
-        return ScoreDetail(detail.category, new_max, 0.0, detail.rationale)
-    earned = round(min(new_max, detail.earned * (new_max / detail.max_points)), 1)
-    return ScoreDetail(detail.category, new_max, earned, detail.rationale)
-
-
-def score_revenue_growth_component(revenue_growth: float | None) -> ScoreDetail:
+def score_revenue_potential_component(
+    revenue_growth: float | None,
+    info: dict,
+    symbol: str,
+    ticker: yf.Ticker | None = None,
+) -> ScoreDetail:
+    """Revenue & forward potential — R&D incubation floor for pre-revenue biotech."""
     max_pts = WEIGHT_GROWTH_REVENUE
-    if revenue_growth is None:
-        return ScoreDetail(
-            "營收成長",
-            max_pts,
-            0.0,
-            "無法取得營收成長率（revenueGrowth），本項 0 分。",
+    info = info or {}
+
+    if revenue_growth is not None and revenue_growth > 0:
+        pct = revenue_growth * 100
+        if revenue_growth >= 0.20:
+            earned, band = max_pts, "高速成長 ≥20%"
+        elif revenue_growth >= 0.10:
+            earned, band = max_pts * 0.85, "強勁成長 10%–20%"
+        elif revenue_growth >= 0.03:
+            earned, band = max_pts * 0.70, "穩健成長 3%–10%"
+        else:
+            earned, band = max_pts * 0.55, "低個位數正成長"
+        rationale = f"營收成長 {pct:.1f}%（{band}），本項得 {earned:.1f}/{max_pts:.0f} 分。"
+        return ScoreDetail("營收與未來預期", max_pts, round(earned, 1), rationale)
+
+    rd_expense, rd_year = fetch_latest_rd_expense(symbol, ticker=ticker)
+    total_revenue = _safe_info_float(info, "totalRevenue")
+    qtr_momentum = _safe_info_float(info, "earningsQuarterlyGrowth")
+    if qtr_momentum is None:
+        qtr_momentum = _safe_info_float(info, "earningsGrowth")
+
+    earned = 0.0
+    rationale_parts: list[str] = []
+
+    if revenue_growth is not None and revenue_growth <= 0:
+        pct = revenue_growth * 100
+        rationale_parts.append(f"年度營收成長 {pct:.1f}%（成長股常見陣痛期）")
+    else:
+        rationale_parts.append("年度營收成長數據缺失")
+
+    if qtr_momentum is not None:
+        q_pct = qtr_momentum * 100
+        if qtr_momentum > 0.05:
+            earned = max(earned, max_pts * 0.75)
+            rationale_parts.append(f"季報動能 +{q_pct:.1f}%")
+        elif qtr_momentum > 0:
+            earned = max(earned, max_pts * 0.55)
+            rationale_parts.append(f"季報微幅正成長 +{q_pct:.1f}%")
+        else:
+            rationale_parts.append(f"季報動能 {q_pct:.1f}%")
+
+    if rd_expense and total_revenue and total_revenue > 0:
+        rd_ratio = rd_expense / total_revenue
+        rd_pct = rd_ratio * 100
+        if rd_ratio >= 0.40:
+            earned = max(earned, max_pts * 0.90)
+            rationale_parts.append(
+                f"R&D ${rd_expense/1e6:.0f}M 佔營收 {rd_pct:.1f}%（{rd_year or '最新'} 財年 · 重度孵化）"
+            )
+        elif rd_ratio >= 0.25:
+            earned = max(earned, max_pts * 0.78)
+            rationale_parts.append(f"R&D 佔營收 {rd_pct:.1f}%（高投入創新期）")
+        elif rd_ratio >= 0.12:
+            earned = max(earned, max_pts * 0.62)
+            rationale_parts.append(f"R&D 佔營收 {rd_pct:.1f}%（中度研發投入）")
+        elif rd_ratio >= 0.05:
+            earned = max(earned, max_pts * 0.45)
+            rationale_parts.append(f"R&D 佔營收 {rd_pct:.1f}%")
+    elif rd_expense and rd_expense > 0:
+        earned = max(earned, max_pts * 0.50)
+        rationale_parts.append(
+            f"最新 R&D ${rd_expense/1e6:.0f}M（{rd_year or '最新'} 財年 · 生技/新創孵化中）"
         )
 
-    pct = revenue_growth * 100
-    if revenue_growth >= 0.15:
-        earned = max_pts
-        band = "高速成長 ≥15%"
-    elif revenue_growth >= 0.08:
-        earned = max_pts * 0.75
-        band = "穩健成長 8%–15%"
-    elif revenue_growth > 0:
-        earned = max_pts * 0.5
-        band = "低個位數正成長"
-    else:
-        earned = max_pts * 0.15
-        band = "營收衰退或持平"
+    if earned <= 0:
+        earned = max_pts * 0.30
+        rationale_parts.append("給予孵化期基礎分，避免因短期營收為負直接歸零")
 
-    rationale = f"最新營收成長 {pct:.1f}%（{band}），本項得 {earned:.1f}/{max_pts:.0f} 分。"
-    return ScoreDetail("營收成長", max_pts, round(earned, 1), rationale)
+    rationale = " · ".join(rationale_parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail("營收與未來預期", max_pts, round(earned, 1), rationale)
 
 
-def score_sma_trend_component(trend: dict[str, float | str | None] | None) -> ScoreDetail:
-    max_pts = WEIGHT_GROWTH_SMA
+def score_growth_momentum_component(
+    trend: dict[str, float | str | None] | None,
+) -> ScoreDetail:
+    """Momentum trigger — full score when price clears both SMA20 and SMA50."""
+    max_pts = WEIGHT_GROWTH_MOMENTUM
     if not trend:
         return ScoreDetail(
-            "SMA 多頭排列",
+            "技術面扣扳機",
             max_pts,
             0.0,
-            "趨勢數據不足，無法評估 SMA20/50 多頭結構。",
+            "趨勢數據不足，無法評估右側扣扳機。",
         )
 
     signal = str(trend.get("current_signal", "Hold"))
@@ -1080,36 +1124,75 @@ def score_sma_trend_component(trend: dict[str, float | str | None] | None) -> Sc
         sma_20 = float(trend.get("sma_20", 0))
         sma_50 = float(trend.get("sma_50", 0))
     except (TypeError, ValueError):
-        return ScoreDetail("SMA 多頭排列", max_pts, 0.0, "均線數據格式異常。")
+        return ScoreDetail("技術面扣扳機", max_pts, 0.0, "均線數據格式異常。")
 
-    bullish_stack = sma_20 >= sma_50 and price > sma_50
-    if bullish_stack and signal == "Buy":
+    above_20 = price > sma_20
+    above_50 = price > sma_50
+
+    if above_20 and above_50:
         earned = max_pts
-        band = "Golden Cross + 價格站上 SMA50"
-    elif bullish_stack and signal == "Hold":
-        earned = max_pts * 0.85
-        band = "多頭排列且趨勢穩定"
-    elif bullish_stack:
+        band = "強勢右側突破 · 收盤站上 SMA20 & SMA50（位置 3/4 扣扳機）"
+    elif above_20 and not above_50:
+        earned = max_pts * 0.72
+        band = "已站上 SMA20，正在挑戰 SMA50（右側起跑初期）"
+    elif above_50 and not above_20:
         earned = max_pts * 0.55
-        band = "均線多頭但動能訊號中性"
-    elif sma_20 >= sma_50:
-        earned = max_pts * 0.35
-        band = "SMA20 ≥ SMA50 但價格未站穩 SMA50"
+        band = "價格在 SMA50 之上但 SMA20 下方（整理/回踩）"
     elif signal == "Wait":
-        earned = max_pts * 0.15
-        band = "空頭排列 · 弱勢"
+        earned = max_pts * 0.18
+        band = "弱勢下跌 · 尚未出現右側訊號"
     else:
-        earned = 0.0
-        band = "Death Cross 或空頭結構"
+        earned = max_pts * 0.08
+        band = "均線下方 · 等待底部確認"
 
     rationale = (
         f"收盤 ${price:.2f} | SMA20 ${sma_20:.2f} | SMA50 ${sma_50:.2f} · "
         f"{band}，本項得 {earned:.1f}/{max_pts:.0f} 分。"
     )
-    return ScoreDetail("SMA 多頭排列", max_pts, round(earned, 1), rationale)
+    return ScoreDetail("技術面扣扳機", max_pts, round(earned, 1), rationale)
 
 
-def grade_from_score(total: float) -> tuple[str, str]:
+def score_growth_beta_component(beta: float | None) -> ScoreDetail:
+    """Growth-mode beta: reward explosive elasticity in the 1.1–1.8 sweet spot."""
+    max_pts = WEIGHT_GROWTH_BETA
+    if beta is None:
+        return ScoreDetail(
+            "Beta 彈性",
+            max_pts,
+            max_pts * 0.35,
+            "無 Beta 數據，給予中性基礎分（35%）。",
+        )
+
+    if 1.1 <= beta <= 1.8:
+        earned = max_pts
+        band = "黃金爆發級距 1.1–1.8"
+    elif 0.8 <= beta < 1.1:
+        earned = max_pts * 0.65
+        band = "偏低彈性 0.8–1.1"
+    elif 1.8 < beta <= 2.5:
+        earned = max_pts * 0.55
+        band = "高彈性 1.8–2.5"
+    elif beta > 2.5:
+        earned = max_pts * 0.12
+        band = "過度妖股 >2.5"
+    elif beta < 0.5:
+        earned = max_pts * 0.15
+        band = "毫無動能 <0.5"
+    else:
+        earned = max_pts * 0.45
+        band = "中性區 0.5–0.8"
+
+    rationale = f"Beta={beta:.2f}（{band}），本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail("Beta 彈性", max_pts, round(earned, 1), rationale)
+
+
+def grade_from_score(total: float, *, growth: bool = False) -> tuple[str, str]:
+    if growth:
+        if total >= 85:
+            return "🚀", "強勢右側標的"
+        if total >= 70:
+            return "🟡", "動能蓄勢中"
+        return "🔴", "趨勢待確認"
     if total >= 85:
         return "🟢", "頂級穩健"
     if total >= 70:
@@ -1138,16 +1221,11 @@ def evaluate_dividends(history: list[YearDividend]) -> tuple[bool | None, str]:
     return False, "Dividend growth streak broken"
 
 
-def build_analyst_commentary(report: StockReport) -> str:
-    mode_label = (
-        "🚀 動能成長模式"
-        if report.strategy_mode == STRATEGY_GROWTH
-        else "🛡️ 價值防禦模式"
-    )
+def _build_value_analyst_commentary(report: StockReport) -> str:
     sections: list[str] = [
         "### AI 首席分析師決策點評",
         f"**{report.symbol} · {report.company_name}**",
-        f"**策略戰術**：{mode_label}",
+        "**策略戰術**：🛡️ 價值防禦模式",
         f"**綜合安全得分：{report.total_score:.1f} / 100** — {report.grade_emoji} {report.grade_label}",
         "",
         "#### 評分明細（微觀原因）",
@@ -1181,16 +1259,10 @@ def build_analyst_commentary(report: StockReport) -> str:
 
     sections.append("")
     sections.append("#### 投資風格提示")
-    if report.strategy_mode == STRATEGY_GROWTH:
-        sections.append(
-            "- 動能成長模式偏重 **營收成長 + SMA 多頭結構 + 技術趨勢**；"
-            "股息/Beta 權重降級，適合波段與科技敘事驅動標的。"
-        )
-    else:
-        sections.append(
-            "- 100 分制衡量 **FCF 紀律、股息成長、發放率與 Beta**；"
-            "建議與 **產業景氣、估值與個人風險偏好** 一併考量，非直接買賣訊號。"
-        )
+    sections.append(
+        "- 100 分制衡量 **FCF 紀律、股息成長、發放率與 Beta**；"
+        "建議與 **產業景氣、估值與個人風險偏好** 一併考量，非直接買賣訊號。"
+    )
 
     if report.total_score >= 85:
         sections.append(
@@ -1208,6 +1280,82 @@ def build_analyst_commentary(report: StockReport) -> str:
         )
 
     return "\n".join(sections)
+
+
+def _format_growth_commentary_context(report: StockReport) -> str:
+    lines = [
+        f"Ticker: {report.symbol}",
+        f"Company: {report.company_name}",
+        f"Total Score: {report.total_score}/100",
+        f"Grade: {report.grade_emoji} {report.grade_label}",
+        "",
+        "Score breakdown:",
+    ]
+    for d in report.score_details:
+        lines.append(f"- {d.category}: {d.earned}/{d.max_points} — {d.rationale}")
+    if report.trend_signal:
+        ts = report.trend_signal
+        lines.extend(
+            [
+                "",
+                "Technical facts:",
+                f"- Signal: {ts.get('current_signal')}",
+                f"- Price: {ts.get('current_price')}",
+                f"- SMA20: {ts.get('sma_20')}",
+                f"- SMA50: {ts.get('sma_50')}",
+                f"- As of: {ts.get('as_of_date')}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
+    sections: list[str] = [
+        "### AI 首席分析師決策點評",
+        f"**{report.symbol} · {report.company_name}**",
+        "**策略戰術**：🚀 動能成長模式 · VC / 趨勢交易視角",
+        f"**綜合動能得分：{report.total_score:.1f} / 100** — {report.grade_emoji} {report.grade_label}",
+        "",
+        "#### 評分明細（動能引擎）",
+    ]
+    for d in report.score_details:
+        tag = "✅" if d.earned >= d.max_points * 0.85 else ("⚠️" if d.earned > 0 else "❌")
+        sections.append(
+            f"- {tag} **{d.category}**：{d.earned:.1f} / {d.max_points:.0f} 分 — {d.rationale}"
+        )
+    if report.trend_signal:
+        ts = report.trend_signal
+        sections.extend(
+            [
+                "",
+                "#### 技術面物理事實",
+                f"- 收盤 **${ts.get('current_price')}** · SMA20 **${ts.get('sma_20')}** · SMA50 **${ts.get('sma_50')}**",
+                f"- 交叉訊號：**{ts.get('current_signal')}**",
+            ]
+        )
+    sections.append(
+        "\n> **VC 視角結論**：本模式不評估股息/FCF。"
+        "聚焦 **營收/R&D 孵化潛力** 與 **均線右側扣扳機**；"
+        "若價格已站上 SMA20 & SMA50，代表底部確認後的趨勢交易勝率窗口。"
+    )
+    return "\n".join(sections)
+
+
+def build_analyst_commentary(report: StockReport) -> str:
+    if report.strategy_mode == STRATEGY_GROWTH:
+        from llm_processor import generate_growth_analyst_commentary
+
+        context = _format_growth_commentary_context(report)
+        llm_text = generate_growth_analyst_commentary(context)
+        if llm_text:
+            return (
+                "### AI 首席分析師決策點評\n"
+                f"**{report.symbol} · {report.company_name}** · "
+                "**策略戰術**：🚀 動能成長模式 · VC / 趨勢交易視角\n\n"
+                f"{llm_text.strip()}"
+            )
+        return _build_growth_analyst_commentary_fallback(report)
+    return _build_value_analyst_commentary(report)
 
 
 def normalize_strategy_mode(strategy_mode: str) -> str:
@@ -1230,29 +1378,31 @@ def compute_scores(
     strategy_mode: str,
     trend_signal: dict[str, float | str | None] | None = None,
     info: dict | None = None,
+    symbol: str = "",
+    ticker: yf.Ticker | None = None,
 ) -> tuple[list[ScoreDetail], float, str, str]:
     mode = normalize_strategy_mode(strategy_mode)
     if mode == STRATEGY_GROWTH:
         revenue_growth = _safe_info_float(info or {}, "revenueGrowth")
         details = [
-            _rescale_score_detail(score_fcf_component(fcf_rows), WEIGHT_GROWTH_FCF),
-            _rescale_score_detail(
-                score_dividend_growth_component(div_rows), WEIGHT_GROWTH_DIV
+            score_revenue_potential_component(
+                revenue_growth, info or {}, symbol, ticker=ticker
             ),
-            _rescale_score_detail(score_payout_component(payout), WEIGHT_GROWTH_PAYOUT),
-            _rescale_score_detail(score_beta_component(beta), WEIGHT_GROWTH_BETA),
-            score_revenue_growth_component(revenue_growth),
-            score_sma_trend_component(trend_signal),
+            score_growth_momentum_component(trend_signal),
+            score_growth_beta_component(beta),
         ]
-    else:
-        details = [
-            score_fcf_component(fcf_rows),
-            score_dividend_growth_component(div_rows),
-            score_payout_component(payout),
-            score_beta_component(beta),
-        ]
+        total = round(sum(d.earned for d in details), 1)
+        emoji, label = grade_from_score(total, growth=True)
+        return details, total, emoji, label
+
+    details = [
+        score_fcf_component(fcf_rows),
+        score_dividend_growth_component(div_rows),
+        score_payout_component(payout),
+        score_beta_component(beta),
+    ]
     total = round(sum(d.earned for d in details), 1)
-    emoji, label = grade_from_score(total)
+    emoji, label = grade_from_score(total, growth=False)
     return details, total, emoji, label
 
 
@@ -1279,6 +1429,8 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
         strategy_mode=mode,
         trend_signal=trend,
         info=info,
+        symbol=sym,
+        ticker=ticker,
     )
 
     report = StockReport(
@@ -1348,19 +1500,27 @@ def reports_to_summary_df(
     rows = []
     growth_mode = is_growth_strategy(strategy_mode)
     for r in reports:
-        row = {
-            "Ticker": r.symbol,
-            "Company": r.company_name,
-            "綜合安全得分": r.total_score,
-            "等級": f"{r.grade_emoji} {r.grade_label}",
-            "FCF分": _detail_score(r, "FCF"),
-            "股息分": _detail_score(r, "股息"),
-            "發放率分": _detail_score(r, "發放率"),
-            "Beta分": _detail_score(r, "Beta"),
-        }
         if growth_mode:
-            row["營收分"] = _detail_score(r, "營收")
-            row["技術面分"] = _detail_score(r, "SMA")
+            row = {
+                "Ticker": r.symbol,
+                "Company": r.company_name,
+                "綜合安全得分": r.total_score,
+                "等級": f"{r.grade_emoji} {r.grade_label}",
+                "營收潛力分": _detail_score(r, "營收", "預期"),
+                "技術面分": _detail_score(r, "扣扳機", "技術"),
+                "Beta彈性分": _detail_score(r, "Beta", "彈性"),
+            }
+        else:
+            row = {
+                "Ticker": r.symbol,
+                "Company": r.company_name,
+                "綜合安全得分": r.total_score,
+                "等級": f"{r.grade_emoji} {r.grade_label}",
+                "FCF分": _detail_score(r, "FCF"),
+                "股息分": _detail_score(r, "股息"),
+                "發放率分": _detail_score(r, "發放率"),
+                "Beta分": _detail_score(r, "Beta"),
+            }
         rows.append(row)
     return pd.DataFrame(rows)
 

@@ -15,6 +15,18 @@ FILTER_PROMPT = (
 )
 MODEL_NAME = "gemini-2.5-flash"
 
+GROWTH_ANALYST_SYSTEM_PROMPT = (
+    "你現在是頂級風險投資家 (VC) 與趨勢交易員的雙面首席分析師。"
+    "請根據提供的量化評分與技術面物理事實，用繁體中文撰寫決策點評。"
+    "強制約束："
+    "1. 視角鎖定「動能成長模式」——聚焦營收/R&D 孵化潛力、Beta 彈性、"
+    "以及股價站上 SMA20/SMA50 的右側扣扳機勝率；"
+    "2. 絕對禁止碎念「缺乏自由現金流」「不配息」「股息不穩」等價值防禦話術；"
+    "3. 若收盤價同時高於 SMA20 與 SMA50，必須明確指出這是位置 3/4 的強勢右側突破訊號；"
+    "4. 結構：① 綜合得分解讀 ② 技術面扳機 ③ 成長敘事/R&D ④ 風險邊界（各 1-2 句）；"
+    "5. 150–250 字，專業但大白話，不要 Markdown 標題，用列點或短段落即可。"
+)
+
 NARRATIVE_SYSTEM_PROMPT = (
     "你現在是頂級科技產業分析師。請無視任何財經媒體的股價看好或看壞噪音。"
     "請根據這段官方公司業務摘要，用 2-3 點極精鍊的繁體中文大白話，告訴用戶："
@@ -92,3 +104,21 @@ def generate_company_narrative_text(
         return text
     except Exception as exc:
         return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"
+
+
+def generate_growth_analyst_commentary(context: str) -> str | None:
+    """VC / trend-trader commentary for growth strategy mode; None triggers fallback."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=f"{GROWTH_ANALYST_SYSTEM_PROMPT}\n\n{context.strip()}",
+        )
+        text = (response.text or "").strip()
+        return text or None
+    except Exception:
+        return None

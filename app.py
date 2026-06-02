@@ -42,9 +42,8 @@ GRADE_COLORS = {
 }
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
 SCORE_COLUMNS_VALUE = ("綜合安全得分", "FCF分", "股息分", "發放率分", "Beta分")
-SCORE_COLUMNS_GROWTH = SCORE_COLUMNS_VALUE + ("營收分", "技術面分")
+SCORE_COLUMNS_GROWTH = ("綜合安全得分", "營收潛力分", "技術面分", "Beta彈性分")
 STRATEGY_SESSION_KEY = "strategy_mode"
-STRATEGY_MIRROR_KEY = "strategy_mode_deep"
 DEFAULT_HUNTER_UNIVERSE = "AAPL, MSFT, NVDA, INTC, BA, DIS, JNJ, KO"
 SCAN_UNIVERSE_OPTIONS: dict[str, str] = {
     "🇺🇸 道瓊 30 (Dow 30) - 快速掃描": "dow30",
@@ -104,61 +103,36 @@ def _strategy_label_for_mode(mode: str) -> str:
 def _strategy_weight_caption(mode: str | None = None) -> str:
     active = mode or _current_strategy_mode()
     if is_growth_strategy(active):
-        return "FCF25 + 股息10 + 發放率10 + Beta5 + 營收成長25 + 技術面25"
+        return "營收潛力40 + 技術扣扳機40 + Beta彈性20（FCF/股息不計分）"
     return "FCF40 + 股息30 + 發放率20 + Beta10"
 
 
-def _score_columns_for_mode(mode: str | None = None) -> tuple[str, ...]:
-    if is_growth_strategy(mode or _current_strategy_mode()):
-        return SCORE_COLUMNS_GROWTH
-    return SCORE_COLUMNS_VALUE
-
-
 def _on_strategy_mode_change() -> None:
-    st.session_state[STRATEGY_MIRROR_KEY] = st.session_state.get(
-        STRATEGY_SESSION_KEY, STRATEGY_LABEL_VALUE
-    )
     st.rerun()
 
 
-def _on_strategy_mirror_change() -> None:
-    st.session_state[STRATEGY_SESSION_KEY] = st.session_state.get(
-        STRATEGY_MIRROR_KEY, STRATEGY_LABEL_VALUE
-    )
-    st.rerun()
-
-
-def _sync_strategy_widgets() -> None:
-    """Keep watchlist and deep-dive strategy radios aligned."""
+def _render_strategy_control() -> None:
     labels = list(STRATEGY_LABELS)
-    canonical = st.session_state.get(STRATEGY_SESSION_KEY, STRATEGY_LABEL_VALUE)
-    if canonical not in labels:
-        canonical = STRATEGY_LABEL_VALUE
-        st.session_state[STRATEGY_SESSION_KEY] = canonical
-    mirror = st.session_state.get(STRATEGY_MIRROR_KEY, canonical)
-    if mirror not in labels:
-        mirror = canonical
-    if mirror != canonical:
-        st.session_state[STRATEGY_MIRROR_KEY] = canonical
-    elif st.session_state.get(STRATEGY_MIRROR_KEY) != canonical:
-        st.session_state[STRATEGY_MIRROR_KEY] = canonical
-
-
-def _render_strategy_control(*, mirror: bool = False) -> None:
-    _sync_strategy_widgets()
-    widget_key = STRATEGY_MIRROR_KEY if mirror else STRATEGY_SESSION_KEY
+    if st.session_state.get(STRATEGY_SESSION_KEY) not in labels:
+        st.session_state[STRATEGY_SESSION_KEY] = STRATEGY_LABEL_VALUE
     st.radio(
         "🎯 投資策略戰術",
-        list(STRATEGY_LABELS),
-        key=widget_key,
+        labels,
+        key=STRATEGY_SESSION_KEY,
         horizontal=True,
-        on_change=_on_strategy_mirror_change if mirror else _on_strategy_mode_change,
+        on_change=_on_strategy_mode_change,
     )
     mode = _current_strategy_mode()
     st.caption(
         f"評分引擎已切換至：**{_strategy_label_for_mode(mode)}** · "
         f"權重 `{_strategy_weight_caption(mode)}`"
     )
+
+
+def _score_columns_for_mode(mode: str | None = None) -> tuple[str, ...]:
+    if is_growth_strategy(mode or _current_strategy_mode()):
+        return SCORE_COLUMNS_GROWTH
+    return SCORE_COLUMNS_VALUE
 
 
 def _render_narrative_card(symbol: str) -> None:
@@ -846,8 +820,6 @@ def _init_session_state() -> None:
         st.session_state.scroll_to_analysis = False
     if STRATEGY_SESSION_KEY not in st.session_state:
         st.session_state[STRATEGY_SESSION_KEY] = STRATEGY_LABEL_VALUE
-    if STRATEGY_MIRROR_KEY not in st.session_state:
-        st.session_state[STRATEGY_MIRROR_KEY] = st.session_state[STRATEGY_SESSION_KEY]
 
 
 def _unlock_ticker_for_analysis(symbol: str) -> None:
@@ -1664,8 +1636,6 @@ def _render_company_deep_analysis() -> None:
             "請從上方輸入股票代號，或使用轉機雷達進行掃描以載入深度分析。"
         )
         return
-
-    _render_strategy_control(mirror=True)
 
     if COMPANY_TAB_KEY not in st.session_state:
         st.session_state[COMPANY_TAB_KEY] = tickers[0]
