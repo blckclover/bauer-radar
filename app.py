@@ -407,6 +407,8 @@ def _inject_css() -> None:
             border-radius: 8px !important;
             padding: 0.85rem 1rem 0.95rem !important;
             box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.06);
+            min-width: 8.5rem;
+            overflow: visible !important;
         }}
         div[data-testid="stMetric"] label {{
             color: #94A3B8 !important;
@@ -414,14 +416,22 @@ def _inject_css() -> None:
             font-weight: 600 !important;
             letter-spacing: 0.04em !important;
             text-transform: uppercase !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            line-height: 1.35 !important;
         }}
         div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
             font-size: 1.65rem !important;
             font-weight: 700 !important;
             color: #F1F5F9 !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            line-height: 1.2 !important;
         }}
         div[data-testid="stMetric"] [data-testid="stMetricDelta"] {{
             font-size: 0.78rem !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
         }}
         :root {{
             --bg-base: #0f172a;
@@ -433,6 +443,15 @@ def _inject_css() -> None:
         }}
         .stApp, [data-testid="stAppViewContainer"] {{
             background-color: var(--bg-base) !important;
+            margin-top: 0 !important;
+        }}
+        [data-testid="stAppViewContainer"] .main,
+        [data-testid="stMain"] {{
+            margin-top: 0 !important;
+            overflow: visible !important;
+        }}
+        header[data-testid="stHeader"] {{
+            background: rgba(15, 23, 42, 0.92) !important;
         }}
         section[data-testid="stSidebar"] {{
             background-color: #121212 !important;
@@ -442,18 +461,43 @@ def _inject_css() -> None:
             background-color: #121212 !important;
         }}
         .block-container {{
-            padding-top: 1.25rem;
+            padding-top: 2.75rem;
             padding-bottom: 2.5rem;
             max-width: 1480px;
+            margin-top: 0 !important;
+            overflow: visible !important;
         }}
         [data-testid="stMainBlockContainer"] {{
-            padding-top: 0.5rem;
+            padding-top: 0.75rem;
+            overflow: visible !important;
         }}
         [data-testid="stAppViewContainer"] .main .block-container {{
-            padding-top: 1.25rem;
+            padding-top: 2.75rem;
+            margin-top: 0 !important;
+        }}
+        [data-testid="stHorizontalBlock"] {{
+            gap: 0.75rem !important;
+            align-items: stretch !important;
+            flex-wrap: wrap !important;
+            overflow: visible !important;
+        }}
+        [data-testid="column"] {{
+            min-width: min(100%, 9.5rem) !important;
+            overflow: visible !important;
+        }}
+        [data-testid="column"] > div {{
+            overflow: visible !important;
+            min-width: 0;
         }}
         [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] {{
             gap: 1.15rem;
+            overflow: visible !important;
+        }}
+        [data-testid="stMarkdownContainer"] p,
+        [data-testid="stMarkdownContainer"] span,
+        [data-testid="stMarkdownContainer"] div {{
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }}
         [data-testid="stTabs"] {{
             margin-top: 0.75rem;
@@ -474,10 +518,12 @@ def _inject_css() -> None:
             padding: 1rem 1.1rem;
             margin: 0.35rem 0 1.1rem;
             min-height: 88px;
+            min-width: 9rem;
             box-shadow: 0 8px 22px rgba(2, 6, 23, 0.22);
             display: flex;
             flex-direction: column;
             justify-content: flex-start;
+            overflow: visible;
         }}
         .fx-metric-label {{
             color: #94a3b8;
@@ -487,8 +533,11 @@ def _inject_css() -> None:
             margin-bottom: 0.45rem;
             flex-shrink: 0;
             display: flex;
-            align-items: center;
+            align-items: flex-start;
             gap: 0.35rem;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            line-height: 1.35;
         }}
         .fx-metric-tip {{
             position: relative;
@@ -642,7 +691,7 @@ def _inject_css() -> None:
         }}
         .scorecard-progress-grid {{
             display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
+            grid-template-columns: repeat(2, minmax(11.5rem, 1fr));
             gap: 0.65rem;
             margin: 0.65rem 0 1.25rem;
         }}
@@ -671,8 +720,12 @@ def _inject_css() -> None:
             font-weight: 600;
             line-height: 1.35;
             display: flex;
-            align-items: center;
+            align-items: flex-start;
             gap: 0.3rem;
+            flex: 1 1 auto;
+            min-width: 0;
+            white-space: normal;
+            overflow-wrap: anywhere;
         }}
         .scorecard-progress-score {{
             font-size: 0.82rem;
@@ -708,6 +761,8 @@ def _inject_css() -> None:
             color: #64748b;
             font-size: 0.68rem;
             line-height: 1.45;
+            white-space: normal;
+            overflow-wrap: anywhere;
         }}
         .scorecard-grid-title {{
             color: #64748b;
@@ -730,9 +785,10 @@ def _inject_css() -> None:
         }}
         .terminal-score-grid {{
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: repeat(2, minmax(12rem, 1fr));
             gap: 1rem;
             margin: 1.1rem 0 0.85rem;
+            overflow: visible;
         }}
         @media (max-width: 768px) {{
             .terminal-score-grid {{ grid-template-columns: 1fr; }}
@@ -752,22 +808,28 @@ def _inject_css() -> None:
             letter-spacing: 0.08em;
             text-transform: uppercase;
             margin-bottom: 0.35rem;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            line-height: 1.35;
         }}
         .terminal-score-sublabel {{
             color: #64748B;
             font-size: 0.68rem;
             margin-bottom: 0.55rem;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            line-height: 1.4;
+        }}
+        .terminal-score-cap {{
+            white-space: normal;
+            overflow-wrap: anywhere;
+            line-height: 1.4;
         }}
         .terminal-score-value {{
             font-size: 48px;
             font-weight: 800;
             line-height: 1.05;
             letter-spacing: -0.02em;
-        }}
-        .terminal-score-cap {{
-            color: #64748B;
-            font-size: 0.7rem;
-            margin-top: 0.45rem;
         }}
         .death-penalty-banner {{
             background: linear-gradient(90deg, rgba(127, 29, 29, 0.55) 0%, rgba(69, 10, 10, 0.45) 100%);
@@ -988,9 +1050,8 @@ def _inject_css() -> None:
         }}
         [data-testid="stTabs"] button p {{
             font-size: 0.92rem;
-        }}
-        div[data-testid="stMetric"] {{
-            display: none !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
         }}
         div.stButton > button {{
             border-radius: 8px !important;
@@ -1226,7 +1287,7 @@ def _render_death_penalty_banners(report: object) -> None:
 
 
 def _render_value_dimension_grid(report: StockReport) -> None:
-    """Four-column Bloomberg-style dimension grid with st.metric tooltips."""
+    """Four-column dimension grid — custom metric cards (avoids column clipping)."""
     dims: list[tuple[str, float, tuple[str, ...], str]] = [
         (
             f"企業品質 · {WEIGHT_VALUE_QUALITY:.0f}%",
@@ -1258,20 +1319,12 @@ def _render_value_dimension_grid(report: StockReport) -> None:
         ),
     ]
 
-    c1, c2, c3, c4 = st.columns(4)
-    for col, (label, max_pts, keys, help_text) in zip(
-        (c1, c2, c3, c4), dims, strict=True
-    ):
-        earned, cap = _score_detail_pair(report, *keys)
+    items: list[tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]] = []
+    for label, max_pts, keys, help_text in dims:
+        earned, _ = _score_detail_pair(report, *keys)
         earned = earned if earned is not None else 0.0
-        with col:
-            st.metric(
-                label=label,
-                value=f"{earned:.1f}",
-                delta=f"/ {max_pts:.0f} pts",
-                delta_color="off",
-                help=help_text,
-            )
+        items.append((label, f"{earned:.1f}", f"/ {max_pts:.0f} pts", help_text))
+    _render_fx_metric_row(items)
 
 
 def _render_growth_dimension_grid(report: StockReport) -> None:
@@ -1303,20 +1356,12 @@ def _render_growth_dimension_grid(report: StockReport) -> None:
         ),
     ]
 
-    c1, c2, c3, c4 = st.columns(4)
-    for col, (label, max_pts, keys, help_text) in zip(
-        (c1, c2, c3, c4), dims, strict=True
-    ):
+    items: list[tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]] = []
+    for label, max_pts, keys, help_text in dims:
         earned, _ = _score_detail_pair(report, *keys)
         earned = earned if earned is not None else 0.0
-        with col:
-            st.metric(
-                label=label,
-                value=f"{earned:.1f}",
-                delta=f"/ {max_pts:.0f} pts",
-                delta_color="off",
-                help=help_text,
-            )
+        items.append((label, f"{earned:.1f}", f"/ {max_pts:.0f} pts", help_text))
+    _render_fx_metric_row(items)
 
 
 def _render_dimension_grid(report: object) -> None:
@@ -2807,20 +2852,21 @@ def _render_company_detail(report: StockReport) -> None:
         if report.payout_ratio is not None
         else "N/A"
     )
-    meta1, meta2, meta3 = st.columns(3)
-    with meta1:
-        st.metric("EPS 發放率", payout_cell, help="Trailing payout ratio · yfinance info")
-    with meta2:
-        beta_v = _fmt1(report.beta) if report.beta is not None else "N/A"
-        st.metric("Beta", beta_v, help="相對大盤波動係數 · 風險參考")
-    with meta3:
-        nd = report.master.net_debt_ebitda
-        nd_v = f"{nd:.1f}x" if nd is not None else "N/A"
-        st.metric(
-            "淨債務/EBITDA",
-            nd_v,
-            help="槓桿安全線 · >3.0x 觸發死亡懲罰",
-        )
+    beta_v = _fmt1(report.beta) if report.beta is not None else "N/A"
+    nd = report.master.net_debt_ebitda
+    nd_v = f"{nd:.1f}x" if nd is not None else "N/A"
+    _render_fx_metric_row(
+        [
+            ("EPS 發放率", payout_cell, "", "Trailing payout ratio · yfinance info"),
+            ("Beta", beta_v, "", "相對大盤波動係數 · 風險參考"),
+            (
+                "淨債務/EBITDA",
+                nd_v,
+                "",
+                "槓桿安全線 · >3.0x 觸發死亡懲罰",
+            ),
+        ]
+    )
 
     _render_master_metric_row(report)
     _render_factor_glossary(report.strategy_mode)
@@ -3257,29 +3303,37 @@ def _render_sidebar() -> None:
 
 
 def main() -> None:
+    # layout="wide" is set at module import (Streamlit requires first st.* call).
     _inject_css()
     _init_session_state()
-    st.markdown('<p class="main-title">股息安全 · 綜合分析儀表板</p>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="subtitle">自訂觀察清單 · 100 分制財務評分 · 轉機股雷達 · 技術線圖</p>',
-        unsafe_allow_html=True,
-    )
-    _render_watchlist_bar()
 
-    tab_score, tab_hunter = st.tabs(
-        [
-            "📊 核心財務評分",
-            "🛡️ 逆向轉機股雷達",
-        ]
-    )
+    main_container = st.container()
+    with main_container:
+        st.markdown(
+            '<p class="main-title">股息安全 · 綜合分析儀表板</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<p class="subtitle">自訂觀察清單 · 100 分制財務評分 · 轉機股雷達 · 技術線圖</p>',
+            unsafe_allow_html=True,
+        )
+        _render_watchlist_bar()
 
-    with tab_score:
-        _render_core_scoring_tab()
+        tab_score, tab_hunter = st.tabs(
+            [
+                "📊 核心財務評分",
+                "🛡️ 逆向轉機股雷達",
+            ]
+        )
 
-    with tab_hunter:
-        _render_turnaround_hunter_tab()
+        with tab_score:
+            _render_core_scoring_tab()
 
-    _render_company_deep_analysis()
+        with tab_hunter:
+            _render_turnaround_hunter_tab()
+
+        _render_company_deep_analysis()
+
     _render_sidebar()
 
 
