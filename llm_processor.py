@@ -22,6 +22,13 @@ GROWTH_LEXICON_CONSTRAINT = (
     "等機構級別、客觀、冷靜的金融語言。"
 )
 
+CAPEX_DIALECTIC_CONSTRAINT = (
+    "當偵察到該公司的資本支出（CapEx YoY）大幅下滑時，AI 點評禁止單純將其解讀為利多或利空。"
+    "必須客觀陳述雙面刃效應：一方面短期可美化並提升自由現金流（FCF Reality），"
+    "另一方面代表公司正在縮減未來成長性投資，可能導致中長期科技敘事（Tech Narrative）失去動能。"
+    "請用冰冷、中性的機構語言進行此項前瞻預期管理。"
+)
+
 GROWTH_ANALYST_SYSTEM_PROMPT = (
     "你是華爾街頂級對沖基金的成長策略首席分析師（Buy-Side PM 視角）。"
     "你的任務不是複述歷史新聞或行銷包裝，而是進行冷靜的機構級多空對峙分析。"
@@ -32,7 +39,8 @@ GROWTH_ANALYST_SYSTEM_PROMPT = (
     "   不可粉飾。"
     "3. 禁止客套開場白、禁止散戶情緒詞（多頭雛形/飆股/爆發/突破）；"
     "4. 成長模式：絕對不准因 FCF/股息/配息/發放率給予負評；"
-    "5. 250–380 字；禁止 Markdown # 與 **；直接從第 1 點開始。"
+    f"5. {CAPEX_DIALECTIC_CONSTRAINT}"
+    "6. 250–380 字；禁止 Markdown # 與 **；直接從第 1 點開始。"
     "僅輸出以下三段（標題完整保留）："
     "【部門拆解與 AI 轉型實質進展】："
     "從最新數據拆解「高增長部門（如 Data Center / 光纖 / AI 推理）」與"
@@ -55,7 +63,8 @@ VALUE_ANALYST_SYSTEM_PROMPT = (
     "2. ROIC 優先於 ROE；若 ROE 顯著高於 ROIC，必須點出過度舉債撐高 ROE 的假象風險。"
     "3. FCF 支付率 >90% 必須明確警告股息裁減風險；"
     "   淨債務/EBITDA >3x 或 5Y 營收 CAGR 為負，必須點名衰退型價值陷阱。"
-    "4. 250–320 字；禁止客套與 Markdown #/**。"
+    f"4. {CAPEX_DIALECTIC_CONSTRAINT}"
+    "5. 250–320 字；禁止客套與 Markdown #/**。"
     "僅輸出以下三段："
     "【ROIC 與真實護城河】：以 ROIC（非 ROE）判定資本配置效率；"
     "對照毛利率穩定度與營業利益率，點出是否靠槓桿撐高 ROE 的假象，"
@@ -71,6 +80,7 @@ MASTER_SCORECARD_PROMPT = (
     "你是機構級量化評分引擎。根據提供的 MASTER DATA FEED，"
     "為以下六個維度各給 1–10 分（整數）及一行冰冷理由（≤40 字）。"
     "禁止行銷語言；理由必須引用具體數字或紅旗。"
+    f"{CAPEX_DIALECTIC_CONSTRAINT}"
     "僅輸出以下區塊（不要其他任何文字）："
     "===SCORECARD==="
     "1. 財務安全 (Financial Runway)|<1-10>|<理由>"

@@ -54,6 +54,66 @@ GRADE_COLORS = {
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
 SCORE_COLUMNS_VALUE = ("綜合安全得分", "企業品質分", "股息現金流分", "財務安全分", "成長底線分")
 SCORE_COLUMNS_GROWTH = ("綜合安全得分", "前瞻增長分", "技術面分", "預期修正分")
+
+# Institutional factor glossary — surfaced via hover tooltips & glossary expander
+METRIC_TOOLTIPS: dict[str, str] = {
+    "ROIC": (
+        "投入資本回報率，用以衡量管理層真實資本運用效率，"
+        "避開舉債操縱 ROE 的價值陷阱。"
+    ),
+    "FCF 支付率": (
+        "自由現金流支付率，大於 90% 視為極度透支，"
+        "用以精準預測股息安全性。"
+    ),
+    "淨債務/EBITDA": (
+        "淨債務與稅前息前折舊攤銷前獲利比，機構級核心槓桿指標，"
+        "大於 3 倍視為財務高風險。"
+    ),
+    "5Y 營收 CAGR": (
+        "五年營收複合成長率，用於排除「便宜但衰退」的價值陷阱；"
+        "負成長直接觸發成長底線 0 分。"
+    ),
+    "綜合安全得分": "100 分制量化綜合評分，由四大維度加總；≥85 為機構級防禦/結構確立門檻。",
+    "等級": "依當前策略模式動態映射：防禦模式 🛡️ 財務防禦確立；成長模式 📈 右側結構確立。",
+    "發放率": "每股盈餘發放率（輔助指標）；價值模式以 FCF 支付率為主判斷股息安全。",
+    "Beta": "相對大盤波動係數；價值防禦模式不計入 Beta，僅供風險參考。",
+    "前瞻 PEG": "前瞻本益成長比，衡量成長是否被低估定價；≤1 代表剪刀差顯著。",
+    "CapEx 擴張率": "資本支出年增率，產業擴張領先指標；大幅下滑須辯證解讀 FCF 美化 vs 成長動能流失。",
+    "毛利率": "定價權 proxy，反映轉嫁通膨與客戶切換成本。",
+    "近一季 Surprise": "最新一季 EPS 相對共識偏差，衡量分析師預期修正動能。",
+    "利息保障倍數": "EBIT / 利息費用，衡量債務結構韌性；<3x 為機構紅線。",
+}
+
+SCORE_WEIGHT_TOOLTIPS_VALUE: dict[str, str] = {
+    "企業品質與護城河": (
+        "ROIC（15）+ 毛利率穩定度（10）+ 營業利益率（15）。"
+        "優先 ROIC 而非 ROE，排除槓桿假象。"
+    ),
+    "股息與現金流品質": (
+        "FCF 支付率（15）+ 股息連續成長（15）。"
+        "支付率 >90% 直接 0 分，精準預測裁息風險。"
+    ),
+    "財務安全防線": (
+        "淨債務/EBITDA（10）+ 利息保障（10）。"
+        "槓桿 >3x 或利息保障 <3x 觸發高風險評級。"
+    ),
+    "抗通膨成長底線": "5Y 營收 CAGR（10）；負成長 = 0 分，避免買入衰退型死水公司。",
+}
+
+SCORE_WEIGHT_TOOLTIPS_GROWTH: dict[str, str] = {
+    "前瞻增長不對稱性": "PEG 剪刀差 + CapEx 擴張率，衡量成長是否被低估定價。",
+    "技術面右側通道支撐": "Close > SMA20 & SMA50，確認中期上升軌道支撐。",
+    "預期修正動態": "EPS Surprise 趨勢，捕捉分析師上修/下修動能。",
+}
+
+SCORECARD_TOOLTIPS: dict[str, str] = {
+    "財務安全": "資產負債表韌性：利息保障、淨槓桿與營業利益率紅旗。",
+    "現金流健康度": "FCF Reality：自由現金流能否持續覆蓋營運與股東回報。",
+    "核心成長性": "營收/獲利動能與 CapEx 投資方向是否一致。",
+    "科技/AI 題材": "Tech Narrative 含金量：研發與資本支出是否支撐中長期敘事。",
+    "定價權": "Moat Stability：毛利率、ROIC 與競爭對手壓力。",
+    "估值": "Valuation Safety Margin：PEG 與預期修正下的安全邊際。",
+}
 GLOBAL_STRATEGY_KEY = "global_strategy_mode"
 ACTIVE_STRATEGY_KEY = "active_strategy"
 DEFAULT_HUNTER_UNIVERSE = "AAPL, MSFT, NVDA, INTC, BA, DIS, JNJ, KO"
@@ -299,6 +359,49 @@ def _inject_css() -> None:
             text-transform: uppercase;
             margin-bottom: 0.45rem;
             flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+        }}
+        .fx-metric-tip {{
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 0.95rem;
+            height: 0.95rem;
+            border-radius: 50%;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            color: #64748b;
+            font-size: 0.58rem;
+            font-weight: 700;
+            cursor: help;
+            text-transform: none;
+            letter-spacing: 0;
+            flex-shrink: 0;
+        }}
+        .fx-metric-tip:hover::after {{
+            content: attr(data-tip);
+            position: absolute;
+            left: 50%;
+            bottom: calc(100% + 8px);
+            transform: translateX(-50%);
+            width: max-content;
+            max-width: 240px;
+            padding: 0.55rem 0.65rem;
+            background: #0f172a;
+            border: 1px solid rgba(100, 116, 139, 0.35);
+            border-radius: 8px;
+            color: #e2e8f0;
+            font-size: 0.68rem;
+            line-height: 1.45;
+            font-weight: 400;
+            text-transform: none;
+            letter-spacing: 0.01em;
+            box-shadow: 0 10px 24px rgba(2, 6, 23, 0.45);
+            z-index: 50;
+            pointer-events: none;
+            white-space: normal;
         }}
         .fx-metric-value {{
             color: #f8fafc;
@@ -410,8 +513,127 @@ def _inject_css() -> None:
             font-weight: 500;
             width: 38%;
         }}
+        .scorecard-progress-grid {{
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.65rem;
+            margin: 0.65rem 0 1.25rem;
+        }}
+        @media (max-width: 900px) {{
+            .scorecard-progress-grid {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+        .scorecard-progress-card {{
+            background: #0f172a;
+            border: 1px solid rgba(100, 116, 139, 0.18);
+            border-radius: 10px;
+            padding: 0.75rem 0.85rem 0.8rem;
+            box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.04);
+        }}
+        .scorecard-progress-header {{
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 0.5rem;
+            margin-bottom: 0.45rem;
+        }}
+        .scorecard-progress-name {{
+            color: #e2e8f0;
+            font-size: 0.74rem;
+            font-weight: 600;
+            line-height: 1.35;
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+        }}
+        .scorecard-progress-score {{
+            font-size: 0.82rem;
+            font-weight: 700;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }}
+        .scorecard-progress-score.score-high {{ color: #4ade80; }}
+        .scorecard-progress-score.score-mid {{ color: #facc15; }}
+        .scorecard-progress-score.score-low {{ color: #fb923c; }}
+        .scorecard-progress-track {{
+            height: 6px;
+            background: rgba(148, 163, 184, 0.12);
+            border-radius: 999px;
+            overflow: hidden;
+            margin-bottom: 0.45rem;
+        }}
+        .scorecard-progress-fill {{
+            height: 100%;
+            border-radius: 999px;
+            transition: width 0.3s ease;
+        }}
+        .scorecard-progress-fill.score-high {{
+            background: linear-gradient(90deg, #22c55e 0%, #4ade80 100%);
+        }}
+        .scorecard-progress-fill.score-mid {{
+            background: linear-gradient(90deg, #ca8a04 0%, #facc15 100%);
+        }}
+        .scorecard-progress-fill.score-low {{
+            background: linear-gradient(90deg, #ea580c 0%, #fb923c 100%);
+        }}
+        .scorecard-progress-rationale {{
+            color: #64748b;
+            font-size: 0.68rem;
+            line-height: 1.45;
+        }}
+        .scorecard-grid-title {{
+            color: #64748b;
+            font-size: 0.68rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin: 0.35rem 0 0.55rem 0.15rem;
+        }}
         .ai-terminal-panel {{
             display: none;
+        }}
+        .ai-terminal-body {{
+            border: 1px solid #334155;
+            border-radius: 10px;
+            background: #0f172a;
+            padding: 1rem 1.15rem;
+            margin: 0.75rem 0 1.35rem;
+            box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.05);
+            color: #cbd5e1;
+            font-size: 0.86rem;
+            line-height: 1.65;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }}
+        .factor-glossary-item {{
+            margin: 0 0 0.55rem 0;
+            line-height: 1.5;
+        }}
+        .factor-glossary-dim {{
+            color: #5eead4;
+            font-size: 0.78rem;
+            font-weight: 600;
+            display: block;
+            margin-bottom: 0.15rem;
+        }}
+        .factor-glossary-desc {{
+            color: #94a3b8;
+            font-size: 0.74rem;
+        }}
+        .panel-heading {{
+            color: #f1f5f9;
+            font-size: 1.05rem;
+            font-weight: 700;
+            margin: 0.5rem 0 0.35rem;
+            letter-spacing: 0.01em;
+        }}
+        .panel-subheading {{
+            color: #64748b;
+            font-size: 0.82rem;
+            font-weight: 600;
+            margin: 0.85rem 0 0.45rem;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
         }}
         .ai-terminal-panel + div[data-testid="stMarkdownContainer"],
         .ai-terminal-panel + div {{
@@ -726,16 +948,54 @@ def _grade_tone(value: object) -> str:
     return "tone-red"
 
 
+def _metric_tooltip(label: str) -> str:
+    return METRIC_TOOLTIPS.get(label, "")
+
+
+def _scorecard_tooltip(dimension: str) -> str:
+    for key, tip in SCORECARD_TOOLTIPS.items():
+        if key in dimension:
+            return tip
+    return "機構級 1–10 分主觀量化維度，由 MASTER DATA FEED 驅動。"
+
+
+def _scorecard_short_name(dimension: str) -> str:
+    text = dimension
+    if ". " in text:
+        text = text.split(". ", 1)[1]
+    if "(" in text:
+        text = text.split("(", 1)[0].strip()
+    return text
+
+
+def _parse_metric_item(
+    item: tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str],
+) -> tuple[str, str, str, str]:
+    label, value = item[0], item[1]
+    subtext = ""
+    tooltip = _metric_tooltip(label)
+    if len(item) == 3:
+        subtext = item[2]
+    elif len(item) >= 4:
+        subtext = item[2] or ""
+        tooltip = item[3] or tooltip
+    return label, value, subtext, tooltip
+
+
 def _render_fx_metric_row(
-    items: list[tuple[str, str] | tuple[str, str, str]],
+    items: list[tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]],
 ) -> None:
-    """Render a row of gradient metric cards. Optional third tuple element = subtext."""
+    """Render a row of gradient metric cards. Optional: subtext, tooltip (4th)."""
     if not items:
         return
     cols = st.columns(len(items))
     for col, item in zip(cols, items):
-        label, value = item[0], item[1]
-        subtext = item[2] if len(item) > 2 else ""
+        label, value, subtext, tooltip = _parse_metric_item(item)
+        tip_html = ""
+        if tooltip:
+            tip_html = (
+                f'<span class="fx-metric-tip" data-tip="{html.escape(tooltip)}">?</span>'
+            )
         sub_html = (
             f'<div class="fx-metric-subtext">{html.escape(subtext)}</div>'
             if subtext
@@ -745,13 +1005,54 @@ def _render_fx_metric_row(
             st.markdown(
                 f"""
                 <div class="fx-metric-card">
-                    <div class="fx-metric-label">{html.escape(label)}</div>
+                    <div class="fx-metric-label">{html.escape(label)}{tip_html}</div>
                     <div class="fx-metric-value">{html.escape(str(value))}</div>
                     {sub_html}
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+
+
+def _render_factor_glossary(mode: str | None = None) -> None:
+    """Expandable institutional factor glossary for scoring transparency."""
+    active = mode or _current_strategy_mode()
+    tips = SCORE_WEIGHT_TOOLTIPS_GROWTH if is_growth_strategy(active) else SCORE_WEIGHT_TOOLTIPS_VALUE
+    with st.expander("📐 量化因子方法論 · Factor Methodology", expanded=False):
+        for dim, desc in tips.items():
+            st.markdown(
+                f'<p class="factor-glossary-item">'
+                f'<span class="factor-glossary-dim">{html.escape(dim)}</span>'
+                f'<span class="factor-glossary-desc">{html.escape(desc)}</span>'
+                f"</p>",
+                unsafe_allow_html=True,
+            )
+        st.caption("核心 Metric 卡片上的 ? 圖示可 hover 查看單項因子定義。")
+
+
+def _sanitize_ai_commentary(raw: str) -> str:
+    """Strip exposed Markdown headers/artifacts before terminal render."""
+    text = raw.strip()
+    filler_re = re.compile(
+        r"^(好的[，,].*?|分析師報告如下[：:].*?|以下是.*?[：:].*?|"
+        r"Sure[,.].*?|Here(?:'s| is).*?:)\s*\n?",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    text = filler_re.sub("", text).strip()
+
+    cleaned: list[str] = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            cleaned.append("")
+            continue
+        if stripped.startswith("#"):
+            stripped = re.sub(r"^#+\s*", "", stripped)
+        stripped = stripped.replace("**", "")
+        if stripped.startswith(">"):
+            stripped = stripped.lstrip(">").strip()
+        cleaned.append(stripped)
+    return "\n".join(cleaned).strip()
 
 
 def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
@@ -800,9 +1101,10 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
 
 
 def _render_ai_terminal_block(text: str) -> None:
-    """Finance-terminal styled markdown block for AI commentary."""
+    """Finance-terminal styled block for AI commentary — no raw Markdown headers."""
+    clean = _sanitize_ai_commentary(text)
     st.markdown('<div class="ai-terminal-panel"></div>', unsafe_allow_html=True)
-    st.markdown(text)
+    st.markdown(f'<div class="ai-terminal-body">{html.escape(clean).replace(chr(10), "<br>")}</div>', unsafe_allow_html=True)
 
 
 def _scorecard_tone(score: int) -> str:
@@ -814,12 +1116,12 @@ def _scorecard_tone(score: int) -> str:
 
 
 def _render_investment_scorecard(report: object) -> None:
-    """Render the six-dimension Master Investment Scorecard (1–10 institutional grid)."""
+    """Six-dimension Master Scorecard as a Fintech progress-bar grid (1–10)."""
     rows_raw = _rget(report, "investment_scorecard", None) or []
     if not rows_raw:
         return
 
-    body_rows: list[str] = []
+    cards: list[str] = []
     for raw in rows_raw:
         if isinstance(raw, ScorecardItem):
             item = raw
@@ -829,30 +1131,38 @@ def _render_investment_scorecard(report: object) -> None:
             item = _coerce_scorecard_item(raw)
 
         tone = _scorecard_tone(item.score)
-        body_rows.append(
-            f"<tr>"
-            f'<td class="dim-cell">{html.escape(item.dimension)}</td>'
-            f'<td class="score-cell {tone}">{item.score}</td>'
-            f'<td>{html.escape(item.rationale)}</td>'
-            f"</tr>"
+        pct = max(0, min(100, item.score * 10))
+        short_name = _scorecard_short_name(item.dimension)
+        tip = _scorecard_tooltip(item.dimension)
+        tip_html = ""
+        if tip:
+            tip_html = (
+                f'<span class="fx-metric-tip" data-tip="{html.escape(tip)}">?</span>'
+            )
+        cards.append(
+            f"""
+            <div class="scorecard-progress-card">
+                <div class="scorecard-progress-header">
+                    <div class="scorecard-progress-name">
+                        {html.escape(short_name)}{tip_html}
+                    </div>
+                    <div class="scorecard-progress-score {tone}">{item.score}/10</div>
+                </div>
+                <div class="scorecard-progress-track">
+                    <div class="scorecard-progress-fill {tone}" style="width:{pct}%;"></div>
+                </div>
+                <div class="scorecard-progress-rationale">{html.escape(item.rationale)}</div>
+            </div>
+            """
         )
 
     st.markdown(
         f"""
-        <div class="master-scorecard-wrap">
-            <div class="master-scorecard-title">
-                Master Investment Scorecard · 大師級多空量化項目評價表
-            </div>
-            <table class="master-scorecard">
-                <thead>
-                    <tr>
-                        <th>評估維度</th>
-                        <th style="text-align:center;">分數</th>
-                        <th>機構理由（1–10）</th>
-                    </tr>
-                </thead>
-                <tbody>{"".join(body_rows)}</tbody>
-            </table>
+        <div class="scorecard-grid-title">
+            Master Investment Scorecard · 大師級多空量化項目評價表
+        </div>
+        <div class="scorecard-progress-grid">
+            {"".join(cards)}
         </div>
         """,
         unsafe_allow_html=True,
@@ -1995,6 +2305,7 @@ def _render_company_detail(report: StockReport) -> None:
         ]
     )
     _render_master_metric_row(report)
+    _render_factor_glossary(report.strategy_mode)
 
     chart_col, side_col = st.columns([0.67, 0.33], gap="medium")
     with chart_col:
@@ -2005,9 +2316,9 @@ def _render_company_detail(report: StockReport) -> None:
             growth_mode=is_growth_strategy(report.strategy_mode),
         )
         _render_narrative_card(report.symbol)
+        _render_investment_scorecard(report)
         st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
         _render_ai_terminal_block(report.analyst_commentary)
-        _render_investment_scorecard(report)
         _render_fcf_chart_section(report, height=240)
         _render_dps_chart_section(report, height=240)
 
@@ -2017,7 +2328,7 @@ def _render_company_detail(report: StockReport) -> None:
                 st.caption(f"{d.category} — {d.rationale}")
                 continue
             st.write(
-                f"**{d.category}**：{_fmt1(d.earned)} / {_fmt1(d.max_points)} — {d.rationale}"
+                f"{d.category}：{_fmt1(d.earned)} / {_fmt1(d.max_points)} — {d.rationale}"
             )
         c1, c2 = st.columns(2)
         with c1:
@@ -2057,6 +2368,7 @@ def _render_core_scoring_tab() -> None:
         f'<p class="subtitle">100 分制財務紀律評分 · {html.escape(weight_caption)}</p>',
         unsafe_allow_html=True,
     )
+    _render_factor_glossary(mode)
 
     if not tickers:
         st.info("請從上方輸入股票代號並載入，或使用轉機雷達解鎖標的，以查看綜合摘要。")
@@ -2092,9 +2404,9 @@ def _render_company_deep_analysis() -> None:
     """Dynamic per-ticker view driven by session_state.analyzed_tickers."""
     tickers: list[str] = st.session_state.analyzed_tickers
     _render_deep_analysis_divider()
-    st.markdown("### 公司深度分析")
+    st.markdown('<p class="panel-heading">公司深度分析</p>', unsafe_allow_html=True)
     st.caption(
-        f"已解鎖 **{len(tickers)}** 檔 · 選擇標的切換（含從轉機雷達解鎖的新標的）"
+        f"已解鎖 {len(tickers)} 檔 · 選擇標的切換（含從轉機雷達解鎖的新標的）"
     )
 
     if not tickers:
@@ -2243,7 +2555,7 @@ def _render_turnaround_hunter_tab() -> None:
     result_df = _turnaround_to_dataframe(results)
     _render_fx_table_card(result_df, title="Turnaround Candidates")
 
-    st.markdown("#### 解鎖深度財報分析")
+    st.markdown('<p class="panel-subheading">解鎖深度財報分析</p>', unsafe_allow_html=True)
     st.caption("點擊後將自動聚焦至下方「公司深度分析」並切換至該標的。")
     unlock_cols = st.columns(min(len(results), 4) or 1)
     for i, opp in enumerate(results):
@@ -2257,7 +2569,7 @@ def _render_turnaround_hunter_tab() -> None:
             ):
                 _unlock_ticker_for_analysis(opp.symbol)
 
-    st.markdown("#### 個股快覽")
+    st.markdown('<p class="panel-subheading">個股快覽</p>', unsafe_allow_html=True)
     for opp in results:
         with st.expander(
             f"{opp.symbol} · {opp.company_name}  "

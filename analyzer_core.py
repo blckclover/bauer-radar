@@ -135,6 +135,8 @@ STOCKHOLDER_EQUITY_ROW_NAMES = (
 OPERATING_MARGIN_RED_FLAG_PP = 2.0
 # CapEx YoY expansion above this while margins shrink → efficiency-trap red flag
 CAPEX_EXPANSION_RED_FLAG = 0.20
+# CapEx YoY decline beyond this triggers dialectic forward-guidance note for AI
+CAPEX_DECLINE_DIALECTIC_THRESHOLD = -0.10
 
 SCORECARD_DIMENSIONS: tuple[str, ...] = (
     "1. 財務安全 (Financial Runway)",
@@ -2447,6 +2449,14 @@ def format_master_metrics_block(master: MasterMetrics) -> str:
     )
     if master.capex_red_flag and master.capex_red_flag_msg:
         lines.append(f"- {master.capex_red_flag_msg}")
+    if (
+        master.capex_growth is not None
+        and master.capex_growth <= CAPEX_DECLINE_DIALECTIC_THRESHOLD
+    ):
+        lines.append(
+            f"- 【CapEx 前瞻辯證】：季 CapEx YoY {master.capex_growth * 100:+.1f}% 大幅下滑——"
+            "禁止單向解讀；須同時評估短期 FCF 美化 vs 中長期 Tech Narrative 動能流失。"
+        )
 
     lines.extend(
         [
@@ -2478,6 +2488,8 @@ def format_master_metrics_block(master: MasterMetrics) -> str:
 
 
 def _format_master_commentary_context(report: StockReport) -> str:
+    from llm_processor import CAPEX_DIALECTIC_CONSTRAINT
+
     mode_label = (
         STRATEGY_LABEL_GROWTH
         if is_growth_strategy(report.strategy_mode)
@@ -2521,27 +2533,28 @@ def _format_master_commentary_context(report: StockReport) -> str:
             lines.append(
                 "- 技術結構：價格已站上中期均線群，呈現右側打底結構（中期上升軌道支撐）。"
             )
+    lines.extend(["", "=== AI FORWARD GUIDANCE CONSTRAINT ===", CAPEX_DIALECTIC_CONSTRAINT])
     return "\n".join(lines)
 
 
 def _build_value_analyst_commentary(report: StockReport) -> str:
     sections: list[str] = [
-        "### AI 首席分析師決策點評",
-        f"**{report.symbol} · {report.company_name}**",
-        "**策略戰術**：🛡️ 價值防禦模式",
-        f"**綜合安全得分：{report.total_score:.1f} / 100** — {report.grade_emoji} {report.grade_label}",
+        "AI 首席分析師決策點評",
+        f"{report.symbol} · {report.company_name}",
+        "策略戰術：🛡️ 價值防禦模式",
+        f"綜合安全得分：{report.total_score:.1f} / 100 — {report.grade_emoji} {report.grade_label}",
         "",
-        "#### 評分明細（微觀原因）",
+        "【評分明細（微觀原因）】",
     ]
     for d in report.score_details:
         delta = d.earned - d.max_points
         tag = "✅" if d.earned >= d.max_points * 0.85 else ("⚠️" if d.earned > 0 else "❌")
         sections.append(
-            f"- {tag} **{d.category}**：{d.earned:.1f} / {d.max_points:.0f} 分 — {d.rationale}"
+            f"- {tag} {d.category}：{d.earned:.1f} / {d.max_points:.0f} 分 — {d.rationale}"
         )
 
     sections.append("")
-    sections.append("#### 右側趨勢訊號（SMA 20/50）")
+    sections.append("【右側趨勢訊號（SMA 20/50）】")
     if report.trend_signal:
         ts = report.trend_signal
         label_map = {
@@ -2552,7 +2565,7 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
         }
         sig = str(ts.get("current_signal", "Hold"))
         sections.append(
-            f"- **{label_map.get(sig, sig)}** | 收盤 ${ts.get('current_price')} "
+            f"- {label_map.get(sig, sig)} | 收盤 ${ts.get('current_price')} "
             f"| SMA20 ${ts.get('sma_20')} | SMA50 ${ts.get('sma_50')}"
         )
         if ts.get("as_of_date"):
@@ -2562,18 +2575,17 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
 
     m = report.master
     sections.append("")
-    sections.append("#### DGI 防禦硬指標")
+    sections.append("【DGI 防禦硬指標】")
     roic_txt = _fmt_pct(m.roic) if m.roic is not None else _fmt_pct(m.roa)
     sections.append(
-        f"- **ROIC / 資本回報**：{roic_txt} · ROE {_fmt_pct(m.roe)}"
+        f"- ROIC / 資本回報：{roic_txt} · ROE {_fmt_pct(m.roe)}"
         + (" · ⚠ ROE 顯著高於 ROIC" if m.roe and m.roic and m.roe > m.roic * 1.8 else "")
     )
     fcf_pay = _fmt_pct(m.fcf_payout_ratio)
     nd_ebitda = f"{m.net_debt_ebitda:.1f}x" if m.net_debt_ebitda is not None else "N/A"
     rev_cagr = _fmt_pct(m.revenue_cagr_5y)
     sections.append(
-        f"- **FCF 支付率**：{fcf_pay} · **淨債務/EBITDA** {nd_ebitda} · "
-        f"**5Y 營收 CAGR** {rev_cagr}"
+        f"- FCF 支付率：{fcf_pay} · 淨債務/EBITDA {nd_ebitda} · 5Y 營收 CAGR {rev_cagr}"
     )
     cov_txt = f"{m.interest_coverage:.1f}x" if m.interest_coverage is not None else "低負債/未知"
     gm_vol = (
@@ -2582,31 +2594,31 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
         else "N/A"
     )
     sections.append(
-        f"- **利息保障** {cov_txt} · **毛利率波動** {gm_vol} · "
-        f"**營業利益率** {_fmt_pct(m.ttm_operating_margin)}"
+        f"- 利息保障 {cov_txt} · 毛利率波動 {gm_vol} · "
+        f"營業利益率 {_fmt_pct(m.ttm_operating_margin)}"
     )
 
     sections.append("")
-    sections.append("#### 投資風格提示")
+    sections.append("【投資風格提示】")
     sections.append(
-        "- 本模式以 **企業品質(40) + 股息現金流(30) + 財務安全(20) + 成長底線(10)** 計分，"
+        "- 本模式以 企業品質(40) + 股息現金流(30) + 財務安全(20) + 成長底線(10) 計分，"
         "聚焦 ROIC 真實護城河、FCF 股息安全網與抗衰退底線；"
-        "建議與 **產業景氣、估值與個人風險偏好** 一併考量。"
+        "建議與 產業景氣、估值與個人風險偏好 一併考量。"
     )
 
     if report.total_score >= 85:
         sections.append(
-            "\n> **結論**：護城河與現金流紀律俱佳，財務防禦確立，可作為核心底倉候選；"
+            "\n結論：護城河與現金流紀律俱佳，財務防禦確立，可作為核心底倉候選；"
             "仍須追蹤產業景氣與估值。"
         )
     elif report.total_score >= 70:
         sections.append(
-            "\n> **結論**：體質穩健，但存在可改進項（見 ⚠️ 項目）；"
+            "\n結論：體質穩健，但存在可改進項（見 ⚠️ 項目）；"
             "適合觀察名單或分批佈局。"
         )
     else:
         sections.append(
-            "\n> **結論**：防禦不足，建議降低倉位權重或等待護城河質量與現金流紀律修復後再評估。"
+            "\n結論：防禦不足，建議降低倉位權重或等待護城河質量與現金流紀律修復後再評估。"
         )
 
     return "\n".join(sections)
@@ -2657,19 +2669,19 @@ def _format_growth_commentary_context(report: StockReport) -> str:
 
 def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
     sections: list[str] = [
-        "### AI 首席分析師決策點評",
-        f"**{report.symbol} · {report.company_name}**",
-        "**策略戰術**：🚀 動能成長模式 · VC / 趨勢交易視角",
-        f"**綜合動能得分：{report.total_score:.1f} / 100** — {report.grade_emoji} {report.grade_label}",
+        "AI 首席分析師決策點評",
+        f"{report.symbol} · {report.company_name}",
+        "策略戰術：🚀 動能成長模式 · VC / 趨勢交易視角",
+        f"綜合動能得分：{report.total_score:.1f} / 100 — {report.grade_emoji} {report.grade_label}",
         "",
-        "#### 評分明細（動能引擎）",
+        "【評分明細（動能引擎）】",
     ]
     for d in report.score_details:
         if d.max_points <= 0:
             continue
         tag = "✅" if d.earned >= d.max_points * 0.85 else ("⚠️" if d.earned > 0 else "❌")
         sections.append(
-            f"- {tag} **{d.category}**：{d.earned:.1f} / {d.max_points:.0f} 分 — {d.rationale}"
+            f"- {tag} {d.category}：{d.earned:.1f} / {d.max_points:.0f} 分 — {d.rationale}"
         )
     if report.trend_signal:
         ts = report.trend_signal
@@ -2681,16 +2693,16 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
         except (TypeError, ValueError):
             breakout = False
         breakout_line = (
-            "- **📈 價格已站上中期均線群，呈現右側打底結構** — 收盤同時站上 SMA20 & SMA50，"
+            "- 📈 價格已站上中期均線群，呈現右側打底結構 — 收盤同時站上 SMA20 & SMA50，"
             "確認價格轉入中期上升軌道。"
             if breakout
-            else f"- 交叉訊號：**{ts.get('current_signal')}**"
+            else f"- 交叉訊號：{ts.get('current_signal')}"
         )
         sections.extend(
             [
                 "",
-                "#### 技術面物理事實",
-                f"- 收盤 **${ts.get('current_price')}** · SMA20 **${ts.get('sma_20')}** · SMA50 **${ts.get('sma_50')}**",
+                "【技術面物理事實】",
+                f"- 收盤 ${ts.get('current_price')} · SMA20 ${ts.get('sma_20')} · SMA50 ${ts.get('sma_50')}",
                 breakout_line,
             ]
         )
@@ -2703,14 +2715,14 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
     sections.extend(
         [
             "",
-            "#### 前瞻硬指標（不對稱性輸入）",
-            f"- 前瞻 PEG **{peg_txt}** · CapEx 擴張率 **{capex_txt}** · "
-            f"最新 Surprise **{surprise_txt}**（連續超預期 {m.surprise_beat_streak} 季）",
+            "【前瞻硬指標（不對稱性輸入）】",
+            f"- 前瞻 PEG {peg_txt} · CapEx 擴張率 {capex_txt} · "
+            f"最新 Surprise {surprise_txt}（連續超預期 {m.surprise_beat_streak} 季）",
         ]
     )
     sections.append(
-        "\n> **機構視角結論**：本模式 **零權重** 評估 FCF / 股息 / 發放率，避免對燒錢新創的防禦偏見。"
-        "聚焦 **PEG 剪刀差 + CapEx 擴張**、**右側通道支撐** 與 **預期修正動態**。"
+        "\n機構視角結論：本模式 零權重 評估 FCF / 股息 / 發放率，避免對燒錢新創的防禦偏見。"
+        "聚焦 PEG 剪刀差 + CapEx 擴張、右側通道支撐 與 預期修正動態。"
     )
     return "\n".join(sections)
 
@@ -2738,9 +2750,9 @@ def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardIt
 
     if llm_text:
         commentary = (
-            "### AI 首席分析師決策點評\n"
-            f"**{report.symbol} · {report.company_name}** · "
-            f"**策略戰術**：{strategy_tagline}\n\n"
+            f"AI 首席分析師決策點評\n"
+            f"{report.symbol} · {report.company_name} · "
+            f"策略戰術：{strategy_tagline}\n\n"
             f"{llm_text.strip()}"
         )
     elif growth:
@@ -3070,7 +3082,7 @@ def reports_to_summary_df(
     growth_mode = is_growth_strategy(strategy_mode)
     for r in reports:
         grade_emoji, grade_label = grade_from_score(
-            r.total_score, growth=is_growth_strategy(r.strategy_mode)
+            r.total_score, growth=growth_mode
         )
         grade_display = f"{grade_emoji} {grade_label}"
         if growth_mode:
