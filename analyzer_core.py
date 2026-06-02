@@ -1131,7 +1131,7 @@ def score_growth_momentum_component(
 
     if above_20 and above_50:
         earned = max_pts
-        band = "強勢右側突破 · 收盤站上 SMA20 & SMA50（位置 3/4 扣扳機）"
+        band = "🔥 突破站上均線・波段多頭雛形"
     elif above_20 and not above_50:
         earned = max_pts * 0.72
         band = "已站上 SMA20，正在挑戰 SMA50（右側起跑初期）"
@@ -1184,6 +1184,11 @@ def score_growth_beta_component(beta: float | None) -> ScoreDetail:
 
     rationale = f"Beta={beta:.2f}（{band}），本項得 {earned:.1f}/{max_pts:.0f} 分。"
     return ScoreDetail("Beta 彈性", max_pts, round(earned, 1), rationale)
+
+
+def _growth_excluded_component(category: str, note: str) -> ScoreDetail:
+    """Placeholder — growth mode never scores FCF / dividend / payout."""
+    return ScoreDetail(category, 0.0, 0.0, note)
 
 
 def grade_from_score(total: float, *, growth: bool = False) -> tuple[str, str]:
@@ -1286,15 +1291,25 @@ def _format_growth_commentary_context(report: StockReport) -> str:
     lines = [
         f"Ticker: {report.symbol}",
         f"Company: {report.company_name}",
+        f"Strategy: {STRATEGY_LABEL_GROWTH}",
         f"Total Score: {report.total_score}/100",
         f"Grade: {report.grade_emoji} {report.grade_label}",
         "",
-        "Score breakdown:",
+        "Score breakdown (FCF/Dividend/Payout excluded — weight 0):",
     ]
     for d in report.score_details:
+        if d.max_points <= 0:
+            continue
         lines.append(f"- {d.category}: {d.earned}/{d.max_points} — {d.rationale}")
     if report.trend_signal:
         ts = report.trend_signal
+        try:
+            price = float(ts.get("current_price", 0))
+            sma_20 = float(ts.get("sma_20", 0))
+            sma_50 = float(ts.get("sma_50", 0))
+            above_both = price > sma_20 and price > sma_50
+        except (TypeError, ValueError):
+            above_both = False
         lines.extend(
             [
                 "",
@@ -1303,9 +1318,14 @@ def _format_growth_commentary_context(report: StockReport) -> str:
                 f"- Price: {ts.get('current_price')}",
                 f"- SMA20: {ts.get('sma_20')}",
                 f"- SMA50: {ts.get('sma_50')}",
+                f"- Price above BOTH SMA20 and SMA50: {above_both}",
                 f"- As of: {ts.get('as_of_date')}",
             ]
         )
+        if above_both:
+            lines.append(
+                "- MANDATORY: Emphasize right-side breakout / bullish base (🔥 突破站上均線・波段多頭雛形)."
+            )
     return "\n".join(lines)
 
 
@@ -1319,30 +1339,44 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
         "#### 評分明細（動能引擎）",
     ]
     for d in report.score_details:
+        if d.max_points <= 0:
+            continue
         tag = "✅" if d.earned >= d.max_points * 0.85 else ("⚠️" if d.earned > 0 else "❌")
         sections.append(
             f"- {tag} **{d.category}**：{d.earned:.1f} / {d.max_points:.0f} 分 — {d.rationale}"
         )
     if report.trend_signal:
         ts = report.trend_signal
+        try:
+            price = float(ts.get("current_price", 0))
+            sma_20 = float(ts.get("sma_20", 0))
+            sma_50 = float(ts.get("sma_50", 0))
+            breakout = price > sma_20 and price > sma_50
+        except (TypeError, ValueError):
+            breakout = False
+        breakout_line = (
+            "- **🔥 突破站上均線・波段多頭雛形** — 收盤同時站上 SMA20 & SMA50，"
+            "右側動能標的，具備波段交易勝率窗口。"
+            if breakout
+            else f"- 交叉訊號：**{ts.get('current_signal')}**"
+        )
         sections.extend(
             [
                 "",
                 "#### 技術面物理事實",
                 f"- 收盤 **${ts.get('current_price')}** · SMA20 **${ts.get('sma_20')}** · SMA50 **${ts.get('sma_50')}**",
-                f"- 交叉訊號：**{ts.get('current_signal')}**",
+                breakout_line,
             ]
         )
     sections.append(
-        "\n> **VC 視角結論**：本模式不評估股息/FCF。"
-        "聚焦 **營收/R&D 孵化潛力** 與 **均線右側扣扳機**；"
-        "若價格已站上 SMA20 & SMA50，代表底部確認後的趨勢交易勝率窗口。"
+        "\n> **VC 視角結論**：本模式 **零權重** 評估 FCF / 股息 / 發放率。"
+        "聚焦 **營收/R&D 孵化潛力** 與 **均線右側扣扳機**。"
     )
     return "\n".join(sections)
 
 
 def build_analyst_commentary(report: StockReport) -> str:
-    if report.strategy_mode == STRATEGY_GROWTH:
+    if is_growth_strategy(report.strategy_mode):
         from llm_processor import generate_growth_analyst_commentary
 
         context = _format_growth_commentary_context(report)
@@ -1384,14 +1418,26 @@ def compute_scores(
     mode = normalize_strategy_mode(strategy_mode)
     if mode == STRATEGY_GROWTH:
         revenue_growth = _safe_info_float(info or {}, "revenueGrowth")
-        details = [
+        scored = [
             score_revenue_potential_component(
                 revenue_growth, info or {}, symbol, ticker=ticker
             ),
             score_growth_momentum_component(trend_signal),
             score_growth_beta_component(beta),
         ]
-        total = round(sum(d.earned for d in details), 1)
+        excluded = [
+            _growth_excluded_component(
+                "FCF 連續為正", "🚀 成長模式：FCF 不計分（權重 0）。"
+            ),
+            _growth_excluded_component(
+                "股息連續成長", "🚀 成長模式：股息不計分（權重 0）。"
+            ),
+            _growth_excluded_component(
+                "股息發放率", "🚀 成長模式：發放率不計分（權重 0）。"
+            ),
+        ]
+        details = excluded + scored
+        total = round(sum(d.earned for d in scored), 1)
         emoji, label = grade_from_score(total, growth=True)
         return details, total, emoji, label
 

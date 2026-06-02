@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import re
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -137,21 +138,54 @@ def _score_columns_for_mode(mode: str | None = None) -> tuple[str, ...]:
     return SCORE_COLUMNS_VALUE
 
 
+def _format_narrative_for_card(raw: str) -> str:
+    """Strip AI filler / markdown artifacts; convert **bold** to HTML <strong>."""
+    text = raw.strip()
+    filler_re = re.compile(
+        r"^(好的[，,].*?|分析師報告如下[：:].*?|以下是.*?[：:].*?|"
+        r"Sure[,.].*?|Here(?:'s| is).*?:)\s*\n?",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    text = filler_re.sub("", text).strip()
+
+    cleaned_lines: list[str] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        if line.replace("*", "").strip() in ("", "科技願景與最新嘗試"):
+            continue
+        if "科技願景" in line and len(line) < 48:
+            continue
+        cleaned_lines.append(line)
+    text = "\n".join(cleaned_lines)
+
+    def _bold_to_strong(match: re.Match[str]) -> str:
+        return f"<strong>{html.escape(match.group(1))}</strong>"
+
+    text = re.sub(r"\*\*(.+?)\*\*", _bold_to_strong, text)
+    text = text.replace("**", "").replace("*", "")
+
+    parts: list[str] = []
+    for segment in re.split(r"(<strong>.*?</strong>)", text):
+        if segment.startswith("<strong>"):
+            parts.append(segment)
+        else:
+            parts.append(html.escape(segment))
+    return "<br>".join("".join(parts).split("\n"))
+
+
 def _render_narrative_card(symbol: str) -> None:
     st.markdown(
         '<p class="panel-label">💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>',
         unsafe_allow_html=True,
     )
     narrative = load_company_narrative(symbol)
-    
-    # Strip out any AI-generated title line to avoid duplication
-    lines = narrative.split("\n")
-    if lines and (lines[0].startswith("#") or lines[0].startswith("**") or "科技願景" in lines[0]):
-        lines = lines[1:]
-    
-    safe_text = html.escape("\n".join(lines).strip()).replace("\n", "<br>")
+    card_html = _format_narrative_for_card(narrative)
     st.markdown(
-        f'<div class="fx-narrative-card"><div class="fx-narrative-body">{safe_text}</div></div>',
+        f'<div class="fx-narrative-card"><div class="fx-narrative-body">{card_html}</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -328,15 +362,19 @@ def _inject_css() -> None:
             background: linear-gradient(165deg, #1e293b 0%, #151d2b 100%);
             border: none;
             border-radius: 10px;
-            padding: 1.25rem 1.5rem;
+            padding: 1.5rem;
             margin: 0.35rem 0 1.25rem;
             box-shadow: 0 8px 22px rgba(2, 6, 23, 0.22);
         }}
         .fx-narrative-body {{
-            color: #cbd5e1;
-            font-size: 0.88rem;
-            line-height: 1.75;
+            color: #f1f5f9;
+            font-size: 0.9rem;
+            line-height: 1.7;
             letter-spacing: 0.01em;
+        }}
+        .fx-narrative-body strong {{
+            color: #ffffff;
+            font-weight: 600;
         }}
         .strategy-badge {{
             display: inline-block;
@@ -798,8 +836,8 @@ def _validate_ticker_symbol(symbol: str) -> bool:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_report_for_symbol(symbol: str, strategy_mode: str) -> StockReport:
-    """Per-symbol cache keyed by symbol + strategy_mode."""
+def load_report_for_symbol(strategy_mode: str, symbol: str) -> StockReport:
+    """Per-symbol cache keyed by strategy_mode + symbol (strategy first for isolation)."""
     mode = normalize_strategy_mode(strategy_mode)
     return analyze_symbol(symbol.upper(), strategy_mode=mode)
 
@@ -886,13 +924,13 @@ def _load_watchlist_tickers() -> None:
 
 def _build_reports_map(tickers: list[str]) -> dict[str, StockReport]:
     """Load cached per-symbol reports using active strategy from session state."""
-    mode = _current_strategy_mode()
+    strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
     reports: dict[str, StockReport] = {}
     for raw in tickers:
         sym = raw.upper().strip()
         if not sym:
             continue
-        reports[sym] = load_report_for_symbol(sym, mode)
+        reports[sym] = load_report_for_symbol(strategy_key, sym)
     return reports
 
 
@@ -931,7 +969,7 @@ def _fmt_price(value: float | str | None) -> str:
         return "N/A"
 
 
-def _render_trend_signal_block(trend: dict | None) -> None:
+def _render_trend_signal_block(trend: dict | None, *, growth_mode: bool = False) -> None:
     """Render compact right-side trend tag + price facts."""
     st.markdown('<p class="panel-label">右側動態趨勢</p>', unsafe_allow_html=True)
 
@@ -945,7 +983,18 @@ def _render_trend_signal_block(trend: dict | None) -> None:
         return
 
     signal = str(trend.get("current_signal", "Hold"))
-    border, bg, emoji, label = TREND_BADGE_STYLES.get(signal, TREND_BADGE_STYLES["Hold"])
+    try:
+        price = float(trend.get("current_price", 0))
+        sma_20 = float(trend.get("sma_20", 0))
+        sma_50 = float(trend.get("sma_50", 0))
+        bullish_breakout = price > sma_20 and price > sma_50
+    except (TypeError, ValueError):
+        bullish_breakout = False
+
+    if growth_mode and bullish_breakout:
+        border, bg, emoji, label = "#ea580c", "#fff7ed", "🔥", "突破站上均線・波段多頭雛形"
+    else:
+        border, bg, emoji, label = TREND_BADGE_STYLES.get(signal, TREND_BADGE_STYLES["Hold"])
 
     st.markdown(
         f"""
@@ -1554,7 +1603,10 @@ def _render_company_detail(report: StockReport) -> None:
     with chart_col:
         _display_technical_chart(report.symbol)
     with side_col:
-        _render_trend_signal_block(report.trend_signal)
+        _render_trend_signal_block(
+            report.trend_signal,
+            growth_mode=is_growth_strategy(report.strategy_mode),
+        )
         _render_narrative_card(report.symbol)
         st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
         _render_ai_terminal_block(report.analyst_commentary)
@@ -1563,6 +1615,9 @@ def _render_company_detail(report: StockReport) -> None:
 
     with st.expander("原始數據與分項得分"):
         for d in report.score_details:
+            if is_growth_strategy(report.strategy_mode) and d.max_points <= 0:
+                st.caption(f"{d.category} — {d.rationale}")
+                continue
             st.write(
                 f"**{d.category}**：{_fmt1(d.earned)} / {_fmt1(d.max_points)} — {d.rationale}"
             )
