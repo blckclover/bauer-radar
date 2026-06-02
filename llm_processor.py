@@ -15,6 +15,15 @@ FILTER_PROMPT = (
 )
 MODEL_NAME = "gemini-2.5-flash"
 
+NARRATIVE_SYSTEM_PROMPT = (
+    "你現在是頂級科技產業分析師。請無視任何財經媒體的股價看好或看壞噪音。"
+    "請根據這段官方公司業務摘要，用 2-3 點極精鍊的繁體中文大白話，告訴用戶："
+    "1. 這家公司底層到底是靠什麼科技/業務賺錢？ "
+    "2. 他們最近在嘗試或投入什麼新研發/新方向？ "
+    "3. 他們的競爭對手是誰？"
+    "字數控制在 150 字內，要讓完全不懂股票的大學 CS 學生一讀就秒懂該公司的科技敘事。"
+)
+
 
 def _format_news_list(news_list: list[NewsItem]) -> str:
     """Convert news items into a readable plain-text block."""
@@ -50,3 +59,36 @@ def crush_and_filter_news(news_list: list[NewsItem]) -> str:
     except Exception as exc:
         print(f"Warning: Gemini API call failed ({exc}). Returning raw news.")
         return raw_text
+
+
+def generate_company_narrative_text(
+    symbol: str,
+    business_summary: str,
+    sector: str = "",
+    industry: str = "",
+) -> str:
+    """Summarize official business summary into concise Traditional Chinese tech narrative."""
+    context_parts = [f"Ticker: {symbol.upper()}"]
+    if sector:
+        context_parts.append(f"Sector: {sector}")
+    if industry:
+        context_parts.append(f"Industry: {industry}")
+    context_parts.append(f"\nOfficial longBusinessSummary:\n{business_summary.strip()}")
+    user_block = "\n".join(context_parts)
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return "⚠️ 未設定 GEMINI_API_KEY，無法生成科技敘事。請在環境變數中設定後重新整理。"
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=f"{NARRATIVE_SYSTEM_PROMPT}\n\n{user_block}",
+        )
+        text = (response.text or "").strip()
+        if not text:
+            raise ValueError("Gemini returned an empty narrative.")
+        return text
+    except Exception as exc:
+        return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"

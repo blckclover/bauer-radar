@@ -1,6 +1,7 @@
 """Streamlit dashboard — core financial scoring + turnaround radar."""
 from __future__ import annotations
 
+import html
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -10,9 +11,12 @@ from plotly.subplots import make_subplots
 
 from analyzer_core import (
     FALLBACK_SCAN_UNIVERSE,
+    STRATEGY_GROWTH,
+    STRATEGY_VALUE,
     StockReport,
     TurnaroundOpportunity,
     analyze_symbol,
+    build_company_narrative,
     detect_trend_signals,
     dividend_chart_df,
     fcf_chart_df,
@@ -34,7 +38,14 @@ GRADE_COLORS = {
     "高風險": "#ef4444",
 }
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
-SCORE_COLUMNS = ("綜合安全得分", "FCF分", "股息分", "發放率分", "Beta分")
+SCORE_COLUMNS_VALUE = ("綜合安全得分", "FCF分", "股息分", "發放率分", "Beta分")
+SCORE_COLUMNS_GROWTH = SCORE_COLUMNS_VALUE + ("營收分", "技術面分")
+STRATEGY_MODE_KEY = "investment_strategy_mode"
+STRATEGY_OPTIONS: dict[str, str] = {
+    "🛡️ 價值防禦模式 (長線穩定、現金流、股息)": STRATEGY_VALUE,
+    "🚀 動能成長模式 (波段趨勢、技術面、科技願景)": STRATEGY_GROWTH,
+}
+STRATEGY_LABELS = list(STRATEGY_OPTIONS.keys())
 DEFAULT_HUNTER_UNIVERSE = "AAPL, MSFT, NVDA, INTC, BA, DIS, JNJ, KO"
 SCAN_UNIVERSE_OPTIONS: dict[str, str] = {
     "🇺🇸 道瓊 30 (Dow 30) - 快速掃描": "dow30",
@@ -77,6 +88,62 @@ FREQ_YF_MAP: dict[str, tuple[str, str]] = {
     "月線 (Monthly)": ("1mo", "max"),
 }
 COMPANY_TAB_KEY = "company_tab_radio"
+
+
+def _current_strategy_mode() -> str:
+    label = st.session_state.get(STRATEGY_MODE_KEY, STRATEGY_LABELS[0])
+    return STRATEGY_OPTIONS.get(label, STRATEGY_VALUE)
+
+
+def _strategy_label_for_mode(mode: str) -> str:
+    for label, value in STRATEGY_OPTIONS.items():
+        if value == mode:
+            return label
+    return STRATEGY_LABELS[0]
+
+
+def _strategy_weight_caption(mode: str | None = None) -> str:
+    active = mode or _current_strategy_mode()
+    if active == STRATEGY_GROWTH:
+        return "FCF25 + 股息10 + 發放率10 + Beta5 + 營收成長25 + 技術面25"
+    return "FCF40 + 股息30 + 發放率20 + Beta10"
+
+
+def _score_columns_for_mode(mode: str | None = None) -> tuple[str, ...]:
+    if (mode or _current_strategy_mode()) == STRATEGY_GROWTH:
+        return SCORE_COLUMNS_GROWTH
+    return SCORE_COLUMNS_VALUE
+
+
+def _render_strategy_control(*, widget_key: str = STRATEGY_MODE_KEY) -> None:
+    current = st.session_state.get(STRATEGY_MODE_KEY, STRATEGY_LABELS[0])
+    if current not in STRATEGY_LABELS:
+        current = STRATEGY_LABELS[0]
+        st.session_state[STRATEGY_MODE_KEY] = current
+    if widget_key != STRATEGY_MODE_KEY and st.session_state.get(widget_key) != current:
+        st.session_state[widget_key] = current
+    selected = st.radio(
+        "🎯 投資策略戰術",
+        STRATEGY_LABELS,
+        key=widget_key,
+        horizontal=True,
+    )
+    if selected != st.session_state.get(STRATEGY_MODE_KEY):
+        st.session_state[STRATEGY_MODE_KEY] = selected
+        st.rerun()
+
+
+def _render_narrative_card(symbol: str) -> None:
+    st.markdown(
+        '<p class="panel-label">💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>',
+        unsafe_allow_html=True,
+    )
+    narrative = load_company_narrative(symbol)
+    safe_text = html.escape(narrative).replace("\n", "<br>")
+    st.markdown(
+        f'<div class="fx-narrative-card"><div class="fx-narrative-body">{safe_text}</div></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _fmt1(value: float | None) -> str:
@@ -130,18 +197,197 @@ def _inject_css() -> None:
             padding-top: 3.75rem;
         }}
         [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] {{
-            gap: 0.85rem;
+            gap: 1.15rem;
         }}
         [data-testid="stTabs"] {{
-            margin-top: 0.5rem;
-            margin-bottom: 1.25rem;
+            margin-top: 0.75rem;
+            margin-bottom: 1.75rem;
         }}
         div[data-testid="stVerticalBlockBorderWrapper"] {{
-            background: var(--bg-card) !important;
+            background: linear-gradient(145deg, #1e293b 0%, #172033 55%, #121a28 100%) !important;
             border: 1px solid var(--border-subtle) !important;
-            border-radius: 8px !important;
-            padding: 0.75rem 1rem !important;
-            margin-bottom: 1rem !important;
+            border-radius: 10px !important;
+            padding: 1rem 1.15rem !important;
+            margin: 0.85rem 0 1.35rem !important;
+            box-shadow: 0 10px 28px rgba(2, 6, 23, 0.28);
+        }}
+        .fx-metric-card {{
+            background: linear-gradient(160deg, #243044 0%, #1a2332 45%, #121a28 100%);
+            border: 1px solid rgba(148, 163, 184, 0.14);
+            border-radius: 10px;
+            padding: 1rem 1.1rem;
+            margin: 0.35rem 0 1.1rem;
+            min-height: 88px;
+            box-shadow: 0 8px 22px rgba(2, 6, 23, 0.22);
+        }}
+        .fx-metric-label {{
+            color: #94a3b8;
+            font-size: 0.72rem;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-bottom: 0.45rem;
+        }}
+        .fx-metric-value {{
+            color: #f8fafc;
+            font-size: 1.2rem;
+            font-weight: 700;
+            line-height: 1.35;
+            word-break: break-word;
+        }}
+        .fx-table-card {{
+            background: linear-gradient(165deg, #1f2937 0%, #172033 50%, #111827 100%);
+            border: 1px solid rgba(148, 163, 184, 0.14);
+            border-radius: 10px;
+            padding: 0.85rem 0.95rem 1rem;
+            margin: 0.65rem 0 1.45rem;
+            box-shadow: 0 12px 30px rgba(2, 6, 23, 0.26);
+        }}
+        .fx-table-title {{
+            color: #94a3b8;
+            font-size: 0.72rem;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            margin: 0.15rem 0 0.75rem 0.35rem;
+        }}
+        .fx-table-wrap {{
+            overflow-x: auto;
+        }}
+        table.fx-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.86rem;
+        }}
+        table.fx-table th {{
+            color: #94a3b8;
+            font-weight: 600;
+            text-align: center;
+            padding: 0.65rem 0.55rem;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+        }}
+        table.fx-table td {{
+            color: #e2e8f0;
+            text-align: center;
+            padding: 0.62rem 0.55rem;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.06);
+            word-break: break-word;
+        }}
+        table.fx-table tbody tr:hover td {{
+            background: rgba(148, 163, 184, 0.05);
+        }}
+        table.fx-table td.tone-green {{ color: #4ade80; font-weight: 700; }}
+        table.fx-table td.tone-yellow {{ color: #facc15; font-weight: 700; }}
+        table.fx-table td.tone-red {{ color: #f87171; font-weight: 700; }}
+        .ai-terminal-panel {{
+            display: none;
+        }}
+        .ai-terminal-panel + div[data-testid="stMarkdownContainer"],
+        .ai-terminal-panel + div {{
+            border: 1px solid #334155;
+            border-radius: 10px;
+            background: #0f172a;
+            padding: 1rem 1.15rem;
+            margin: 0.75rem 0 1.35rem;
+            box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.05);
+        }}
+        .ai-terminal-panel + div h3 {{
+            font-size: 0.95rem !important;
+            color: #e2e8f0 !important;
+            margin: 0.65rem 0 0.35rem !important;
+        }}
+        .ai-terminal-panel + div h4 {{
+            font-size: 0.88rem !important;
+            color: #94a3b8 !important;
+            margin: 0.55rem 0 0.25rem !important;
+        }}
+        .ai-terminal-panel + div p,
+        .ai-terminal-panel + div li {{
+            color: #cbd5e1;
+            font-size: 0.86rem;
+            line-height: 1.65;
+        }}
+        .ai-terminal-panel + div strong {{
+            color: #f1f5f9;
+        }}
+        .ai-terminal-panel + div blockquote {{
+            border-left: 3px solid var(--accent);
+            padding-left: 0.75rem;
+            color: #94a3b8;
+            margin: 0.5rem 0;
+        }}
+        .fx-narrative-card {{
+            background: linear-gradient(165deg, #1e293b 0%, #151d2b 100%);
+            border: none;
+            border-radius: 10px;
+            padding: 1rem 1.15rem;
+            margin: 0.35rem 0 1.25rem;
+            box-shadow: 0 8px 22px rgba(2, 6, 23, 0.22);
+        }}
+        .fx-narrative-body {{
+            color: #cbd5e1;
+            font-size: 0.88rem;
+            line-height: 1.75;
+            letter-spacing: 0.01em;
+        }}
+        .strategy-badge {{
+            display: inline-block;
+            background: rgba(20, 184, 166, 0.12);
+            color: #5eead4;
+            border-radius: 999px;
+            padding: 0.28rem 0.75rem;
+            font-size: 0.78rem;
+            font-weight: 600;
+            margin-bottom: 0.65rem;
+        }}
+        div[data-testid="stRadio"] > label {{
+            color: #94a3b8 !important;
+            font-size: 0.82rem !important;
+            font-weight: 600 !important;
+        }}
+        .section-divider {{
+            margin: 3rem 0 1.85rem;
+            padding: 1.35rem 0 1.1rem;
+            border-top: 1px solid rgba(148, 163, 184, 0.16);
+            border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+            background: linear-gradient(180deg, rgba(30, 41, 59, 0.42) 0%, rgba(15, 23, 42, 0) 100%);
+            border-radius: 10px;
+        }}
+        .section-divider-label {{
+            display: block;
+            text-align: center;
+            color: #64748b;
+            font-size: 0.72rem;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+        }}
+        .sidebar-lab-card {{
+            background: linear-gradient(160deg, #1a2332 0%, #121a28 100%);
+            border: 1px dashed rgba(148, 163, 184, 0.22);
+            border-radius: 10px;
+            padding: 0.85rem 0.9rem;
+            margin: 0.35rem 0 1rem;
+            opacity: 0.72;
+        }}
+        .sidebar-lab-title {{
+            color: #94a3b8;
+            font-size: 0.82rem;
+            font-weight: 600;
+            margin-bottom: 0.35rem;
+        }}
+        .sidebar-lab-badge {{
+            display: inline-block;
+            font-size: 0.62rem;
+            letter-spacing: 0.08em;
+            color: #64748b;
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            border-radius: 999px;
+            padding: 0.12rem 0.45rem;
+            margin-bottom: 0.45rem;
+        }}
+        .sidebar-lab-hint {{
+            color: #64748b;
+            font-size: 0.72rem;
+            line-height: 1.45;
+            margin: 0;
         }}
         .main-title {{
             font-size: 1.55rem;
@@ -164,28 +410,7 @@ def _inject_css() -> None:
             font-size: 0.92rem;
         }}
         div[data-testid="stMetric"] {{
-            background: var(--bg-card);
-            padding: 0.85rem 1rem;
-            border-radius: 8px;
-            border: none;
-            margin-bottom: 0.35rem;
-            box-shadow: inset 0 0 0 1px var(--border-subtle);
-        }}
-        div[data-testid="stMetric"] label {{
-            color: var(--text-muted) !important;
-            font-size: 0.78rem !important;
-        }}
-        div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
-            font-size: 1.1rem !important;
-            white-space: normal !important;
-            word-break: break-word;
-            overflow-wrap: anywhere;
-            line-height: 1.25;
-            color: #f1f5f9 !important;
-        }}
-        div[data-testid="stMetric"] [data-testid="stMetricValue"] > div {{
-            overflow: visible !important;
-            text-overflow: unset !important;
+            display: none !important;
         }}
         div.stButton > button {{
             border-radius: 8px !important;
@@ -215,16 +440,8 @@ def _inject_css() -> None:
             color: #99f6e4 !important;
             box-shadow: 0 0 0 1px rgba(45, 212, 191, 0.15) !important;
         }}
-        div[data-testid="stDataFrame"] div[data-testid="StyledFullScreenFrame"] {{
-            border: none !important;
-            background: transparent !important;
-        }}
-        div[data-testid="stDataFrame"] [data-testid="stTable"] {{
-            font-size: 0.86rem;
-        }}
-        div[data-testid="stDataFrame"] th, div[data-testid="stDataFrame"] td {{
-            white-space: normal !important;
-            word-break: break-word;
+        div[data-testid="stDataFrame"] {{
+            display: none !important;
         }}
         .section-card {{
             background: var(--bg-card);
@@ -293,15 +510,12 @@ def _inject_css() -> None:
             margin-bottom: 0.75rem;
         }}
         div[data-testid="stRadio"] label {{
-            background: var(--bg-card) !important;
+            background: linear-gradient(160deg, #243044 0%, #1a2332 100%) !important;
             border-radius: 8px !important;
             padding: 0.4rem 0.8rem !important;
             border: 1px solid var(--border-subtle) !important;
             font-size: 0.85rem !important;
-        }}
-        div[data-testid="stDataFrame"] {{
-            border: none !important;
-            margin-bottom: 0.75rem;
+            margin-bottom: 0.35rem !important;
         }}
         hr {{
             margin: 1.5rem 0 !important;
@@ -323,6 +537,108 @@ def _inject_css() -> None:
     )
 
 
+def _score_tone(value: object) -> str:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if score >= 85:
+        return "tone-green"
+    if score >= 70:
+        return "tone-yellow"
+    return "tone-red"
+
+
+def _grade_tone(value: object) -> str:
+    text = str(value)
+    if "頂級" in text:
+        return "tone-green"
+    if "良好" in text:
+        return "tone-yellow"
+    return "tone-red"
+
+
+def _render_fx_metric_row(items: list[tuple[str, str]]) -> None:
+    """Render a row of gradient metric cards."""
+    if not items:
+        return
+    cols = st.columns(len(items))
+    for col, (label, value) in zip(cols, items):
+        with col:
+            st.markdown(
+                f"""
+                <div class="fx-metric-card">
+                    <div class="fx-metric-label">{html.escape(label)}</div>
+                    <div class="fx-metric-value">{html.escape(str(value))}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
+    """Render a dataframe as a custom HTML gradient table card."""
+    if df.empty:
+        st.caption("（無資料）")
+        return
+
+    headers = "".join(f"<th>{html.escape(str(col))}</th>" for col in df.columns)
+    rows: list[str] = []
+    for _, row in df.iterrows():
+        cells: list[str] = []
+        for col in df.columns:
+            raw = row[col]
+            val = html.escape(str(raw))
+            tone = ""
+            if col == "綜合安全得分":
+                tone = _score_tone(raw)
+            elif col == "等級":
+                tone = _grade_tone(raw)
+            elif col == "相對半年高點跌幅":
+                tone = "tone-red"
+            elif col == "最新財年 FCF" and str(raw).startswith("$"):
+                tone = "tone-green"
+            cls = f' class="{tone}"' if tone else ""
+            cells.append(f"<td{cls}>{val}</td>")
+        rows.append(f"<tr>{''.join(cells)}</tr>")
+
+    title_html = (
+        f'<div class="fx-table-title">{html.escape(title)}</div>' if title else ""
+    )
+    st.markdown(
+        f"""
+        <div class="fx-table-card">
+            {title_html}
+            <div class="fx-table-wrap">
+                <table class="fx-table">
+                    <thead><tr>{headers}</tr></thead>
+                    <tbody>{"".join(rows)}</tbody>
+                </table>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_ai_terminal_block(text: str) -> None:
+    """Finance-terminal styled markdown block for AI commentary."""
+    st.markdown('<div class="ai-terminal-panel"></div>', unsafe_allow_html=True)
+    st.markdown(text)
+
+
+def _render_deep_analysis_divider() -> None:
+    """Visual separator between scan workspace and deep-dive analysis."""
+    st.markdown(
+        """
+        <div class="section-divider">
+            <span class="section-divider-label">深度研究區 · Deep Dive Workspace</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _parse_ticker_list(text: str) -> list[str]:
     """Parse comma- or newline-separated tickers; dedupe while preserving order."""
     seen: set[str] = set()
@@ -336,9 +652,10 @@ def _parse_ticker_list(text: str) -> list[str]:
     return out
 
 
-def _format_summary_df(df: pd.DataFrame) -> pd.DataFrame:
+def _format_summary_df(df: pd.DataFrame, *, score_columns: tuple[str, ...] | None = None) -> pd.DataFrame:
     display = df.copy()
-    for col in SCORE_COLUMNS:
+    cols = score_columns or SCORE_COLUMNS_VALUE
+    for col in cols:
         if col not in display.columns:
             continue
         display[col] = display[col].apply(
@@ -461,9 +778,15 @@ def _validate_ticker_symbol(symbol: str) -> bool:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_report_for_symbol(symbol: str) -> StockReport:
-    """Per-symbol cache for user watchlist / Hunter unlocks."""
-    return analyze_symbol(symbol.upper())
+def load_report_for_symbol(symbol: str, strategy_mode: str = STRATEGY_VALUE) -> StockReport:
+    """Per-symbol cache keyed by strategy mode."""
+    mode = strategy_mode if strategy_mode in (STRATEGY_VALUE, STRATEGY_GROWTH) else STRATEGY_VALUE
+    return analyze_symbol(symbol.upper(), strategy_mode=mode)
+
+
+@st.cache_data(ttl=3600, show_spinner="正在生成科技敘事…")
+def load_company_narrative(symbol: str) -> str:
+    return build_company_narrative(symbol.upper())
 
 
 def _init_session_state() -> None:
@@ -483,6 +806,8 @@ def _init_session_state() -> None:
         st.session_state.focus_ticker = None
     if "scroll_to_analysis" not in st.session_state:
         st.session_state.scroll_to_analysis = False
+    if STRATEGY_MODE_KEY not in st.session_state:
+        st.session_state[STRATEGY_MODE_KEY] = STRATEGY_LABELS[0]
 
 
 def _unlock_ticker_for_analysis(symbol: str) -> None:
@@ -534,14 +859,15 @@ def _load_watchlist_tickers() -> None:
     st.rerun()
 
 
-def _build_reports_map(tickers: list[str]) -> dict[str, StockReport]:
+def _build_reports_map(tickers: list[str], strategy_mode: str | None = None) -> dict[str, StockReport]:
     """Load cached per-symbol reports for the active watchlist."""
+    mode = strategy_mode or _current_strategy_mode()
     reports: dict[str, StockReport] = {}
     for raw in tickers:
         sym = raw.upper().strip()
         if not sym:
             continue
-        reports[sym] = load_report_for_symbol(sym)
+        reports[sym] = load_report_for_symbol(sym, mode)
     return reports
 
 
@@ -1104,6 +1430,7 @@ def _render_watchlist_bar() -> None:
         loaded = st.session_state.analyzed_tickers
         if loaded:
             st.caption(f"已載入 **{len(loaded)}** 檔：" + ", ".join(loaded))
+        _render_strategy_control(widget_key=STRATEGY_MODE_KEY)
 
 
 def _format_fcf_table(report: StockReport) -> pd.DataFrame:
@@ -1128,29 +1455,36 @@ def _format_dividend_table(report: StockReport) -> pd.DataFrame:
 
 
 def _render_company_detail(report: StockReport) -> None:
+    mode_label = _strategy_label_for_mode(report.strategy_mode)
     st.markdown(
-        f'<p class="subtitle" style="margin-bottom:0.65rem;">'
+        f'<p class="subtitle" style="margin-bottom:0.35rem;">'
         f"{report.symbol} · {report.company_name}</p>",
         unsafe_allow_html=True,
     )
+    st.markdown(f'<span class="strategy-badge">{html.escape(mode_label)}</span>', unsafe_allow_html=True)
 
-    h1, h2, h3, h4 = st.columns(4)
-    h1.metric("綜合安全得分", _fmt1(report.total_score))
-    h2.metric("等級", f"{report.grade_emoji} {report.grade_label}")
-    h3.metric(
-        "發放率",
-        f"{report.payout_ratio * 100:.1f}%" if report.payout_ratio is not None else "N/A",
+    _render_fx_metric_row(
+        [
+            ("綜合安全得分", _fmt1(report.total_score)),
+            ("等級", f"{report.grade_emoji} {report.grade_label}"),
+            (
+                "發放率",
+                f"{report.payout_ratio * 100:.1f}%"
+                if report.payout_ratio is not None
+                else "N/A",
+            ),
+            ("Beta", _fmt1(report.beta) if report.beta is not None else "N/A"),
+        ]
     )
-    h4.metric("Beta", _fmt1(report.beta) if report.beta is not None else "N/A")
 
     chart_col, side_col = st.columns([0.67, 0.33], gap="medium")
     with chart_col:
         _display_technical_chart(report.symbol)
     with side_col:
         _render_trend_signal_block(report.trend_signal)
+        _render_narrative_card(report.symbol)
         st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
-        with st.container(border=True):
-            st.markdown(report.analyst_commentary)
+        _render_ai_terminal_block(report.analyst_commentary)
         st.plotly_chart(
             _fcf_bar_chart(report, height=240),
             use_container_width=True,
@@ -1169,9 +1503,9 @@ def _render_company_detail(report: StockReport) -> None:
             )
         c1, c2 = st.columns(2)
         with c1:
-            st.dataframe(_format_fcf_table(report), use_container_width=True, hide_index=True)
+            _render_fx_table_card(_format_fcf_table(report), title="FCF 原始數據")
         with c2:
-            st.dataframe(_format_dividend_table(report), use_container_width=True, hide_index=True)
+            _render_fx_table_card(_format_dividend_table(report), title="股息原始數據")
 
 
 def _scroll_to_analysis_section() -> None:
@@ -1199,10 +1533,10 @@ def _scroll_to_analysis_section() -> None:
 def _render_core_scoring_tab() -> None:
     """Core financial scoring — summary for user-loaded watchlist."""
     tickers: list[str] = st.session_state.analyzed_tickers
+    mode = _current_strategy_mode()
+    weight_caption = _strategy_weight_caption(mode)
     st.markdown(
-        '<p class="subtitle">'
-        "100 分制財務紀律評分 · FCF40 + 股息30 + 發放率20 + Beta10"
-        "</p>",
+        f'<p class="subtitle">100 分制財務紀律評分 · {html.escape(weight_caption)}</p>',
         unsafe_allow_html=True,
     )
 
@@ -1210,37 +1544,36 @@ def _render_core_scoring_tab() -> None:
         st.info("請從上方輸入股票代號並載入，或使用轉機雷達解鎖標的，以查看綜合摘要。")
         return
 
-    by_symbol = _build_reports_map(tickers)
+    by_symbol = _build_reports_map(tickers, mode)
     reports = [by_symbol[s] for s in tickers if s in by_symbol]
 
     top = [r for r in reports if r.total_score >= 85]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("分析標的", len(reports))
-    c2.metric("頂級穩健 (≥85)", len(top))
-    c3.metric("評分權重", "FCF40 + 股息30 + 發放率20 + Beta10")
-    c4.metric(
-        "均分",
-        _fmt1(sum(r.total_score for r in reports) / len(reports)) if reports else "—",
+    _render_fx_metric_row(
+        [
+            ("分析標的", str(len(reports))),
+            ("頂級穩健 (≥85)", str(len(top))),
+            ("評分權重", weight_caption),
+            (
+                "均分",
+                _fmt1(sum(r.total_score for r in reports) / len(reports))
+                if reports
+                else "—",
+            ),
+        ]
     )
 
-    summary_df = _format_summary_df(reports_to_summary_df(reports))
-    st.markdown('<p class="panel-label">綜合摘要</p>', unsafe_allow_html=True)
-    st.dataframe(
-        _style_summary_table(summary_df),
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Ticker": st.column_config.TextColumn(width="small"),
-            "Company": st.column_config.TextColumn(width="medium"),
-            "等級": st.column_config.TextColumn(width="small"),
-        },
+    summary_df = _format_summary_df(
+        reports_to_summary_df(reports),
+        score_columns=_score_columns_for_mode(mode),
     )
+    st.markdown('<p class="panel-label">綜合摘要</p>', unsafe_allow_html=True)
+    _render_fx_table_card(summary_df, title="Watchlist Summary")
 
 
 def _render_company_deep_analysis() -> None:
     """Dynamic per-ticker view driven by session_state.analyzed_tickers."""
     tickers: list[str] = st.session_state.analyzed_tickers
-    st.markdown("---")
+    _render_deep_analysis_divider()
     st.markdown("### 公司深度分析")
     st.caption(
         f"已解鎖 **{len(tickers)}** 檔 · 選擇標的切換（含從轉機雷達解鎖的新標的）"
@@ -1251,6 +1584,8 @@ def _render_company_deep_analysis() -> None:
             "請從上方輸入股票代號，或使用轉機雷達進行掃描以載入深度分析。"
         )
         return
+
+    _render_strategy_control(widget_key="strategy_detail_radio")
 
     if COMPANY_TAB_KEY not in st.session_state:
         st.session_state[COMPANY_TAB_KEY] = tickers[0]
@@ -1285,16 +1620,23 @@ def _render_company_deep_analysis() -> None:
 def _render_turnaround_hunter_tab() -> None:
     """Turnaround radar — index universes or custom list feed analyzed_tickers."""
     st.markdown(
+        '<p class="panel-label" style="margin-top:0.25rem;">掃描工作區 · Reversal Scan Workspace</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
         '<p class="subtitle">'
         "在<strong>市場恐慌（股價大跌）</strong>中，尋找<strong>自由現金流仍為正</strong>的硬事實標的。"
         "</p>",
         unsafe_allow_html=True,
     )
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("篩選門檻", "半年高點跌幅 > 15%")
-    c2.metric("硬事實", "最新財年 FCF > 0")
-    c3.metric("上次命中", len(st.session_state.hunter_results))
+    _render_fx_metric_row(
+        [
+            ("篩選門檻", "半年高點跌幅 > 15%"),
+            ("硬事實", "最新財年 FCF > 0"),
+            ("上次命中", str(len(st.session_state.hunter_results))),
+        ]
+    )
 
     st.markdown('<p class="panel-label">選擇掃描母體 (Scan Universe)</p>', unsafe_allow_html=True)
     selected_label = st.selectbox(
@@ -1376,11 +1718,7 @@ def _render_turnaround_hunter_tab() -> None:
     )
 
     result_df = _turnaround_to_dataframe(results)
-    st.dataframe(
-        _style_turnaround_table(result_df),
-        use_container_width=True,
-        hide_index=True,
-    )
+    _render_fx_table_card(result_df, title="Turnaround Candidates")
 
     st.markdown("#### 解鎖深度財報分析")
     st.caption("點擊後將自動聚焦至下方「公司深度分析」並切換至該標的。")
@@ -1404,15 +1742,14 @@ def _render_turnaround_hunter_tab() -> None:
             f"| FCF {_fmt_money_large(opp.latest_fcf)}"
         ):
             _render_trend_signal_block(_cached_trend_signal(opp.symbol))
-            d1, d2, d3, d4 = st.columns(4)
-            d1.markdown(
-                f'<span class="panic-tag">-{opp.drawdown_pct:.1f}%</span>',
-                unsafe_allow_html=True,
+            _render_fx_metric_row(
+                [
+                    ("相對半年高點跌幅", f"-{opp.drawdown_pct:.1f}%"),
+                    ("現價", f"${opp.current_price:.2f}"),
+                    ("半年高點", f"${opp.six_month_high:.2f}"),
+                    ("最新 FCF", _fmt_money_large(opp.latest_fcf)),
+                ]
             )
-            d1.caption("相對半年高點跌幅")
-            d2.metric("現價", f"${opp.current_price:.2f}")
-            d3.metric("半年高點", f"${opp.six_month_high:.2f}")
-            d4.metric("最新 FCF", _fmt_money_large(opp.latest_fcf))
             if opp.rd_expense:
                 st.markdown(
                     f"**科技新知儲備（R&D）**：{_fmt_money_large(opp.rd_expense)} "
@@ -1453,8 +1790,27 @@ def _render_sidebar() -> None:
     st.sidebar.markdown(
         f"**已載入深度分析**：{len(st.session_state.get('analyzed_tickers', []))} 檔"
     )
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(
+        """
+        <div class="sidebar-lab-card">
+            <div class="sidebar-lab-badge">COMING SOON</div>
+            <div class="sidebar-lab-title">實驗性引擎：社會套利 (Social Sentiment Lab)</div>
+            <p class="sidebar-lab-hint">TODO: 接入 Reddit / TikTok API</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.sidebar.button(
+        "社會套利 · Social Sentiment Lab",
+        disabled=True,
+        help="TODO: 接入 Reddit / TikTok API — 模組二預留中",
+        use_container_width=True,
+        key="social_sentiment_lab_button",
+    )
     if st.sidebar.button("清除快取資料"):
         load_report_for_symbol.clear()
+        load_company_narrative.clear()
         _validate_ticker_symbol.clear()
         _fetch_market_history.clear()
         _cached_index_constituents.clear()
