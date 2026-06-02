@@ -42,8 +42,9 @@ GRADE_COLORS = {
 }
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
 SCORE_COLUMNS_VALUE = ("綜合安全得分", "FCF分", "股息分", "發放率分", "Beta分")
-SCORE_COLUMNS_GROWTH = SCORE_COLUMNS_VALUE + ("營收成長分", "技術面分")
+SCORE_COLUMNS_GROWTH = SCORE_COLUMNS_VALUE + ("營收分", "技術面分")
 STRATEGY_SESSION_KEY = "strategy_mode"
+STRATEGY_MIRROR_KEY = "strategy_mode_deep"
 DEFAULT_HUNTER_UNIVERSE = "AAPL, MSFT, NVDA, INTC, BA, DIS, JNJ, KO"
 SCAN_UNIVERSE_OPTIONS: dict[str, str] = {
     "🇺🇸 道瓊 30 (Dow 30) - 快速掃描": "dow30",
@@ -114,16 +115,44 @@ def _score_columns_for_mode(mode: str | None = None) -> tuple[str, ...]:
 
 
 def _on_strategy_mode_change() -> None:
+    st.session_state[STRATEGY_MIRROR_KEY] = st.session_state.get(
+        STRATEGY_SESSION_KEY, STRATEGY_LABEL_VALUE
+    )
     st.rerun()
 
 
-def _render_strategy_control() -> None:
+def _on_strategy_mirror_change() -> None:
+    st.session_state[STRATEGY_SESSION_KEY] = st.session_state.get(
+        STRATEGY_MIRROR_KEY, STRATEGY_LABEL_VALUE
+    )
+    st.rerun()
+
+
+def _sync_strategy_widgets() -> None:
+    """Keep watchlist and deep-dive strategy radios aligned."""
+    labels = list(STRATEGY_LABELS)
+    canonical = st.session_state.get(STRATEGY_SESSION_KEY, STRATEGY_LABEL_VALUE)
+    if canonical not in labels:
+        canonical = STRATEGY_LABEL_VALUE
+        st.session_state[STRATEGY_SESSION_KEY] = canonical
+    mirror = st.session_state.get(STRATEGY_MIRROR_KEY, canonical)
+    if mirror not in labels:
+        mirror = canonical
+    if mirror != canonical:
+        st.session_state[STRATEGY_MIRROR_KEY] = canonical
+    elif st.session_state.get(STRATEGY_MIRROR_KEY) != canonical:
+        st.session_state[STRATEGY_MIRROR_KEY] = canonical
+
+
+def _render_strategy_control(*, mirror: bool = False) -> None:
+    _sync_strategy_widgets()
+    widget_key = STRATEGY_MIRROR_KEY if mirror else STRATEGY_SESSION_KEY
     st.radio(
         "🎯 投資策略戰術",
         list(STRATEGY_LABELS),
-        key=STRATEGY_SESSION_KEY,
+        key=widget_key,
         horizontal=True,
-        on_change=_on_strategy_mode_change,
+        on_change=_on_strategy_mirror_change if mirror else _on_strategy_mode_change,
     )
     mode = _current_strategy_mode()
     st.caption(
@@ -336,6 +365,16 @@ def _inject_css() -> None:
             font-size: 0.78rem;
             font-weight: 600;
             margin-bottom: 0.65rem;
+        }}
+        .fx-chart-empty {{
+            background: linear-gradient(165deg, #1e293b 0%, #151d2b 100%);
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            border-radius: 10px;
+            padding: 0.85rem 1rem;
+            margin: 0.35rem 0 1rem;
+            color: #94a3b8;
+            font-size: 0.86rem;
+            line-height: 1.55;
         }}
         div[data-testid="stRadio"] > label {{
             color: #94a3b8 !important;
@@ -807,6 +846,8 @@ def _init_session_state() -> None:
         st.session_state.scroll_to_analysis = False
     if STRATEGY_SESSION_KEY not in st.session_state:
         st.session_state[STRATEGY_SESSION_KEY] = STRATEGY_LABEL_VALUE
+    if STRATEGY_MIRROR_KEY not in st.session_state:
+        st.session_state[STRATEGY_MIRROR_KEY] = st.session_state[STRATEGY_SESSION_KEY]
 
 
 def _unlock_ticker_for_analysis(symbol: str) -> None:
@@ -942,8 +983,24 @@ def _render_trend_signal_block(trend: dict | None) -> None:
     )
 
 
-def _fcf_bar_chart(report: StockReport, *, height: int = 400) -> go.Figure:
+def _chart_df_ready(df: pd.DataFrame | None, *required_columns: str) -> bool:
+    if df is None or df.empty:
+        return False
+    return all(col in df.columns for col in required_columns)
+
+
+def _render_chart_empty_notice(message: str) -> None:
+    st.markdown(
+        f'<div class="fx-chart-empty">{html.escape(message)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _fcf_bar_chart(report: StockReport, *, height: int = 400) -> go.Figure | None:
     df = fcf_chart_df(report)
+    if not _chart_df_ready(df, "Fiscal Year", "FCF (USD billions)"):
+        return None
+
     unit = "Billions USD"
     y_vals = df["FCF (USD billions)"]
     if not y_vals.empty and y_vals.abs().max() < 1:
@@ -981,6 +1038,69 @@ def _fcf_bar_chart(report: StockReport, *, height: int = 400) -> go.Figure:
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(gridcolor="#334155", zeroline=False)
     return fig
+
+
+def _render_fcf_chart_section(report: StockReport, *, height: int = 240) -> None:
+    fig = _fcf_bar_chart(report, height=height)
+    if fig is None:
+        _render_chart_empty_notice(
+            "ℹ️ 無可用自由現金流 (FCF) 年度數據可供繪圖"
+            "（可能上市年限較短、財報尚未揭露，或 SEC 資料缺失）。"
+        )
+        return
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=f"fcf_{report.symbol}",
+    )
+
+
+def _dps_line_chart(report: StockReport, *, height: int = 400) -> go.Figure | None:
+    df = dividend_chart_df(report)
+    if not _chart_df_ready(df, "Year", "DPS (USD)"):
+        return None
+
+    fig = go.Figure(
+        data=[
+            go.Scatter(
+                x=df["Year"],
+                y=df["DPS (USD)"],
+                mode="lines+markers",
+                line=dict(color=CHART_COLORS[1], width=2.5),
+                marker=dict(size=7),
+                hovertemplate="%{x}<br>DPS: $%{y:.3f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title=dict(text="年度股息 DPS", font=dict(size=13, color="#94a3b8")),
+        xaxis_title="",
+        yaxis_title="DPS (USD)",
+        template="plotly_dark",
+        paper_bgcolor=TECH_DARK_CARD,
+        plot_bgcolor=TECH_DARK_CARD,
+        height=height,
+        margin=dict(t=36, b=28, l=40, r=16),
+        showlegend=False,
+        xaxis=dict(dtick=1),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor="#334155", zeroline=False)
+    return fig
+
+
+def _render_dps_chart_section(report: StockReport, *, height: int = 240) -> None:
+    fig = _dps_line_chart(report, height=height)
+    if fig is None:
+        _render_chart_empty_notice(
+            "ℹ️ 該標的歷史上未曾發放股息，無年度股息 (DPS) 數據可供繪圖。"
+        )
+        return
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=f"dps_{report.symbol}",
+    )
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -1374,37 +1494,6 @@ def _display_technical_chart(symbol: str) -> None:
         )
 
 
-def _dps_line_chart(report: StockReport, *, height: int = 400) -> go.Figure:
-    df = dividend_chart_df(report)
-    fig = go.Figure(
-        data=[
-            go.Scatter(
-                x=df["Year"],
-                y=df["DPS (USD)"],
-                mode="lines+markers",
-                line=dict(color=CHART_COLORS[1], width=2.5),
-                marker=dict(size=7),
-                hovertemplate="%{x}<br>DPS: $%{y:.3f}<extra></extra>",
-            )
-        ]
-    )
-    fig.update_layout(
-        title=dict(text="年度股息 DPS", font=dict(size=13, color="#94a3b8")),
-        xaxis_title="",
-        yaxis_title="DPS (USD)",
-        template="plotly_dark",
-        paper_bgcolor=TECH_DARK_CARD,
-        plot_bgcolor=TECH_DARK_CARD,
-        height=height,
-        margin=dict(t=36, b=28, l=40, r=16),
-        showlegend=False,
-        xaxis=dict(dtick=1),
-    )
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(gridcolor="#334155", zeroline=False)
-    return fig
-
-
 def _render_watchlist_bar() -> None:
     """Top watchlist input — user-defined ticker universe."""
     with st.container(border=True):
@@ -1484,16 +1573,8 @@ def _render_company_detail(report: StockReport) -> None:
         _render_narrative_card(report.symbol)
         st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
         _render_ai_terminal_block(report.analyst_commentary)
-        st.plotly_chart(
-            _fcf_bar_chart(report, height=240),
-            use_container_width=True,
-            key=f"fcf_{report.symbol}",
-        )
-        st.plotly_chart(
-            _dps_line_chart(report, height=240),
-            use_container_width=True,
-            key=f"dps_{report.symbol}",
-        )
+        _render_fcf_chart_section(report, height=240)
+        _render_dps_chart_section(report, height=240)
 
     with st.expander("原始數據與分項得分"):
         for d in report.score_details:
@@ -1583,6 +1664,8 @@ def _render_company_deep_analysis() -> None:
             "請從上方輸入股票代號，或使用轉機雷達進行掃描以載入深度分析。"
         )
         return
+
+    _render_strategy_control(mirror=True)
 
     if COMPANY_TAB_KEY not in st.session_state:
         st.session_state[COMPANY_TAB_KEY] = tickers[0]

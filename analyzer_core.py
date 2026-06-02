@@ -1359,7 +1359,7 @@ def reports_to_summary_df(
             "Beta分": _detail_score(r, "Beta"),
         }
         if growth_mode:
-            row["營收成長分"] = _detail_score(r, "營收")
+            row["營收分"] = _detail_score(r, "營收")
             row["技術面分"] = _detail_score(r, "SMA")
         rows.append(row)
     return pd.DataFrame(rows)
