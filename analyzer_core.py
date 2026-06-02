@@ -3273,6 +3273,20 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
     return "\n".join(sections)
 
 
+_LLM_BUSY_MESSAGE = "目前 AI 伺服器擁擠，請稍後重試。"
+
+
+def _notify_llm_busy() -> None:
+    """Surface a user-visible error without caching the message itself."""
+    st.error(_LLM_BUSY_MESSAGE)
+
+
+def _accept_cached_llm_text(text: str | None) -> str | None:
+    from llm_processor import accept_llm_cache_result
+
+    return accept_llm_cache_result(text)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_llm_value_commentary(symbol: str, strategy_mode: str, context: str) -> str | None:
     """Cache value-mode analyst commentary — keyed by ticker + strategy (context is plain str)."""
@@ -3283,12 +3297,14 @@ def _cached_llm_value_commentary(symbol: str, strategy_mode: str, context: str) 
     for attempt in range(1, 4):
         try:
             result = generate_value_analyst_commentary(context)
-            if result is not None:
-                return result
+            accepted = _accept_cached_llm_text(result)
+            if accepted:
+                return accepted
         except Exception as exc:
             print(f"Warning: value commentary failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
         if attempt < 3:
             time.sleep(10)
+    _notify_llm_busy()
     return None
 
 
@@ -3302,12 +3318,14 @@ def _cached_llm_growth_commentary(symbol: str, strategy_mode: str, context: str)
     for attempt in range(1, 4):
         try:
             result = generate_growth_analyst_commentary(context)
-            if result is not None:
-                return result
+            accepted = _accept_cached_llm_text(result)
+            if accepted:
+                return accepted
         except Exception as exc:
             print(f"Warning: growth commentary failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
         if attempt < 3:
             time.sleep(10)
+    _notify_llm_busy()
     return None
 
 
@@ -3318,7 +3336,7 @@ def _cached_llm_investment_scorecard(
     context: str,
 ) -> tuple[tuple[str, int, str], ...] | None:
     """Cache Master Investment Scorecard rows as a hashable tuple."""
-    from llm_processor import generate_investment_scorecard
+    from llm_processor import accept_llm_cache_result, generate_investment_scorecard
 
     sym = symbol.upper().strip()
     mode = normalize_strategy_mode(strategy_mode)
@@ -3327,14 +3345,21 @@ def _cached_llm_investment_scorecard(
         try:
             raw = generate_investment_scorecard(context, growth=growth)
             if raw:
-                return tuple(
-                    (str(row["dimension"]), int(row["score"]), str(row["rationale"]))
-                    for row in raw
-                )
+                rows: list[tuple[str, int, str]] = []
+                for row in raw:
+                    rationale = accept_llm_cache_result(str(row.get("rationale", "")))
+                    if not rationale:
+                        continue
+                    rows.append(
+                        (str(row["dimension"]), int(row["score"]), rationale)
+                    )
+                if rows:
+                    return tuple(rows)
         except Exception as exc:
             print(f"Warning: scorecard failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
         if attempt < 3:
             time.sleep(10)
+    _notify_llm_busy()
     return None
 
 
@@ -3364,11 +3389,24 @@ def _cached_llm_value_narrative(
     business_summary: str,
     sector: str,
     industry: str,
-) -> str:
+) -> str | None:
     """Cache value-mode tech narrative (static business summary)."""
     from llm_processor import generate_company_narrative_text
 
-    return generate_company_narrative_text(symbol, business_summary, sector, industry)
+    sym = symbol.upper().strip()
+    mode = normalize_strategy_mode(strategy_mode)
+    for attempt in range(1, 4):
+        try:
+            result = generate_company_narrative_text(sym, business_summary, sector, industry)
+            accepted = _accept_cached_llm_text(result)
+            if accepted:
+                return accepted
+        except Exception as exc:
+            print(f"Warning: value narrative failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
+        if attempt < 3:
+            time.sleep(10)
+    _notify_llm_busy()
+    return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -3381,25 +3419,38 @@ def _cached_llm_growth_narrative(
     live_news_text: str,
     trend_json: str,
     master_text: str,
-) -> str:
+) -> str | None:
     """Cache growth-mode live-news narrative — trend serialized as JSON."""
     from llm_processor import generate_growth_narrative_text
 
+    sym = symbol.upper().strip()
+    mode = normalize_strategy_mode(strategy_mode)
     trend: dict | None = None
     if trend_json:
         try:
             trend = json.loads(trend_json)
         except json.JSONDecodeError:
             trend = None
-    return generate_growth_narrative_text(
-        symbol,
-        business_summary,
-        sector,
-        industry,
-        live_news_text=live_news_text,
-        trend_signal=trend,
-        master_text=master_text,
-    )
+    for attempt in range(1, 4):
+        try:
+            result = generate_growth_narrative_text(
+                sym,
+                business_summary,
+                sector,
+                industry,
+                live_news_text=live_news_text,
+                trend_signal=trend,
+                master_text=master_text,
+            )
+            accepted = _accept_cached_llm_text(result)
+            if accepted:
+                return accepted
+        except Exception as exc:
+            print(f"Warning: growth narrative failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
+        if attempt < 3:
+            time.sleep(10)
+    _notify_llm_busy()
+    return None
 
 
 def clear_gemini_llm_cache() -> None:
@@ -3428,6 +3479,8 @@ def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardIt
         llm_text = _cached_llm_growth_commentary(sym, mode, context)
     else:
         llm_text = _cached_llm_value_commentary(sym, mode, context)
+
+    llm_text = _accept_cached_llm_text(llm_text)
 
     if llm_text:
         commentary = (
@@ -3730,11 +3783,11 @@ def build_company_narrative(
             trend_json,
             master_block,
         )
-        if text.startswith("⚠️") and summary:
+        if not text and summary:
             text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
-        elif not text.strip():
-            text = summary or "暫無可用敘事資料。"
-        return NarrativeResult(text=text, live_news_degraded=degraded)
+        if not text and summary:
+            text = summary.strip()
+        return NarrativeResult(text=text or "", live_news_degraded=degraded)
 
     if not summary:
         return NarrativeResult(
@@ -3742,7 +3795,9 @@ def build_company_narrative(
             live_news_degraded=False,
         )
     text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
-    return NarrativeResult(text=text, live_news_degraded=False)
+    if not text:
+        text = summary.strip()
+    return NarrativeResult(text=text or "", live_news_degraded=False)
 
 
 def analyze_all(

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 from google import genai
@@ -10,6 +11,44 @@ from google import genai
 from data_fetcher import NewsItem
 
 logger = logging.getLogger(__name__)
+
+_HTML_FENCE_RE = re.compile(r"```(?:html)?\n?", re.IGNORECASE)
+_LLM_ERROR_MARKERS = (
+    "429",
+    "resource_exhausted",
+    "rate limit",
+    "too many requests",
+    "quota exceeded",
+    "科技敘事生成失敗",
+    "生成失敗",
+)
+
+
+def _strip_llm_fences(text: str) -> str:
+    return _HTML_FENCE_RE.sub("", text or "").replace("```", "").strip()
+
+
+def is_poisoned_llm_output(text: str | None) -> bool:
+    """True when text looks like an API failure — must not be cached or rendered."""
+    if text is None:
+        return True
+    raw = str(text).strip()
+    if not raw:
+        return True
+    if raw.startswith("⚠️"):
+        return True
+    lower = raw.lower()
+    if any(marker in lower or marker in raw for marker in _LLM_ERROR_MARKERS):
+        return True
+    return False
+
+
+def accept_llm_cache_result(text: str | None) -> str | None:
+    """Return sanitized LLM text safe to cache, or None to avoid cache poisoning."""
+    if is_poisoned_llm_output(text):
+        return None
+    cleaned = _strip_llm_fences(str(text).strip())
+    return cleaned or None
 
 FILTER_PROMPT = (
     "你是一個冷酷的量化投資資訊過濾器。請對以下新聞進行去噪，剔除所有煽動性形容詞與無關炒作（如虛擬貨幣）。"
@@ -218,7 +257,7 @@ def generate_company_narrative_text(
     business_summary: str,
     sector: str = "",
     industry: str = "",
-) -> str:
+) -> str | None:
     """Summarize official business summary into concise Traditional Chinese tech narrative."""
     context_parts = [f"Ticker: {symbol.upper()}"]
     if sector:
@@ -230,17 +269,19 @@ def generate_company_narrative_text(
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return "⚠️ 未設定 GEMINI_API_KEY，無法生成科技敘事。請在環境變數中設定後重新整理。"
+        return None
 
     try:
         client = genai.Client(api_key=api_key)
-        return _generate_content_with_backoff(
+        text = _generate_content_with_backoff(
             client,
             model=MODEL_NAME,
             contents=f"{NARRATIVE_SYSTEM_PROMPT}\n\n{user_block}",
         )
+        return accept_llm_cache_result(text)
     except Exception as exc:
-        return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"
+        print(f"Warning: company narrative failed for {symbol}: {exc}")
+        return None
 
 
 def _format_trend_context(trend_signal: dict | None) -> str:
@@ -279,7 +320,7 @@ def generate_growth_narrative_text(
     live_news_text: str = "",
     trend_signal: dict | None = None,
     master_text: str = "",
-) -> str:
+) -> str | None:
     """Growth-mode narrative: fuse static summary + live news + master metrics + technical catalyst."""
     context_parts = [f"Ticker: {symbol.upper()}"]
     if sector:
@@ -300,17 +341,19 @@ def generate_growth_narrative_text(
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return "⚠️ 未設定 GEMINI_API_KEY，無法生成科技敘事。請在環境變數中設定後重新整理。"
+        return None
 
     try:
         client = genai.Client(api_key=api_key)
-        return _generate_content_with_backoff(
+        text = _generate_content_with_backoff(
             client,
             model=MODEL_NAME,
             contents=f"{NARRATIVE_GROWTH_LIVE_PROMPT}\n\n{user_block}",
         )
+        return accept_llm_cache_result(text)
     except Exception as exc:
-        return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"
+        print(f"Warning: growth narrative failed for {symbol}: {exc}")
+        return None
 
 
 def _call_gemini(system_prompt: str, context: str) -> str | None:
@@ -324,7 +367,7 @@ def _call_gemini(system_prompt: str, context: str) -> str | None:
             model=MODEL_NAME,
             contents=f"{system_prompt}\n\n{context.strip()}",
         )
-        return text or None
+        return accept_llm_cache_result(text)
     except Exception as exc:
         print(f"Warning: Gemini commentary failed after retries: {exc}")
         return None

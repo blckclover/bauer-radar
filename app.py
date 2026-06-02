@@ -244,25 +244,60 @@ _HTML_FENCE_LEADING_RE = re.compile(r"^\s*```(?:html|HTML)?\s*\n?", re.IGNORECAS
 _HTML_FENCE_TRAILING_RE = re.compile(r"\n?\s*```\s*$")
 
 
+_HTML_FENCE_RE = re.compile(r"```(?:html)?\n?", re.IGNORECASE)
+
+
 def _clean_ai_html(raw: str) -> str:
     """Remove ```html / ``` markdown fences so Streamlit receives pure HTML or text."""
-    text = (raw or "").replace("```html", "").replace("```HTML", "").replace("```", "").strip()
-    if not text:
+    content = raw or ""
+    clean_html = _HTML_FENCE_RE.sub("", content).replace("```", "").strip()
+    if not clean_html:
         return ""
-    block = _HTML_FENCE_BLOCK_RE.match(text)
+    block = _HTML_FENCE_BLOCK_RE.match(clean_html)
     if block:
-        return block.group(1).replace("```html", "").replace("```HTML", "").replace("```", "").strip()
-    text = _HTML_FENCE_LEADING_RE.sub("", text)
-    text = _HTML_FENCE_TRAILING_RE.sub("", text)
-    return text.replace("```html", "").replace("```HTML", "").replace("```", "").strip()
+        inner = block.group(1)
+        clean_html = _HTML_FENCE_RE.sub("", inner).replace("```", "").strip()
+    clean_html = _HTML_FENCE_LEADING_RE.sub("", clean_html)
+    clean_html = _HTML_FENCE_TRAILING_RE.sub("", clean_html)
+    return _HTML_FENCE_RE.sub("", clean_html).replace("```", "").strip()
 
 
 def _render_html(html_content: str) -> None:
     """Render custom HTML/CSS blocks — always strip AI fences and enable HTML parsing."""
-    content = (html_content or "").replace("```html", "").replace("```HTML", "").replace("```", "").strip()
-    cleaned = _clean_ai_html(content)
+    content = html_content or ""
+    clean_html = _HTML_FENCE_RE.sub("", content).replace("```", "").strip()
+    cleaned = _clean_ai_html(clean_html)
     if cleaned:
         st.markdown(cleaned, unsafe_allow_html=True)
+
+
+def _is_llm_error_payload(text: object) -> bool:
+    """Detect API failures / rate-limit strings that must never be rendered or cached."""
+    if text is None:
+        return True
+    raw = str(text).strip()
+    if not raw:
+        return True
+    lower = raw.lower()
+    if raw.startswith("⚠️") or "科技敘事生成失敗" in raw or "生成失敗" in raw:
+        return True
+    if any(
+        token in lower
+        for token in ("429", "resource_exhausted", "rate limit", "too many requests", "quota exceeded")
+    ):
+        return True
+    return False
+
+
+def _safe_render_text(text: object) -> str | None:
+    """Return stripped text safe to render, or None when empty / poisoned."""
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw or _is_llm_error_payload(raw):
+        return None
+    cleaned = _clean_ai_html(raw)
+    return cleaned if cleaned else None
 
 
 def _format_narrative_for_card(raw: str) -> str:
@@ -314,7 +349,14 @@ def _render_narrative_card(symbol: str) -> None:
     )
     strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
     narrative, live_news_degraded = load_company_narrative(strategy_key, symbol)
-    card_html = _format_narrative_for_card(narrative)
+    safe_narrative = _safe_render_text(narrative)
+    if not safe_narrative:
+        if _is_llm_error_payload(narrative):
+            st.error("目前 AI 伺服器擁擠，請稍後重試。")
+        return
+    card_html = _format_narrative_for_card(safe_narrative)
+    if not card_html:
+        return
     if live_news_degraded and is_growth_strategy(strategy_key):
         card_html += (
             '<p class="fx-narrative-footnote">'
@@ -1462,9 +1504,16 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
     )
 
 
-def _render_ai_terminal_block(text: str) -> None:
+def _render_ai_terminal_block(text: str | None) -> None:
     """Finance-terminal styled block for AI commentary — no raw Markdown headers."""
-    clean = _sanitize_ai_commentary(text)
+    safe = _safe_render_text(text)
+    if not safe:
+        if text and _is_llm_error_payload(text):
+            st.error("目前 AI 伺服器擁擠，請稍後重試。")
+        return
+    clean = _sanitize_ai_commentary(safe)
+    if not clean:
+        return
     _render_html('<div class="ai-terminal-panel"></div>')
     _render_html(
         f'<div class="ai-terminal-body">{html.escape(clean).replace(chr(10), "<br>")}</div>'
@@ -1494,9 +1543,15 @@ def _render_investment_scorecard(report: object) -> None:
         else:
             item = _coerce_scorecard_item(raw)
 
+        rationale = _safe_render_text(item.rationale)
+        if not rationale:
+            continue
+
         tone = _scorecard_tone(item.score)
         pct = max(0, min(100, item.score * 10))
         short_name = _scorecard_short_name(item.dimension)
+        if not short_name:
+            continue
         tip = _scorecard_tooltip(item.dimension)
         tip_html = ""
         if tip:
@@ -1515,12 +1570,15 @@ def _render_investment_scorecard(report: object) -> None:
                 <div class="scorecard-progress-track">
                     <div class="scorecard-progress-fill {tone}" style="width:{pct}%;"></div>
                 </div>
-                <div class="scorecard-progress-rationale">{html.escape(_clean_ai_html(item.rationale))}</div>
+                <div class="scorecard-progress-rationale">{html.escape(rationale)}</div>
             </div>
             """
         )
 
-    _render_html(
+    if not cards:
+        return
+
+    scorecard_html = (
         f"""
         <div class="scorecard-grid-title">
             Master Investment Scorecard · 大師級多空量化項目評價表
@@ -1530,6 +1588,8 @@ def _render_investment_scorecard(report: object) -> None:
         </div>
         """
     )
+    clean_html = _HTML_FENCE_RE.sub("", scorecard_html).replace("```", "").strip()
+    _render_html(clean_html)
 
 
 def _render_deep_analysis_divider() -> None:
@@ -2775,8 +2835,13 @@ def _render_company_detail(report: StockReport) -> None:
         )
         _render_narrative_card(report.symbol)
         _render_investment_scorecard(report)
-        st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
-        _render_ai_terminal_block(report.analyst_commentary)
+        commentary = _safe_render_text(_rget(report, "analyst_commentary", None))
+        if commentary:
+            st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
+            _render_ai_terminal_block(commentary)
+        elif _is_llm_error_payload(_rget(report, "analyst_commentary", None)):
+            st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
+            st.error("目前 AI 伺服器擁擠，請稍後重試。")
         _render_fcf_chart_section(report, height=240)
         _render_dps_chart_section(report, height=240)
 
