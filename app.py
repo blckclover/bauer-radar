@@ -18,6 +18,7 @@ from analyzer_core import (
     STRATEGY_VALUE,
     MasterMetrics,
     ScoreDetail,
+    ScorecardItem,
     StockReport,
     TurnaroundOpportunity,
     YearDividend,
@@ -358,6 +359,57 @@ def _inject_css() -> None:
         table.fx-table td.tone-green {{ color: #4ade80; font-weight: 700; }}
         table.fx-table td.tone-yellow {{ color: #facc15; font-weight: 700; }}
         table.fx-table td.tone-red {{ color: #f87171; font-weight: 700; }}
+        .master-scorecard-wrap {{
+            background: linear-gradient(165deg, #1a2332 0%, #121a28 100%);
+            border: 1px solid rgba(100, 116, 139, 0.18);
+            border-radius: 10px;
+            padding: 0.85rem 0.95rem 1rem;
+            margin: 0.65rem 0 1.25rem;
+            box-shadow: 0 8px 22px rgba(2, 6, 23, 0.28);
+        }}
+        .master-scorecard-title {{
+            color: #64748b;
+            font-size: 0.68rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin: 0.1rem 0 0.65rem 0.2rem;
+        }}
+        table.master-scorecard {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.78rem;
+        }}
+        table.master-scorecard th {{
+            color: #64748b;
+            font-weight: 600;
+            text-align: left;
+            padding: 0.5rem 0.45rem;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+            font-size: 0.68rem;
+            letter-spacing: 0.04em;
+        }}
+        table.master-scorecard td {{
+            color: #cbd5e1;
+            padding: 0.55rem 0.45rem;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.06);
+            vertical-align: top;
+            line-height: 1.45;
+        }}
+        table.master-scorecard td.score-cell {{
+            text-align: center;
+            font-weight: 700;
+            font-size: 0.95rem;
+            width: 3rem;
+            white-space: nowrap;
+        }}
+        table.master-scorecard td.score-high {{ color: #4ade80; }}
+        table.master-scorecard td.score-mid {{ color: #facc15; }}
+        table.master-scorecard td.score-low {{ color: #f87171; }}
+        table.master-scorecard td.dim-cell {{
+            color: #e2e8f0;
+            font-weight: 500;
+            width: 38%;
+        }}
         .ai-terminal-panel {{
             display: none;
         }}
@@ -751,6 +803,60 @@ def _render_ai_terminal_block(text: str) -> None:
     """Finance-terminal styled markdown block for AI commentary."""
     st.markdown('<div class="ai-terminal-panel"></div>', unsafe_allow_html=True)
     st.markdown(text)
+
+
+def _scorecard_tone(score: int) -> str:
+    if score >= 8:
+        return "score-high"
+    if score >= 5:
+        return "score-mid"
+    return "score-low"
+
+
+def _render_investment_scorecard(report: object) -> None:
+    """Render the six-dimension Master Investment Scorecard (1–10 institutional grid)."""
+    rows_raw = _rget(report, "investment_scorecard", None) or []
+    if not rows_raw:
+        return
+
+    body_rows: list[str] = []
+    for raw in rows_raw:
+        if isinstance(raw, ScorecardItem):
+            item = raw
+        elif isinstance(raw, dict):
+            item = _coerce_scorecard_item(raw)
+        else:
+            item = _coerce_scorecard_item(raw)
+
+        tone = _scorecard_tone(item.score)
+        body_rows.append(
+            f"<tr>"
+            f'<td class="dim-cell">{html.escape(item.dimension)}</td>'
+            f'<td class="score-cell {tone}">{item.score}</td>'
+            f'<td>{html.escape(item.rationale)}</td>'
+            f"</tr>"
+        )
+
+    st.markdown(
+        f"""
+        <div class="master-scorecard-wrap">
+            <div class="master-scorecard-title">
+                Master Investment Scorecard · 大師級多空量化項目評價表
+            </div>
+            <table class="master-scorecard">
+                <thead>
+                    <tr>
+                        <th>評估維度</th>
+                        <th style="text-align:center;">分數</th>
+                        <th>機構理由（1–10）</th>
+                    </tr>
+                </thead>
+                <tbody>{"".join(body_rows)}</tbody>
+            </table>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _render_deep_analysis_divider() -> None:
@@ -1700,6 +1806,33 @@ def _coerce_master(raw: object) -> MasterMetrics:
         surprise_beat_streak=_rget(raw, "surprise_beat_streak", 0),
         surprise_sample=_rget(raw, "surprise_sample", 0),
         surprise_beats=_rget(raw, "surprise_beats", 0),
+        latest_quarter_label=str(_rget(raw, "latest_quarter_label", "")),
+        yoy_quarter_label=str(_rget(raw, "yoy_quarter_label", "")),
+        operating_margin_latest=_rget(raw, "operating_margin_latest"),
+        operating_margin_yoy=_rget(raw, "operating_margin_yoy"),
+        operating_margin_change_pp=_rget(raw, "operating_margin_change_pp"),
+        operating_margin_red_flag=bool(_rget(raw, "operating_margin_red_flag", False)),
+        operating_margin_red_flag_msg=str(_rget(raw, "operating_margin_red_flag_msg", "")),
+        capex_red_flag=bool(_rget(raw, "capex_red_flag", False)),
+        capex_red_flag_msg=str(_rget(raw, "capex_red_flag_msg", "")),
+        ttm_operating_margin=_rget(raw, "ttm_operating_margin"),
+        ttm_gross_margin=_rget(raw, "ttm_gross_margin"),
+        ttm_revenue_growth=_rget(raw, "ttm_revenue_growth"),
+        data_as_of=str(_rget(raw, "data_as_of", "")),
+    )
+
+
+def _coerce_scorecard_item(raw: object) -> ScorecardItem:
+    if isinstance(raw, ScorecardItem):
+        return raw
+    try:
+        score = int(_rget(raw, "score", 5) or 5)
+    except (TypeError, ValueError):
+        score = 5
+    return ScorecardItem(
+        dimension=str(_rget(raw, "dimension", "")),
+        score=max(1, min(10, score)),
+        rationale=str(_rget(raw, "rationale", "")),
     )
 
 
@@ -1771,6 +1904,10 @@ def _coerce_report(report: object) -> StockReport:
         trend_signal=report.get("trend_signal"),
         strategy_mode=str(report.get("strategy_mode", STRATEGY_VALUE)),
         master=master,
+        investment_scorecard=[
+            _coerce_scorecard_item(row)
+            for row in (report.get("investment_scorecard") or [])
+        ],
     )
 
 
@@ -1860,6 +1997,7 @@ def _render_company_detail(report: StockReport) -> None:
         _render_narrative_card(report.symbol)
         st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
         _render_ai_terminal_block(report.analyst_commentary)
+        _render_investment_scorecard(report)
         _render_fcf_chart_section(report, height=240)
         _render_dps_chart_section(report, height=240)
 

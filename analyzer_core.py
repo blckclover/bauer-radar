@@ -108,6 +108,19 @@ TOTAL_REVENUE_ROW_NAMES = (
     "Total Revenue",
     "OperatingRevenue",
 )
+# Operating-margin YoY decline ≥ this many pp triggers a pricing-power red flag
+OPERATING_MARGIN_RED_FLAG_PP = 2.0
+# CapEx YoY expansion above this while margins shrink → efficiency-trap red flag
+CAPEX_EXPANSION_RED_FLAG = 0.20
+
+SCORECARD_DIMENSIONS: tuple[str, ...] = (
+    "1. 財務安全 (Financial Runway)",
+    "2. 現金流健康度 (FCF Reality)",
+    "3. 核心成長性 (Growth Momentum)",
+    "4. 科技/AI 題材含金量 (Tech Narrative Catalyst)",
+    "5. 產業定價權與競爭優勢 (Moat Stability)",
+    "6. 前瞻估值吸引力 (Valuation Safety Margin)",
+)
 
 # Index scan universes — Wikipedia constituents with hardcoded fallback
 WIKI_INDEX_PAGES: dict[str, str] = {
@@ -256,6 +269,29 @@ class MasterMetrics:
     surprise_beat_streak: int = 0           # consecutive recent beats
     surprise_sample: int = 0                # number of reported quarters compared
     surprise_beats: int = 0                 # beats within the sample
+    # Period-stamped margin / CapEx trend (quarterly vs TTM — never conflate)
+    latest_quarter_label: str = ""          # e.g. "2025-Q3 (quarterly filing)"
+    yoy_quarter_label: str = ""
+    operating_margin_latest: float | None = None   # latest quarter OM %
+    operating_margin_yoy: float | None = None      # same quarter prior year OM %
+    operating_margin_change_pp: float | None = None  # YoY change in percentage points
+    operating_margin_red_flag: bool = False
+    operating_margin_red_flag_msg: str = ""
+    capex_red_flag: bool = False
+    capex_red_flag_msg: str = ""
+    ttm_operating_margin: float | None = None      # yfinance info — trailing twelve months
+    ttm_gross_margin: float | None = None
+    ttm_revenue_growth: float | None = None        # info.revenueGrowth (TTM proxy)
+    data_as_of: str = ""                           # ISO date of latest price / quarter
+
+
+@dataclass
+class ScorecardItem:
+    """Single row in the Master Investment Scorecard (1–10 institutional rating)."""
+
+    dimension: str
+    score: int
+    rationale: str
 
 
 @dataclass
@@ -279,6 +315,7 @@ class StockReport:
     trend_signal: dict[str, float | str | None] | None = None
     strategy_mode: str = STRATEGY_VALUE
     master: MasterMetrics = field(default_factory=MasterMetrics)
+    investment_scorecard: list[ScorecardItem] = field(default_factory=list)
 
     @property
     def overall_pass(self) -> bool | None:
@@ -861,6 +898,94 @@ def fetch_earnings_surprise(ticker: yf.Ticker) -> dict | None:
     }
 
 
+def _quarter_label(col: object) -> str:
+    """Human-readable fiscal quarter label from a statement column timestamp."""
+    try:
+        ts = pd.Timestamp(col)
+        return f"{ts.year}-Q{(ts.month - 1) // 3 + 1} (as-of {ts.strftime('%Y-%m-%d')})"
+    except Exception:
+        return str(col)
+
+
+def fetch_operating_margin_trend(ticker: yf.Ticker) -> dict:
+    """Latest-quarter operating margin vs the year-ago quarter (YoY trend).
+
+    Returns period-stamped margins and optional red-flag messages. Never raises.
+    """
+    out: dict = {
+        "latest_quarter_label": "",
+        "yoy_quarter_label": "",
+        "operating_margin_latest": None,
+        "operating_margin_yoy": None,
+        "operating_margin_change_pp": None,
+        "operating_margin_red_flag": False,
+        "operating_margin_red_flag_msg": "",
+    }
+    try:
+        quarterly = ticker.quarterly_income_stmt
+    except Exception:
+        return out
+    if quarterly is None or quarterly.empty:
+        return out
+
+    op_row = _pick_row(quarterly, *EBIT_ROW_NAMES)
+    rev_row = _pick_row(quarterly, *TOTAL_REVENUE_ROW_NAMES)
+    if op_row is None or rev_row is None:
+        return out
+
+    cols = sorted(quarterly.columns, reverse=True)
+    if len(cols) < 5:
+        return out
+
+    latest_col, yoy_col = cols[0], cols[4]
+    try:
+        rev_latest = float(rev_row.get(latest_col))
+        rev_yoy = float(rev_row.get(yoy_col))
+        op_latest = float(op_row.get(latest_col))
+        op_yoy = float(op_row.get(yoy_col))
+    except (TypeError, ValueError):
+        return out
+    if rev_latest <= 0 or rev_yoy <= 0:
+        return out
+
+    om_latest = op_latest / rev_latest
+    om_yoy = op_yoy / rev_yoy
+    change_pp = (om_latest - om_yoy) * 100.0
+
+    out.update(
+        {
+            "latest_quarter_label": _quarter_label(latest_col),
+            "yoy_quarter_label": _quarter_label(yoy_col),
+            "operating_margin_latest": round(om_latest * 100.0, 2),
+            "operating_margin_yoy": round(om_yoy * 100.0, 2),
+            "operating_margin_change_pp": round(change_pp, 2),
+        }
+    )
+    if change_pp <= -OPERATING_MARGIN_RED_FLAG_PP:
+        out["operating_margin_red_flag"] = True
+        out["operating_margin_red_flag_msg"] = (
+            f"【紅旗警告】：營業利益率 YoY {om_yoy*100:.1f}% → {om_latest*100:.1f}% "
+            f"（{change_pp:+.1f}pp），獲利能力衰退，面臨定價權危機或成本失控"
+        )
+    return out
+
+
+def _evaluate_capex_red_flag(
+    capex_growth: float | None,
+    operating_margin_change_pp: float | None,
+) -> tuple[bool, str]:
+    """CapEx expansion paired with margin erosion → efficiency-trap warning."""
+    if capex_growth is None or operating_margin_change_pp is None:
+        return False, ""
+    if capex_growth >= CAPEX_EXPANSION_RED_FLAG and operating_margin_change_pp < -1.0:
+        return True, (
+            f"【紅旗警告】：CapEx 季 YoY 擴張 {capex_growth*100:+.1f}%，"
+            f"但營業利益率同步下滑 {operating_margin_change_pp:+.1f}pp，"
+            "可能存在資本效率陷阱或過度投資風險"
+        )
+    return False, ""
+
+
 def fetch_master_metrics(
     symbol: str,
     info: dict | None,
@@ -872,6 +997,10 @@ def fetch_master_metrics(
 
     capex_growth, capex_latest = fetch_capex_growth(t)
     surprise = fetch_earnings_surprise(t)
+    margin_trend = fetch_operating_margin_trend(t)
+    capex_flag, capex_msg = _evaluate_capex_red_flag(
+        capex_growth, margin_trend.get("operating_margin_change_pp")
+    )
 
     return MasterMetrics(
         peg_ratio=_safe_info_float(info, "trailingPegRatio"),
@@ -886,6 +1015,18 @@ def fetch_master_metrics(
         surprise_beat_streak=(surprise or {}).get("beat_streak", 0),
         surprise_sample=(surprise or {}).get("sample", 0),
         surprise_beats=(surprise or {}).get("beats", 0),
+        latest_quarter_label=str(margin_trend.get("latest_quarter_label", "")),
+        yoy_quarter_label=str(margin_trend.get("yoy_quarter_label", "")),
+        operating_margin_latest=margin_trend.get("operating_margin_latest"),
+        operating_margin_yoy=margin_trend.get("operating_margin_yoy"),
+        operating_margin_change_pp=margin_trend.get("operating_margin_change_pp"),
+        operating_margin_red_flag=bool(margin_trend.get("operating_margin_red_flag")),
+        operating_margin_red_flag_msg=str(margin_trend.get("operating_margin_red_flag_msg", "")),
+        capex_red_flag=capex_flag,
+        capex_red_flag_msg=capex_msg,
+        ttm_operating_margin=_safe_info_float(info, "operatingMargins"),
+        ttm_gross_margin=_safe_info_float(info, "grossMargins"),
+        ttm_revenue_growth=_safe_info_float(info, "revenueGrowth"),
     )
 
 
@@ -1947,7 +2088,11 @@ def _fmt_pct(value: float | None, *, scale: bool = True) -> str:
 
 
 def format_master_metrics_block(master: MasterMetrics) -> str:
-    """Readable block of forward-looking master variables for AI prompt context."""
+    """Readable block of forward-looking master variables for AI prompt context.
+
+    Explicitly separates quarterly filing data from TTM (trailing-twelve-month)
+    info fields so the LLM cannot conflate periods.
+    """
     if master is None:
         master = MasterMetrics()
     capex = (
@@ -1957,20 +2102,69 @@ def format_master_metrics_block(master: MasterMetrics) -> str:
     surprise = (
         f"{master.surprise_latest_pct:+.1f}%" if master.surprise_latest_pct is not None else "N/A"
     )
+
     lines = [
-        "Master forward-looking variables (期望值/風險溢價輸入):",
-        f"- Trailing PEG: {master.peg_ratio if master.peg_ratio is not None else 'N/A'}",
-        f"- CapEx 擴張率 (季 YoY): {capex}",
-        f"- ROE: {_fmt_pct(master.roe)} | ROA(ROIC proxy): {_fmt_pct(master.roa)}",
-        f"- 毛利率 (定價權 proxy): {_fmt_pct(master.gross_margins)}",
-        f"- 利息保障倍數: {cov}",
-        f"- 營收成長 (revenueGrowth): {_fmt_pct(master.revenue_growth)}",
-        (
-            f"- Earnings Surprise: 最新 {surprise} · "
-            f"連續超預期 {master.surprise_beat_streak} 季 · "
-            f"樣本 {master.surprise_sample} 季中 {master.surprise_beats} 季超預期"
-        ),
+        "=== MASTER DATA FEED (strict period labels — do NOT mix quarterly vs TTM) ===",
+        "",
+        "[A] QUARTERLY FILING DATA (latest reported quarter vs same quarter prior year):",
     ]
+    if master.latest_quarter_label:
+        om_latest = (
+            f"{master.operating_margin_latest:.1f}%"
+            if master.operating_margin_latest is not None
+            else "N/A"
+        )
+        om_yoy = (
+            f"{master.operating_margin_yoy:.1f}%"
+            if master.operating_margin_yoy is not None
+            else "N/A"
+        )
+        chg = (
+            f"{master.operating_margin_change_pp:+.1f}pp YoY"
+            if master.operating_margin_change_pp is not None
+            else "N/A"
+        )
+        lines.extend(
+            [
+                f"- Latest quarter: {master.latest_quarter_label}",
+                f"- YoY comparison quarter: {master.yoy_quarter_label}",
+                f"- Operating Margin (quarterly): {om_latest} vs {om_yoy} prior year ({chg})",
+            ]
+        )
+        if master.operating_margin_red_flag and master.operating_margin_red_flag_msg:
+            lines.append(f"- {master.operating_margin_red_flag_msg}")
+    else:
+        lines.append("- Operating Margin trend: quarterly data unavailable")
+
+    lines.extend(
+        [
+            f"- CapEx expansion (quarterly YoY): {capex}",
+        ]
+    )
+    if master.capex_red_flag and master.capex_red_flag_msg:
+        lines.append(f"- {master.capex_red_flag_msg}")
+
+    lines.extend(
+        [
+            "",
+            "[B] TTM / TRAILING METRICS (yfinance info — NOT the same period as [A]):",
+            f"- TTM Gross Margin: {_fmt_pct(master.ttm_gross_margin)}",
+            f"- TTM Operating Margin: {_fmt_pct(master.ttm_operating_margin)}",
+            f"- TTM Revenue Growth (revenueGrowth): {_fmt_pct(master.ttm_revenue_growth)}",
+            f"- Trailing PEG (trailingPegRatio): {master.peg_ratio if master.peg_ratio is not None else 'N/A'}",
+            "",
+            "[C] RETURN QUALITY & CONSENSUS:",
+            f"- ROE: {_fmt_pct(master.roe)} | ROA (ROIC proxy): {_fmt_pct(master.roa)}",
+            f"- Interest Coverage (latest annual): {cov}",
+            (
+                f"- Earnings Surprise (latest quarter): {surprise} · "
+                f"beat streak {master.surprise_beat_streak}Q · "
+                f"{master.surprise_beats}/{master.surprise_sample} beats in sample"
+            ),
+        ]
+    )
+    if master.data_as_of:
+        lines.append(f"\nData as-of: {master.data_as_of}")
     return "\n".join(lines)
 
 
@@ -2200,27 +2394,151 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
     return "\n".join(sections)
 
 
-def build_analyst_commentary(report: StockReport) -> str:
-    from llm_processor import generate_master_analyst_commentary
+def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardItem]]:
+    """Return (commentary markdown, investment scorecard rows)."""
+    from llm_processor import (
+        generate_growth_analyst_commentary,
+        generate_investment_scorecard,
+        generate_value_analyst_commentary,
+    )
 
     growth = is_growth_strategy(report.strategy_mode)
     strategy_tagline = (
-        "🚀 動能成長模式 · 索羅斯敘事變革 / PEG 剪刀差 / 右側動能視角"
+        "🚀 動能成長模式 · 機構多空對峙 / 部門拆解 / 風險邊界"
         if growth
         else "🛡️ 價值防禦模式 · 葛拉漢安全邊際 / 巴菲特護城河視角"
     )
     context = _format_master_commentary_context(report)
-    llm_text = generate_master_analyst_commentary(context)
+
+    if growth:
+        llm_text = generate_growth_analyst_commentary(context)
+    else:
+        llm_text = generate_value_analyst_commentary(context)
+
     if llm_text:
-        return (
+        commentary = (
             "### AI 首席分析師決策點評\n"
             f"**{report.symbol} · {report.company_name}** · "
             f"**策略戰術**：{strategy_tagline}\n\n"
             f"{llm_text.strip()}"
         )
-    if growth:
-        return _build_growth_analyst_commentary_fallback(report)
-    return _build_value_analyst_commentary(report)
+    elif growth:
+        commentary = _build_growth_analyst_commentary_fallback(report)
+    else:
+        commentary = _build_value_analyst_commentary(report)
+
+    raw_scorecard = generate_investment_scorecard(context, growth=growth)
+    if raw_scorecard:
+        scorecard = [
+            ScorecardItem(
+                dimension=str(row["dimension"]),
+                score=int(row["score"]),
+                rationale=str(row["rationale"]),
+            )
+            for row in raw_scorecard
+        ]
+    else:
+        scorecard = _build_scorecard_fallback(report)
+
+    return commentary, scorecard
+
+
+def _build_scorecard_fallback(report: StockReport) -> list[ScorecardItem]:
+    """Deterministic 1–10 scorecard when Gemini is unavailable."""
+    m = report.master
+    rows: list[ScorecardItem] = []
+
+    # 1 Financial runway — interest coverage + margin red flags
+    runway = 7
+    if m.interest_coverage is not None and m.interest_coverage < 3:
+        runway = 4
+    if m.operating_margin_red_flag:
+        runway = max(1, runway - 2)
+    rows.append(
+        ScorecardItem(
+            "1. 財務安全 (Financial Runway)",
+            runway,
+            f"利息保障 {m.interest_coverage or '低負債'}x；"
+            + ("營業利益率紅旗已觸發。" if m.operating_margin_red_flag else "資產負債結構尚可。"),
+        )
+    )
+
+    # 2 FCF reality
+    fcf_pts = 5
+    if report.fcf_pass is True:
+        fcf_pts = 8
+    elif report.fcf_pass is False:
+        fcf_pts = 3
+    rows.append(
+        ScorecardItem(
+            "2. 現金流健康度 (FCF Reality)",
+            fcf_pts,
+            report.fcf_note or "依最近 FCF 序列評估。",
+        )
+    )
+
+    # 3 Growth momentum
+    gm = 5
+    if m.revenue_growth and m.revenue_growth > 0.10:
+        gm = 8
+    elif m.surprise_beat_streak >= 2:
+        gm = 7
+    rows.append(
+        ScorecardItem(
+            "3. 核心成長性 (Growth Momentum)",
+            gm,
+            f"營收成長 {_fmt_pct(m.revenue_growth)} · Surprise streak {m.surprise_beat_streak}Q",
+        )
+    )
+
+    # 4 Tech narrative
+    peg = m.peg_ratio
+    tn = 6 if peg is None else (8 if peg <= 1.5 else 5)
+    capex_txt = (
+        f"{m.capex_growth * 100:+.1f}% YoY" if m.capex_growth is not None else "N/A"
+    )
+    rows.append(
+        ScorecardItem(
+            "4. 科技/AI 題材含金量 (Tech Narrative Catalyst)",
+            tn,
+            f"PEG {peg if peg is not None else 'N/A'} · CapEx {capex_txt}",
+        )
+    )
+
+    # 5 Moat
+    moat = 6
+    if m.gross_margins and m.gross_margins >= 0.40:
+        moat = 8
+    if m.operating_margin_red_flag:
+        moat = max(2, moat - 3)
+    rows.append(
+        ScorecardItem(
+            "5. 產業定價權與競爭優勢 (Moat Stability)",
+            moat,
+            f"毛利率 {_fmt_pct(m.gross_margins)} · OM YoY "
+            f"{m.operating_margin_change_pp:+.1f}pp"
+            if m.operating_margin_change_pp is not None
+            else f"毛利率 {_fmt_pct(m.gross_margins)}",
+        )
+    )
+
+    # 6 Valuation
+    val = 6
+    if peg is not None:
+        if peg <= 1.0:
+            val = 9
+        elif peg <= 2.0:
+            val = 7
+        else:
+            val = 4
+    rows.append(
+        ScorecardItem(
+            "6. 前瞻估值吸引力 (Valuation Safety Margin)",
+            val,
+            f"Trailing PEG {peg if peg is not None else 'N/A'}",
+        )
+    )
+    return rows
 
 
 def normalize_strategy_mode(strategy_mode: str) -> str:
@@ -2301,6 +2619,8 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
     beta = _safe_beta(info)
     trend = detect_trend_signals(sym)
     master = fetch_master_metrics(sym, info, ticker=ticker)
+    if trend and trend.get("as_of_date"):
+        master.data_as_of = str(trend["as_of_date"])
 
     fcf_pass, fcf_note = evaluate_fcf(fcf_rows)
     div_pass, div_note = evaluate_dividends(div_rows)
@@ -2336,7 +2656,9 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
         strategy_mode=mode,
         master=master,
     )
-    report.analyst_commentary = build_analyst_commentary(report)
+    commentary, scorecard = build_analyst_commentary(report)
+    report.analyst_commentary = commentary
+    report.investment_scorecard = scorecard
     return report
 
 
