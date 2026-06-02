@@ -23,6 +23,7 @@ from analyzer_core import (
     TurnaroundOpportunity,
     YearDividend,
     YearFCF,
+    clear_gemini_llm_cache,
     analyze_symbol,
     build_company_narrative,
     detect_trend_signals,
@@ -220,9 +221,39 @@ def _score_columns_for_mode(mode: str | None = None) -> tuple[str, ...]:
     return SCORE_COLUMNS_VALUE
 
 
+_HTML_FENCE_BLOCK_RE = re.compile(
+    r"^\s*```(?:html|HTML)?\s*\n?(.*?)\n?\s*```\s*$",
+    re.DOTALL,
+)
+_HTML_FENCE_LEADING_RE = re.compile(r"^\s*```(?:html|HTML)?\s*\n?", re.IGNORECASE)
+_HTML_FENCE_TRAILING_RE = re.compile(r"\n?\s*```\s*$")
+
+
+def _clean_ai_html(raw: str) -> str:
+    """Remove ```html / ``` markdown fences so Streamlit receives pure HTML or text."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    block = _HTML_FENCE_BLOCK_RE.match(text)
+    if block:
+        return block.group(1).strip()
+    text = _HTML_FENCE_LEADING_RE.sub("", text)
+    text = _HTML_FENCE_TRAILING_RE.sub("", text)
+    return text.strip()
+
+
+def _render_html(html_content: str) -> None:
+    """Render custom HTML/CSS blocks — always strip AI fences and enable HTML parsing."""
+    cleaned = _clean_ai_html(html_content)
+    if cleaned:
+        st.markdown(cleaned, unsafe_allow_html=True)
+
+
 def _format_narrative_for_card(raw: str) -> str:
     """Strip AI filler / markdown artifacts; convert **bold** to HTML <strong>."""
-    text = raw.strip()
+    text = _clean_ai_html(raw)
+    if text.lstrip().startswith("<"):
+        return text
     filler_re = re.compile(
         r"^(好的[，,].*?|分析師報告如下[：:].*?|以下是.*?[：:].*?|"
         r"Sure[,.].*?|Here(?:'s| is).*?:)\s*\n?",
@@ -274,9 +305,8 @@ def _render_narrative_card(symbol: str) -> None:
             "即時新聞流連線超時 · 目前顯示基礎科技敘事"
             "</p>"
         )
-    st.markdown(
-        f'<div class="fx-narrative-card"><div class="fx-narrative-body">{card_html}</div></div>',
-        unsafe_allow_html=True,
+    _render_html(
+        f'<div class="fx-narrative-card"><div class="fx-narrative-body">{card_html}</div></div>'
     )
 
 
@@ -1007,15 +1037,14 @@ def _render_fx_metric_row(
             else ""
         )
         with col:
-            st.markdown(
+            _render_html(
                 f"""
                 <div class="fx-metric-card">
                     <div class="fx-metric-label">{html.escape(label)}{tip_html}</div>
                     <div class="fx-metric-value">{html.escape(str(value))}</div>
                     {sub_html}
                 </div>
-                """,
-                unsafe_allow_html=True,
+                """
             )
 
 
@@ -1025,19 +1054,18 @@ def _render_factor_glossary(mode: str | None = None) -> None:
     tips = SCORE_WEIGHT_TOOLTIPS_GROWTH if is_growth_strategy(active) else SCORE_WEIGHT_TOOLTIPS_VALUE
     with st.expander("📐 量化因子方法論 · Factor Methodology", expanded=False):
         for dim, desc in tips.items():
-            st.markdown(
+            _render_html(
                 f'<p class="factor-glossary-item">'
                 f'<span class="factor-glossary-dim">{html.escape(dim)}</span>'
                 f'<span class="factor-glossary-desc">{html.escape(desc)}</span>'
-                f"</p>",
-                unsafe_allow_html=True,
+                f"</p>"
             )
         st.caption("核心 Metric 卡片上的 ? 圖示可 hover 查看單項因子定義。")
 
 
 def _sanitize_ai_commentary(raw: str) -> str:
     """Strip exposed Markdown headers/artifacts before terminal render."""
-    text = raw.strip()
+    text = _clean_ai_html(raw)
     filler_re = re.compile(
         r"^(好的[，,].*?|分析師報告如下[：:].*?|以下是.*?[：:].*?|"
         r"Sure[,.].*?|Here(?:'s| is).*?:)\s*\n?",
@@ -1091,7 +1119,7 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
     title_html = (
         f'<div class="fx-table-title">{html.escape(title)}</div>' if title else ""
     )
-    st.markdown(
+    _render_html(
         f"""
         <div class="fx-table-card">
             {title_html}
@@ -1102,16 +1130,17 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
                 </table>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
 def _render_ai_terminal_block(text: str) -> None:
     """Finance-terminal styled block for AI commentary — no raw Markdown headers."""
     clean = _sanitize_ai_commentary(text)
-    st.markdown('<div class="ai-terminal-panel"></div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="ai-terminal-body">{html.escape(clean).replace(chr(10), "<br>")}</div>', unsafe_allow_html=True)
+    _render_html('<div class="ai-terminal-panel"></div>')
+    _render_html(
+        f'<div class="ai-terminal-body">{html.escape(clean).replace(chr(10), "<br>")}</div>'
+    )
 
 
 def _scorecard_tone(score: int) -> str:
@@ -1158,12 +1187,12 @@ def _render_investment_scorecard(report: object) -> None:
                 <div class="scorecard-progress-track">
                     <div class="scorecard-progress-fill {tone}" style="width:{pct}%;"></div>
                 </div>
-                <div class="scorecard-progress-rationale">{html.escape(item.rationale)}</div>
+                <div class="scorecard-progress-rationale">{html.escape(_clean_ai_html(item.rationale))}</div>
             </div>
             """
         )
 
-    st.markdown(
+    _render_html(
         f"""
         <div class="scorecard-grid-title">
             Master Investment Scorecard · 大師級多空量化項目評價表
@@ -1171,8 +1200,7 @@ def _render_investment_scorecard(report: object) -> None:
         <div class="scorecard-progress-grid">
             {"".join(cards)}
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -2324,7 +2352,7 @@ def _render_company_detail(report: StockReport) -> None:
     mode_label = _strategy_label_for_mode(report.strategy_mode)
     st.markdown(
         f'<p class="subtitle" style="margin-bottom:0.35rem;">'
-        f"{report.symbol} · {report.company_name}</p>",
+        f"{html.escape(report.symbol)} · {html.escape(report.company_name)}</p>",
         unsafe_allow_html=True,
     )
     st.markdown(f'<span class="strategy-badge">{html.escape(mode_label)}</span>', unsafe_allow_html=True)
@@ -2767,6 +2795,7 @@ def _render_sidebar() -> None:
     if st.sidebar.button("清除快取資料"):
         load_report_for_symbol.clear()
         load_company_narrative.clear()
+        clear_gemini_llm_cache()
         _validate_ticker_symbol.clear()
         _fetch_market_history.clear()
         _cached_index_constituents.clear()

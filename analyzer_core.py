@@ -1,6 +1,7 @@
 """Core dividend / FCF analysis with 100-point safety scoring."""
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from io import StringIO
 
 import pandas as pd
 import requests
+import streamlit as st
 import yfinance as yf
 
 # Neutral default universe for CLI / cron when no custom list is supplied
@@ -1492,8 +1494,6 @@ def _attach_value_defense_score(opp: TurnaroundOpportunity) -> TurnaroundOpportu
 
 def _attach_reason_tag(opp: TurnaroundOpportunity) -> TurnaroundOpportunity:
     """Enrich with Gemini mispricing reason tag (fallback when API unavailable)."""
-    from llm_processor import generate_turnaround_reason_tag
-
     try:
         news = fetch_ticker_live_news(opp.symbol)
         news_block = format_live_news_block(news)
@@ -1510,7 +1510,7 @@ def _attach_reason_tag(opp: TurnaroundOpportunity) -> TurnaroundOpportunity:
         f"{opp.price_vs_52w_high if opp.price_vs_52w_high is not None else 'N/A'}\n\n"
         f"Recent headlines:\n{news_block}"
     )
-    tag, comment = generate_turnaround_reason_tag(context)
+    tag, comment = _cached_llm_turnaround_reason_tag(opp.symbol.upper(), context)
     opp.reason_tag = tag
     opp.reason_comment = comment
     return opp
@@ -2972,14 +2972,105 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
     return "\n".join(sections)
 
 
-def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardItem]]:
-    """Return (commentary markdown, investment scorecard rows)."""
-    from llm_processor import (
-        generate_growth_analyst_commentary,
-        generate_investment_scorecard,
-        generate_value_analyst_commentary,
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_llm_value_commentary(symbol: str, context: str) -> str | None:
+    """Cache value-mode analyst commentary — keyed by ticker + context."""
+    from llm_processor import generate_value_analyst_commentary
+
+    return generate_value_analyst_commentary(context)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_llm_growth_commentary(symbol: str, context: str) -> str | None:
+    """Cache growth-mode analyst commentary — keyed by ticker + context."""
+    from llm_processor import generate_growth_analyst_commentary
+
+    return generate_growth_analyst_commentary(context)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_llm_investment_scorecard(
+    symbol: str,
+    growth: bool,
+    context: str,
+) -> tuple[tuple[str, int, str], ...] | None:
+    """Cache Master Investment Scorecard rows as a hashable tuple."""
+    from llm_processor import generate_investment_scorecard
+
+    raw = generate_investment_scorecard(context, growth=growth)
+    if not raw:
+        return None
+    return tuple(
+        (str(row["dimension"]), int(row["score"]), str(row["rationale"]))
+        for row in raw
     )
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_llm_turnaround_reason_tag(symbol: str, context: str) -> tuple[str, str]:
+    """Cache Gemini mispricing reason tag for turnaround radar hits."""
+    from llm_processor import generate_turnaround_reason_tag
+
+    return generate_turnaround_reason_tag(context)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_llm_value_narrative(
+    symbol: str,
+    strategy_mode: str,
+    business_summary: str,
+    sector: str,
+    industry: str,
+) -> str:
+    """Cache value-mode tech narrative (static business summary)."""
+    from llm_processor import generate_company_narrative_text
+
+    return generate_company_narrative_text(symbol, business_summary, sector, industry)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_llm_growth_narrative(
+    symbol: str,
+    strategy_mode: str,
+    business_summary: str,
+    sector: str,
+    industry: str,
+    live_news_text: str,
+    trend_json: str,
+    master_text: str,
+) -> str:
+    """Cache growth-mode live-news narrative — trend serialized as JSON."""
+    from llm_processor import generate_growth_narrative_text
+
+    trend: dict | None = None
+    if trend_json:
+        try:
+            trend = json.loads(trend_json)
+        except json.JSONDecodeError:
+            trend = None
+    return generate_growth_narrative_text(
+        symbol,
+        business_summary,
+        sector,
+        industry,
+        live_news_text=live_news_text,
+        trend_signal=trend,
+        master_text=master_text,
+    )
+
+
+def clear_gemini_llm_cache() -> None:
+    """Clear all Streamlit-cached Gemini LLM responses (sidebar refresh)."""
+    _cached_llm_value_commentary.clear()
+    _cached_llm_growth_commentary.clear()
+    _cached_llm_investment_scorecard.clear()
+    _cached_llm_turnaround_reason_tag.clear()
+    _cached_llm_value_narrative.clear()
+    _cached_llm_growth_narrative.clear()
+
+
+def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardItem]]:
+    """Return (commentary markdown, investment scorecard rows)."""
     growth = is_growth_strategy(report.strategy_mode)
     strategy_tagline = (
         "🚀 動能成長模式 · 機構多空對峙 / 部門拆解 / 風險邊界"
@@ -2987,11 +3078,12 @@ def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardIt
         else "🛡️ 價值防禦模式 · 葛拉漢安全邊際 / 巴菲特護城河視角"
     )
     context = _format_master_commentary_context(report)
+    sym = report.symbol.upper()
 
     if growth:
-        llm_text = generate_growth_analyst_commentary(context)
+        llm_text = _cached_llm_growth_commentary(sym, context)
     else:
-        llm_text = generate_value_analyst_commentary(context)
+        llm_text = _cached_llm_value_commentary(sym, context)
 
     if llm_text:
         commentary = (
@@ -3005,15 +3097,15 @@ def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardIt
     else:
         commentary = _build_value_analyst_commentary(report)
 
-    raw_scorecard = generate_investment_scorecard(context, growth=growth)
+    raw_scorecard = _cached_llm_investment_scorecard(sym, growth, context)
     if raw_scorecard:
         scorecard = [
             ScorecardItem(
-                dimension=str(row["dimension"]),
-                score=int(row["score"]),
-                rationale=str(row["rationale"]),
+                dimension=dim,
+                score=score,
+                rationale=rationale,
             )
-            for row in raw_scorecard
+            for dim, score, rationale in raw_scorecard
         ]
     else:
         scorecard = _build_scorecard_fallback(report)
@@ -3245,8 +3337,6 @@ def build_company_narrative(
     strategy_mode: str = STRATEGY_VALUE,
 ) -> NarrativeResult:
     """Generate tech narrative — static summary (value) or live-news fusion (growth)."""
-    from llm_processor import generate_company_narrative_text, generate_growth_narrative_text
-
     sym = symbol.upper().strip()
     yf_ticker = yf.Ticker(sym)
     summary, sector, industry = fetch_business_summary(sym)
@@ -3268,17 +3358,19 @@ def build_company_narrative(
         info = _safe_ticker_info(yf_ticker, sym)
         master = fetch_master_metrics(sym, info, ticker=yf_ticker)
         master_block = format_master_metrics_block(master)
-        text = generate_growth_narrative_text(
+        trend_json = json.dumps(trend or {}, sort_keys=True, default=str)
+        text = _cached_llm_growth_narrative(
             sym,
-            summary,
-            sector,
-            industry,
-            live_news_text=live_block,
-            trend_signal=trend,
-            master_text=master_block,
+            mode,
+            summary or "",
+            sector or "",
+            industry or "",
+            live_block,
+            trend_json,
+            master_block,
         )
         if text.startswith("⚠️") and summary:
-            text = generate_company_narrative_text(sym, summary, sector, industry)
+            text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
         elif not text.strip():
             text = summary or "暫無可用敘事資料。"
         return NarrativeResult(text=text, live_news_degraded=degraded)
@@ -3288,7 +3380,7 @@ def build_company_narrative(
             text="尚無官方業務摘要（longBusinessSummary），暫時無法生成科技敘事。",
             live_news_degraded=False,
         )
-    text = generate_company_narrative_text(sym, summary, sector, industry)
+    text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
     return NarrativeResult(text=text, live_news_degraded=False)
 
 
