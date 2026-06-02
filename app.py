@@ -43,7 +43,8 @@ GRADE_COLORS = {
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
 SCORE_COLUMNS_VALUE = ("綜合安全得分", "FCF分", "股息分", "發放率分", "Beta分")
 SCORE_COLUMNS_GROWTH = ("綜合安全得分", "營收潛力分", "技術面分", "Beta彈性分")
-STRATEGY_SESSION_KEY = "strategy_mode"
+GLOBAL_STRATEGY_KEY = "global_strategy_mode"
+ACTIVE_STRATEGY_KEY = "active_strategy"
 DEFAULT_HUNTER_UNIVERSE = "AAPL, MSFT, NVDA, INTC, BA, DIS, JNJ, KO"
 SCAN_UNIVERSE_OPTIONS: dict[str, str] = {
     "🇺🇸 道瓊 30 (Dow 30) - 快速掃描": "dow30",
@@ -90,7 +91,7 @@ COMPANY_TAB_KEY = "company_tab_radio"
 
 def _current_strategy_mode() -> str:
     """Return canonical strategy code (value/growth) from session state."""
-    selected = st.session_state.get(STRATEGY_SESSION_KEY, STRATEGY_LABEL_VALUE)
+    selected = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
     return normalize_strategy_mode(selected)
 
 
@@ -108,17 +109,18 @@ def _strategy_weight_caption(mode: str | None = None) -> str:
 
 
 def _on_strategy_mode_change() -> None:
+    st.session_state[ACTIVE_STRATEGY_KEY] = st.session_state.get(GLOBAL_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
     st.rerun()
 
 
 def _render_strategy_control() -> None:
     labels = list(STRATEGY_LABELS)
-    if st.session_state.get(STRATEGY_SESSION_KEY) not in labels:
-        st.session_state[STRATEGY_SESSION_KEY] = STRATEGY_LABEL_VALUE
+    if st.session_state.get(GLOBAL_STRATEGY_KEY) not in labels:
+        st.session_state[GLOBAL_STRATEGY_KEY] = STRATEGY_LABEL_VALUE
     st.radio(
         "🎯 投資策略戰術",
         labels,
-        key=STRATEGY_SESSION_KEY,
+        key=GLOBAL_STRATEGY_KEY,
         horizontal=True,
         on_change=_on_strategy_mode_change,
     )
@@ -141,7 +143,13 @@ def _render_narrative_card(symbol: str) -> None:
         unsafe_allow_html=True,
     )
     narrative = load_company_narrative(symbol)
-    safe_text = html.escape(narrative).replace("\n", "<br>")
+    
+    # Strip out any AI-generated title line to avoid duplication
+    lines = narrative.split("\n")
+    if lines and (lines[0].startswith("#") or lines[0].startswith("**") or "科技願景" in lines[0]):
+        lines = lines[1:]
+    
+    safe_text = html.escape("\n".join(lines).strip()).replace("\n", "<br>")
     st.markdown(
         f'<div class="fx-narrative-card"><div class="fx-narrative-body">{safe_text}</div></div>',
         unsafe_allow_html=True,
@@ -320,7 +328,7 @@ def _inject_css() -> None:
             background: linear-gradient(165deg, #1e293b 0%, #151d2b 100%);
             border: none;
             border-radius: 10px;
-            padding: 1rem 1.15rem;
+            padding: 1.25rem 1.5rem;
             margin: 0.35rem 0 1.25rem;
             box-shadow: 0 8px 22px rgba(2, 6, 23, 0.22);
         }}
@@ -818,11 +826,14 @@ def _init_session_state() -> None:
         st.session_state.focus_ticker = None
     if "scroll_to_analysis" not in st.session_state:
         st.session_state.scroll_to_analysis = False
-    if STRATEGY_SESSION_KEY not in st.session_state:
-        st.session_state[STRATEGY_SESSION_KEY] = STRATEGY_LABEL_VALUE
+    if GLOBAL_STRATEGY_KEY not in st.session_state:
+        st.session_state[GLOBAL_STRATEGY_KEY] = STRATEGY_LABEL_VALUE
+    if ACTIVE_STRATEGY_KEY not in st.session_state:
+        st.session_state[ACTIVE_STRATEGY_KEY] = st.session_state[GLOBAL_STRATEGY_KEY]
 
 
 def _unlock_ticker_for_analysis(symbol: str) -> None:
+    st.session_state[ACTIVE_STRATEGY_KEY] = st.session_state.get(GLOBAL_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
     sym = symbol.upper().strip()
     if not sym:
         return
@@ -839,6 +850,8 @@ def _unlock_ticker_for_analysis(symbol: str) -> None:
 
 def _load_watchlist_tickers() -> None:
     """Parse watchlist input, validate tickers, append only valid symbols."""
+    st.session_state[ACTIVE_STRATEGY_KEY] = st.session_state.get(GLOBAL_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
+
     parsed = _parse_ticker_list(st.session_state.get(WATCHLIST_INPUT_KEY, ""))
     if not parsed:
         st.warning("請輸入至少一個有效股票代號（以逗號分隔）。")
