@@ -186,3 +186,79 @@ export function sanitizeRedTeamFindings(
     (f) => f?.title?.trim() && f?.description?.trim()
   );
 }
+
+export interface StockAnalysisResult {
+  data: AnalyzeResponse;
+  usedMock: boolean;
+  apiError: string | null;
+  validationError: string | null;
+}
+
+/** Server-safe analyze fetch with Zod validation + mock fallback. */
+export async function getStockAnalysis(
+  ticker: string,
+  mode: StrategyMode
+): Promise<StockAnalysisResult> {
+  const { parseAnalyzeResponse, safeParseAnalyzeResponse } = await import(
+    "@/lib/schemas"
+  );
+
+  const sym = ticker.toUpperCase().trim();
+  let apiError: string | null = null;
+  let validationError: string | null = null;
+
+  try {
+    const raw = await fetchJson<unknown>(
+      `/api/v1/analyze/${encodeURIComponent(sym)}?mode=${mode}`
+    );
+    const parsed = safeParseAnalyzeResponse(raw);
+    if (parsed.success) {
+      return {
+        data: {
+          ...parsed.data,
+          redTeamFindings: sanitizeRedTeamFindings(parsed.data.redTeamFindings),
+          dataSource: parsed.data.dataSource ?? "live",
+        },
+        usedMock: false,
+        apiError: null,
+        validationError: null,
+      };
+    }
+    validationError = parsed.error;
+    console.warn(`[api] validation failed for ${sym}:`, parsed.error);
+  } catch (error) {
+    apiError =
+      error instanceof ApiClientError
+        ? error.message
+        : error instanceof Error
+          ? error.message
+          : "Unknown API error";
+    console.warn(`[api] analyze failed for ${sym}:`, apiError);
+  }
+
+  const mock = mockAnalyzeResponse(sym, mode);
+  try {
+    const validated = parseAnalyzeResponse(mock);
+    return {
+      data: validated,
+      usedMock: true,
+      apiError,
+      validationError,
+    };
+  } catch {
+    return {
+      data: mock,
+      usedMock: true,
+      apiError,
+      validationError,
+    };
+  }
+}
+
+export function hasDeathPenalty(
+  data: AnalyzeResponse
+): boolean {
+  const critical = data.redTeamFindings?.some((f) => f.severity === "critical");
+  const capped = (data.scorecard.quality.value ?? 0) <= 69;
+  return Boolean(critical || capped);
+}

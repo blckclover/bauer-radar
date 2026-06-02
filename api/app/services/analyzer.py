@@ -77,20 +77,79 @@ def _fmt_pct(value: float | None, *, signed: bool = False) -> str:
 
 
 def _build_metrics(report: StockReport, growth: bool) -> list[MetricItem]:
+    """Extended master-variable grid for dashboard + stock detail pages."""
     m = report.master
+
+    def _pe() -> MetricItem:
+        return MetricItem(
+            id="forward-pe",
+            label="Forward P/E",
+            value=f"{m.forward_pe:.1f}x" if m.forward_pe is not None else "N/A",
+            tooltip="Forward 十二個月本益比",
+        )
+
+    def _peg() -> MetricItem:
+        return MetricItem(
+            id="peg",
+            label="前瞻 PEG",
+            value=f"{m.peg_ratio:.2f}" if m.peg_ratio is not None else "N/A",
+            subtext="成長/估值剪刀差",
+            tooltip="PEG 剪刀差 · 成長 vs 估值",
+        )
+
+    def _fcf_yield() -> MetricItem:
+        return MetricItem(
+            id="fcf-yield",
+            label="FCF Yield",
+            value=_fmt_pct(m.fcf_yield),
+            tooltip="FCF / 市值",
+        )
+
+    def _roic() -> MetricItem:
+        return MetricItem(
+            id="roic",
+            label="ROIC",
+            value=_fmt_pct(m.roic),
+            tooltip="投入資本回報率",
+        )
+
+    def _fcf_payout() -> MetricItem:
+        return MetricItem(
+            id="fcf-payout",
+            label="FCF 支付率",
+            value=_fmt_pct(m.fcf_payout_ratio),
+            tooltip="股息 / 自由現金流 · >90% 死亡懲罰",
+        )
+
+    def _nd_ebitda() -> MetricItem:
+        return MetricItem(
+            id="nd-ebitda",
+            label="淨債務/EBITDA",
+            value=f"{float(m.net_debt_ebitda):.1f}x" if m.net_debt_ebitda is not None else "N/A",
+            tooltip="槓桿安全線 · >3.0x 死亡懲罰",
+        )
+
+    def _rev_cagr() -> MetricItem:
+        return MetricItem(
+            id="rev-cagr-5y",
+            label="5Y 營收 CAGR",
+            value=_fmt_pct(m.revenue_cagr_5y, signed=True)
+            if m.revenue_cagr_5y is not None
+            else "N/A",
+            tooltip="五年營收複合年增率",
+        )
+
     if growth:
         return [
-            MetricItem(
-                id="peg",
-                label="前瞻 PEG",
-                value=f"{m.peg_ratio:.2f}" if m.peg_ratio is not None else "N/A",
-                subtext="成長/估值剪刀差",
-            ),
+            _pe(),
+            _peg(),
             MetricItem(
                 id="capex",
                 label="CapEx 擴張率",
-                value=_fmt_pct(m.capex_growth, signed=True) if m.capex_growth is not None else "N/A",
-                subtext="季 YoY",
+                value=_fmt_pct(m.capex_growth, signed=True)
+                if m.capex_growth is not None
+                else "N/A",
+                subtext="季 YoY · 產業擴張",
             ),
             MetricItem(
                 id="surprise",
@@ -106,33 +165,18 @@ def _build_metrics(report: StockReport, growth: bool) -> list[MetricItem]:
                 value=_fmt_pct(m.gross_margins),
                 subtext="定價權 proxy",
             ),
+            _fcf_yield(),
+            _nd_ebitda(),
         ]
 
     return [
-        MetricItem(
-            id="roic",
-            label="ROIC",
-            value=_fmt_pct(m.roic),
-            tooltip="投入資本回報率",
-        ),
-        MetricItem(
-            id="peg",
-            label="前瞻 PEG",
-            value=f"{m.peg_ratio:.2f}" if m.peg_ratio is not None else "N/A",
-            tooltip="成長/估值剪刀差",
-        ),
-        MetricItem(
-            id="fcf-yield",
-            label="FCF Yield",
-            value=_fmt_pct(m.fcf_yield),
-            tooltip="FCF / 市值",
-        ),
-        MetricItem(
-            id="nd-ebitda",
-            label="淨債務/EBITDA",
-            value=f"{float(m.net_debt_ebitda):.1f}x" if m.net_debt_ebitda is not None else "N/A",
-            tooltip="槓桿安全線",
-        ),
+        _pe(),
+        _peg(),
+        _fcf_yield(),
+        _roic(),
+        _fcf_payout(),
+        _nd_ebitda(),
+        _rev_cagr(),
     ]
 
 

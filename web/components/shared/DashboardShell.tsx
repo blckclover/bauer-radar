@@ -1,6 +1,7 @@
 "use client";
 
 import { AlertTriangle, Loader2 } from "lucide-react";
+import Link from "next/link";
 import { useMemo, useState } from "react";
 
 import { DashboardSidebar } from "@/components/shared/DashboardSidebar";
@@ -32,9 +33,11 @@ import type { StrategyMode, WatchlistEntry } from "@/types";
 function WatchlistTable({
   items,
   isLoading,
+  strategyMode,
 }: {
   items: WatchlistEntry[];
   isLoading: boolean;
+  strategyMode: StrategyMode;
 }) {
   if (isLoading && !items.length) {
     return (
@@ -69,7 +72,14 @@ function WatchlistTable({
               key={row.symbol}
               className="border-b border-border/40 last:border-0 hover:bg-muted/20"
             >
-              <td className="px-4 py-3 font-mono font-semibold">{row.symbol}</td>
+              <td className="px-4 py-3 font-mono font-semibold">
+                <Link
+                  href={`/stock/${row.symbol}?mode=${strategyMode}`}
+                  className="text-primary hover:underline"
+                >
+                  {row.symbol}
+                </Link>
+              </td>
               <td className="px-4 py-3 text-muted-foreground">{row.companyName}</td>
               <td className="px-4 py-3 tabular-nums">{row.qualityScore.toFixed(1)}</td>
               <td className="px-4 py-3 tabular-nums">{row.valuationScore.toFixed(1)}</td>
@@ -210,9 +220,14 @@ export function DashboardShell() {
           <section className="space-y-4">
             {scorecard ? (
               <div className="flex flex-wrap items-center gap-3">
-                <Badge variant="outline" className="font-mono">
-                  {scorecard.symbol}
-                </Badge>
+                <Link href={`/stock/${scorecard.symbol}?mode=${strategyMode}`}>
+                  <Badge
+                    variant="outline"
+                    className="cursor-pointer font-mono hover:border-primary"
+                  >
+                    {scorecard.symbol}
+                  </Badge>
+                </Link>
                 <h2 className="text-lg font-semibold text-foreground">
                   {scorecard.companyName}
                 </h2>
@@ -337,7 +352,11 @@ export function DashboardShell() {
             <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
               綜合摘要 · Watchlist Summary
             </h3>
-            <WatchlistTable items={watchlist} isLoading={watchlistLoading} />
+            <WatchlistTable
+              items={watchlist}
+              isLoading={watchlistLoading}
+              strategyMode={strategyMode}
+            />
           </section>
         </div>
       </main>

@@ -61,7 +61,19 @@ web/
 └── types/index.ts
 ```
 
-## Phase 3 (Suggested)
+## Phase 3: Stock Detail Page
+
+`/stock/[ticker]?mode=value|growth` — Server Component fetches `GET /api/v1/analyze/{ticker}` with Zod validation and mock fallback.
+
+### Key files
+
+- `app/stock/[ticker]/page.tsx` — async server fetch
+- `app/stock/[ticker]/loading.tsx` — skeleton
+- `components/stock/StockDetailView.tsx` — page layout
+- `components/stock/StockHeroScores.tsx` — dual hero scores + death penalty UI
+- `lib/schemas.ts` — Zod validation
+
+## Phase 4 (Suggested)
 
 - `/stock/[ticker]` full detail page wired to analyze + narrative APIs
 - `/reversal-scan` page + `POST /api/v1/hunter/scan`
