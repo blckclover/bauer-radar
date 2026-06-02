@@ -1259,14 +1259,15 @@ def score_revenue_potential_component(
 def score_growth_momentum_component(
     trend: dict[str, float | str | None] | None,
 ) -> ScoreDetail:
-    """Momentum trigger — full score when price clears both SMA20 and SMA50."""
+    """Momentum structure — full score when price clears both SMA20 and SMA50."""
     max_pts = WEIGHT_GROWTH_MOMENTUM
+    category = "技術面動能結構"
     if not trend:
         return ScoreDetail(
-            "技術面扣扳機",
+            category,
             max_pts,
             0.0,
-            "趨勢數據不足，無法評估右側扣扳機。",
+            "趨勢數據不足，無法評估中期均線動能結構。",
         )
 
     signal = str(trend.get("current_signal", "Hold"))
@@ -1275,32 +1276,32 @@ def score_growth_momentum_component(
         sma_20 = float(trend.get("sma_20", 0))
         sma_50 = float(trend.get("sma_50", 0))
     except (TypeError, ValueError):
-        return ScoreDetail("技術面扣扳機", max_pts, 0.0, "均線數據格式異常。")
+        return ScoreDetail(category, max_pts, 0.0, "均線數據格式異常。")
 
     above_20 = price > sma_20
     above_50 = price > sma_50
 
     if above_20 and above_50:
         earned = max_pts
-        band = "🔥 突破站上均線・波段多頭雛形"
+        band = "📈 價格站上中期均線群 · 右側結構確立（確認價格轉入中期上升軌道）"
     elif above_20 and not above_50:
         earned = max_pts * 0.72
-        band = "已站上 SMA20，正在挑戰 SMA50（右側起跑初期）"
+        band = "收盤站上 SMA20，中期均線群尚未完全確認"
     elif above_50 and not above_20:
         earned = max_pts * 0.55
-        band = "價格在 SMA50 之上但 SMA20 下方（整理/回踩）"
+        band = "價格高於 SMA50 但低於 SMA20（整理區間）"
     elif signal == "Wait":
         earned = max_pts * 0.18
-        band = "弱勢下跌 · 尚未出現右側訊號"
+        band = "弱勢結構 · 右側動能尚未確立"
     else:
         earned = max_pts * 0.08
-        band = "均線下方 · 等待底部確認"
+        band = "均線下方 · 等待結構修復"
 
     rationale = (
         f"收盤 ${price:.2f} | SMA20 ${sma_20:.2f} | SMA50 ${sma_50:.2f} · "
         f"{band}，本項得 {earned:.1f}/{max_pts:.0f} 分。"
     )
-    return ScoreDetail("技術面扣扳機", max_pts, round(earned, 1), rationale)
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
 
 def score_growth_beta_component(beta: float | None) -> ScoreDetail:
@@ -1316,7 +1317,7 @@ def score_growth_beta_component(beta: float | None) -> ScoreDetail:
 
     if 1.1 <= beta <= 1.8:
         earned = max_pts
-        band = "黃金爆發級距 1.1–1.8"
+        band = "理想彈性區間 1.1–1.8"
     elif 0.8 <= beta < 1.1:
         earned = max_pts * 0.65
         band = "偏低彈性 0.8–1.1"
@@ -1325,7 +1326,7 @@ def score_growth_beta_component(beta: float | None) -> ScoreDetail:
         band = "高彈性 1.8–2.5"
     elif beta > 2.5:
         earned = max_pts * 0.12
-        band = "過度妖股 >2.5"
+        band = "波動率過高 >2.5"
     elif beta < 0.5:
         earned = max_pts * 0.15
         band = "毫無動能 <0.5"
@@ -1345,7 +1346,7 @@ def _growth_excluded_component(category: str, note: str) -> ScoreDetail:
 def grade_from_score(total: float, *, growth: bool = False) -> tuple[str, str]:
     if growth:
         if total >= 85:
-            return "🚀", "強勢右側標的"
+            return "📈", "右側結構確立"
         if total >= 70:
             return "🟡", "動能蓄勢中"
         return "🔴", "趨勢待確認"
@@ -1475,7 +1476,8 @@ def _format_growth_commentary_context(report: StockReport) -> str:
         )
         if above_both:
             lines.append(
-                "- MANDATORY: Emphasize right-side breakout / bullish base (🔥 突破站上均線・波段多頭雛形)."
+                "- MANDATORY: State price above mid-term MA cluster; right-side structure established; "
+                "confirm transition into mid-term uptrend. Avoid retail lexicon (no 多頭雛形/飆股/爆發)."
             )
     return "\n".join(lines)
 
@@ -1506,8 +1508,8 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
         except (TypeError, ValueError):
             breakout = False
         breakout_line = (
-            "- **🔥 突破站上均線・波段多頭雛形** — 收盤同時站上 SMA20 & SMA50，"
-            "右側動能標的，具備波段交易勝率窗口。"
+            "- **📈 價格站上中期均線群 · 右側結構確立** — 收盤同時站上 SMA20 & SMA50，"
+            "確認價格轉入中期上升軌道。"
             if breakout
             else f"- 交叉訊號：**{ts.get('current_signal')}**"
         )
@@ -1520,8 +1522,8 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
             ]
         )
     sections.append(
-        "\n> **VC 視角結論**：本模式 **零權重** 評估 FCF / 股息 / 發放率。"
-        "聚焦 **營收/R&D 孵化潛力** 與 **均線右側扣扳機**。"
+        "\n> **機構視角結論**：本模式 **零權重** 評估 FCF / 股息 / 發放率。"
+        "聚焦 **營收/R&D 孵化潛力** 與 **中期均線動能結構**。"
     )
     return "\n".join(sections)
 
@@ -1742,7 +1744,7 @@ def reports_to_summary_df(
                 "綜合安全得分": r.total_score,
                 "等級": f"{r.grade_emoji} {r.grade_label}",
                 "營收潛力分": _detail_score(r, "營收", "預期"),
-                "技術面分": _detail_score(r, "扣扳機", "技術"),
+                "技術面分": _detail_score(r, "動能", "技術"),
                 "Beta彈性分": _detail_score(r, "Beta", "彈性"),
             }
         else:

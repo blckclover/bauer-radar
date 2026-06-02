@@ -105,7 +105,7 @@ def _strategy_label_for_mode(mode: str) -> str:
 def _strategy_weight_caption(mode: str | None = None) -> str:
     active = mode or _current_strategy_mode()
     if is_growth_strategy(active):
-        return "營收潛力40 + 技術扣扳機40 + Beta彈性20（FCF/股息不計分）"
+        return "營收潛力40 + 技術動能40 + Beta彈性20（FCF/股息不計分）"
     return "FCF40 + 股息30 + 發放率20 + Beta10"
 
 
@@ -188,7 +188,7 @@ def _render_narrative_card(symbol: str) -> None:
     if live_news_degraded and is_growth_strategy(strategy_key):
         card_html += (
             '<p class="fx-narrative-footnote">'
-            "（即時新聞流連線超時，目前顯示基礎科技敘事）"
+            "即時新聞流連線超時 · 目前顯示基礎科技敘事"
             "</p>"
         )
     st.markdown(
@@ -384,11 +384,15 @@ def _inject_css() -> None:
             font-weight: 600;
         }}
         .fx-narrative-footnote {{
-            color: #64748b;
-            font-size: 0.72rem;
-            line-height: 1.5;
-            margin-top: 0.9rem;
-            opacity: 0.88;
+            color: #475569;
+            font-size: 0.65rem;
+            line-height: 1.45;
+            margin-top: 1.05rem;
+            padding-top: 0.65rem;
+            border-top: 1px solid rgba(148, 163, 184, 0.08);
+            opacity: 0.65;
+            letter-spacing: 0.03em;
+            font-weight: 400;
         }}
         .strategy-badge {{
             display: inline-block;
@@ -1008,7 +1012,12 @@ def _render_trend_signal_block(trend: dict | None, *, growth_mode: bool = False)
         bullish_breakout = False
 
     if growth_mode and bullish_breakout:
-        border, bg, emoji, label = "#ea580c", "#fff7ed", "🔥", "突破站上均線・波段多頭雛形"
+        border, bg, emoji, label = (
+            "#14b8a6",
+            "rgba(20, 184, 166, 0.10)",
+            "📈",
+            "價格站上中期均線群 · 右側結構確立",
+        )
     else:
         border, bg, emoji, label = TREND_BADGE_STYLES.get(signal, TREND_BADGE_STYLES["Hold"])
 
