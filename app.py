@@ -15,8 +15,13 @@ from analyzer_core import (
     STRATEGY_LABEL_GROWTH,
     STRATEGY_LABEL_VALUE,
     STRATEGY_LABELS,
+    STRATEGY_VALUE,
+    MasterMetrics,
+    ScoreDetail,
     StockReport,
     TurnaroundOpportunity,
+    YearDividend,
+    YearFCF,
     analyze_symbol,
     build_company_narrative,
     detect_trend_signals,
@@ -1662,36 +1667,157 @@ def _format_dividend_table(report: StockReport) -> pd.DataFrame:
     return out
 
 
-def _render_master_metric_row(report: StockReport) -> None:
-    """Forward-looking master variables (PEG / CapEx / ROE / margin / surprise)."""
-    m = report.master
+def _rget(obj: object, key: str, default: object = None) -> object:
+    """Read ``key`` from either an object (attribute) or a dict uniformly.
 
-    def _pct(v: float | None) -> str:
-        return f"{v * 100:.1f}%" if v is not None else "N/A"
+    Tolerates None and missing keys/attributes, returning ``default``.
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        value = obj.get(key, default)
+    else:
+        value = getattr(obj, key, default)
+    return default if value is None else value
 
-    peg = f"{m.peg_ratio:.2f}" if m.peg_ratio is not None else "N/A"
-    capex = f"{m.capex_growth * 100:+.1f}%" if m.capex_growth is not None else "N/A"
-    cov = f"{m.interest_coverage:.1f}x" if m.interest_coverage is not None else "低負債"
-    if m.surprise_latest_pct is not None:
-        surprise_val = f"{m.surprise_latest_pct:+.1f}%"
-        surprise_sub = f"連續超預期 {m.surprise_beat_streak} 季"
-    elif m.surprise_sample:
+
+def _coerce_master(raw: object) -> MasterMetrics:
+    """Normalize a master-metrics payload (dict / object / None) into MasterMetrics."""
+    if isinstance(raw, MasterMetrics):
+        return raw
+    if raw is None:
+        return MasterMetrics()
+    return MasterMetrics(
+        peg_ratio=_rget(raw, "peg_ratio"),
+        capex_growth=_rget(raw, "capex_growth"),
+        capex_latest=_rget(raw, "capex_latest"),
+        roe=_rget(raw, "roe"),
+        roa=_rget(raw, "roa"),
+        gross_margins=_rget(raw, "gross_margins"),
+        interest_coverage=_rget(raw, "interest_coverage"),
+        revenue_growth=_rget(raw, "revenue_growth"),
+        surprise_latest_pct=_rget(raw, "surprise_latest_pct"),
+        surprise_beat_streak=_rget(raw, "surprise_beat_streak", 0),
+        surprise_sample=_rget(raw, "surprise_sample", 0),
+        surprise_beats=_rget(raw, "surprise_beats", 0),
+    )
+
+
+def _coerce_score_detail(raw: object) -> ScoreDetail:
+    if isinstance(raw, ScoreDetail):
+        return raw
+    return ScoreDetail(
+        category=str(_rget(raw, "category", "")),
+        max_points=float(_rget(raw, "max_points", 0.0) or 0.0),
+        earned=float(_rget(raw, "earned", 0.0) or 0.0),
+        rationale=str(_rget(raw, "rationale", "")),
+    )
+
+
+def _coerce_year_fcf(raw: object) -> YearFCF:
+    if isinstance(raw, YearFCF):
+        return raw
+    return YearFCF(
+        fiscal_year=int(_rget(raw, "fiscal_year", 0) or 0),
+        period_end=str(_rget(raw, "period_end", "")),
+        free_cash_flow=float(_rget(raw, "free_cash_flow", 0.0) or 0.0),
+        source=str(_rget(raw, "source", "")),
+    )
+
+
+def _coerce_year_div(raw: object) -> YearDividend:
+    if isinstance(raw, YearDividend):
+        return raw
+    return YearDividend(
+        calendar_year=int(_rget(raw, "calendar_year", 0) or 0),
+        dividend_per_share=float(_rget(raw, "dividend_per_share", 0.0) or 0.0),
+        yoy_growth=_rget(raw, "yoy_growth"),
+    )
+
+
+def _coerce_report(report: object) -> StockReport:
+    """Accept a StockReport OR a dict and return a fully-typed StockReport.
+
+    Guarantees attribute-style access for every downstream rendering helper
+    (charts, AI commentary, tables) regardless of backend payload shape.
+    """
+    if isinstance(report, StockReport):
+        return report
+    if not isinstance(report, dict):
+        # Unknown object that already supports attribute access — pass through.
+        return report  # type: ignore[return-value]
+
+    master = _coerce_master(report.get("master") or report.get("master_metrics"))
+    details = [_coerce_score_detail(d) for d in (report.get("score_details") or [])]
+    fcf_history = [_coerce_year_fcf(y) for y in (report.get("fcf_history") or [])]
+    div_history = [_coerce_year_div(y) for y in (report.get("div_history") or [])]
+
+    return StockReport(
+        symbol=str(report.get("symbol", "")),
+        company_name=str(report.get("company_name", "")),
+        fcf_history=fcf_history,
+        div_history=div_history,
+        payout_ratio=report.get("payout_ratio"),
+        beta=report.get("beta"),
+        score_details=details,
+        total_score=float(report.get("total_score", 0.0) or 0.0),
+        grade_label=str(report.get("grade_label", "")),
+        grade_emoji=str(report.get("grade_emoji", "")),
+        analyst_commentary=str(report.get("analyst_commentary", "")),
+        fcf_pass=report.get("fcf_pass"),
+        fcf_note=str(report.get("fcf_note", "")),
+        div_pass=report.get("div_pass"),
+        div_note=str(report.get("div_note", "")),
+        trend_signal=report.get("trend_signal"),
+        strategy_mode=str(report.get("strategy_mode", STRATEGY_VALUE)),
+        master=master,
+    )
+
+
+def _render_master_metric_row(report: object) -> None:
+    """Forward-looking master variables (PEG / CapEx / ROE / margin / surprise).
+
+    Tolerates both StockReport objects and raw dict payloads.
+    """
+    m = _rget(report, "master", None)
+    if m is None:
+        m = _rget(report, "master_metrics", None)
+
+    peg_v = _rget(m, "peg_ratio")
+    capex_v = _rget(m, "capex_growth")
+    cov_v = _rget(m, "interest_coverage")
+    gross_v = _rget(m, "gross_margins")
+    roe_v = _rget(m, "roe")
+    surprise_pct = _rget(m, "surprise_latest_pct")
+    surprise_streak = _rget(m, "surprise_beat_streak", 0)
+    surprise_sample = _rget(m, "surprise_sample", 0)
+
+    def _pct(v: object) -> str:
+        return f"{float(v) * 100:.1f}%" if v is not None else "N/A"
+
+    peg = f"{float(peg_v):.2f}" if peg_v is not None else "N/A"
+    capex = f"{float(capex_v) * 100:+.1f}%" if capex_v is not None else "N/A"
+    cov = f"{float(cov_v):.1f}x" if cov_v is not None else "低負債"
+    if surprise_pct is not None:
+        surprise_val = f"{float(surprise_pct):+.1f}%"
+        surprise_sub = f"連續超預期 {surprise_streak} 季"
+    elif surprise_sample:
         surprise_val = "—"
-        surprise_sub = f"連續超預期 {m.surprise_beat_streak} 季"
+        surprise_sub = f"連續超預期 {surprise_streak} 季"
     else:
         surprise_val, surprise_sub = "N/A", "預期偏差數據不足"
 
-    if is_growth_strategy(report.strategy_mode):
+    if is_growth_strategy(str(_rget(report, "strategy_mode", STRATEGY_VALUE))):
         items = [
             ("前瞻 PEG", peg, "成長/估值剪刀差"),
             ("CapEx 擴張率", capex, "季 YoY · 產業擴張領先"),
-            ("毛利率", _pct(m.gross_margins), "定價權 proxy"),
+            ("毛利率", _pct(gross_v), "定價權 proxy"),
             ("近一季 Surprise", surprise_val, surprise_sub),
         ]
     else:
         items = [
-            ("ROE", _pct(m.roe), "股東資金回報質量"),
-            ("毛利率", _pct(m.gross_margins), "定價權 / 轉嫁通膨"),
+            ("ROE", _pct(roe_v), "股東資金回報質量"),
+            ("毛利率", _pct(gross_v), "定價權 / 轉嫁通膨"),
             ("利息保障倍數", cov, "EBIT / 利息 · 護城河"),
             ("近一季 Surprise", surprise_val, surprise_sub),
         ]
@@ -1699,6 +1825,7 @@ def _render_master_metric_row(report: StockReport) -> None:
 
 
 def _render_company_detail(report: StockReport) -> None:
+    report = _coerce_report(report)
     mode_label = _strategy_label_for_mode(report.strategy_mode)
     st.markdown(
         f'<p class="subtitle" style="margin-bottom:0.35rem;">'
