@@ -56,14 +56,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.warning(
-    "⚠️ **此 Streamlit 版本即將退役** — 請改用 Next.js 新介面："
-    " [http://localhost:3000](http://localhost:3000) · "
-    "功能包含 Dashboard、個股深度分析、逆向轉機股雷達。"
-    " Streamlit 僅保留作為後備工具。",
-    icon="🚀",
-)
-
 GRADE_COLORS = {
     "財務防禦確立": "#22c55e",
     "體質穩健": "#eab308",
@@ -450,15 +442,15 @@ def _inject_css() -> None:
             background-color: #121212 !important;
         }}
         .block-container {{
-            padding-top: 3.75rem;
+            padding-top: 1.25rem;
             padding-bottom: 2.5rem;
             max-width: 1480px;
         }}
         [data-testid="stMainBlockContainer"] {{
-            padding-top: 0.75rem;
+            padding-top: 0.5rem;
         }}
         [data-testid="stAppViewContainer"] .main .block-container {{
-            padding-top: 3.75rem;
+            padding-top: 1.25rem;
         }}
         [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] {{
             gap: 1.15rem;
@@ -987,7 +979,7 @@ def _inject_css() -> None:
         .subtitle {{
             color: var(--text-muted);
             font-size: 0.92rem;
-            margin-bottom: 1.35rem;
+            margin-bottom: 0.85rem;
             line-height: 1.55;
         }}
         h2, h3, h4, h5 {{
