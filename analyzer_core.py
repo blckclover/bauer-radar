@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -1631,7 +1632,11 @@ def _attach_reason_tag(opp: TurnaroundOpportunity) -> TurnaroundOpportunity:
         f"{opp.price_vs_52w_high if opp.price_vs_52w_high is not None else 'N/A'}\n\n"
         f"Recent headlines:\n{news_block}"
     )
-    tag, comment = _cached_llm_turnaround_reason_tag(opp.symbol.upper(), context)
+    tag, comment = _cached_llm_turnaround_reason_tag(
+        opp.symbol.upper(),
+        STRATEGY_VALUE,
+        context,
+    )
     opp.reason_tag = tag
     opp.reason_comment = comment
     return opp
@@ -3269,45 +3274,87 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_llm_value_commentary(symbol: str, context: str) -> str | None:
-    """Cache value-mode analyst commentary — keyed by ticker + context."""
+def _cached_llm_value_commentary(symbol: str, strategy_mode: str, context: str) -> str | None:
+    """Cache value-mode analyst commentary — keyed by ticker + strategy (context is plain str)."""
     from llm_processor import generate_value_analyst_commentary
 
-    return generate_value_analyst_commentary(context)
+    sym = symbol.upper().strip()
+    mode = normalize_strategy_mode(strategy_mode)
+    for attempt in range(1, 4):
+        try:
+            result = generate_value_analyst_commentary(context)
+            if result is not None:
+                return result
+        except Exception as exc:
+            print(f"Warning: value commentary failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
+        if attempt < 3:
+            time.sleep(10)
+    return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_llm_growth_commentary(symbol: str, context: str) -> str | None:
-    """Cache growth-mode analyst commentary — keyed by ticker + context."""
+def _cached_llm_growth_commentary(symbol: str, strategy_mode: str, context: str) -> str | None:
+    """Cache growth-mode analyst commentary — keyed by ticker + strategy (context is plain str)."""
     from llm_processor import generate_growth_analyst_commentary
 
-    return generate_growth_analyst_commentary(context)
+    sym = symbol.upper().strip()
+    mode = normalize_strategy_mode(strategy_mode)
+    for attempt in range(1, 4):
+        try:
+            result = generate_growth_analyst_commentary(context)
+            if result is not None:
+                return result
+        except Exception as exc:
+            print(f"Warning: growth commentary failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
+        if attempt < 3:
+            time.sleep(10)
+    return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_llm_investment_scorecard(
     symbol: str,
-    growth: bool,
+    strategy_mode: str,
     context: str,
 ) -> tuple[tuple[str, int, str], ...] | None:
     """Cache Master Investment Scorecard rows as a hashable tuple."""
     from llm_processor import generate_investment_scorecard
 
-    raw = generate_investment_scorecard(context, growth=growth)
-    if not raw:
-        return None
-    return tuple(
-        (str(row["dimension"]), int(row["score"]), str(row["rationale"]))
-        for row in raw
-    )
+    sym = symbol.upper().strip()
+    mode = normalize_strategy_mode(strategy_mode)
+    growth = is_growth_strategy(mode)
+    for attempt in range(1, 4):
+        try:
+            raw = generate_investment_scorecard(context, growth=growth)
+            if raw:
+                return tuple(
+                    (str(row["dimension"]), int(row["score"]), str(row["rationale"]))
+                    for row in raw
+                )
+        except Exception as exc:
+            print(f"Warning: scorecard failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
+        if attempt < 3:
+            time.sleep(10)
+    return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_llm_turnaround_reason_tag(symbol: str, context: str) -> tuple[str, str]:
+def _cached_llm_turnaround_reason_tag(symbol: str, strategy_mode: str, context: str) -> tuple[str, str]:
     """Cache Gemini mispricing reason tag for turnaround radar hits."""
     from llm_processor import generate_turnaround_reason_tag
 
-    return generate_turnaround_reason_tag(context)
+    sym = symbol.upper().strip()
+    mode = normalize_strategy_mode(strategy_mode)
+    for attempt in range(1, 4):
+        try:
+            return generate_turnaround_reason_tag(context)
+        except Exception as exc:
+            print(f"Warning: reason tag failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
+        if attempt < 3:
+            time.sleep(10)
+    from llm_processor import _fallback_turnaround_reason_tag
+
+    return _fallback_turnaround_reason_tag(context)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -3375,11 +3422,12 @@ def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardIt
     )
     context = _format_master_commentary_context(report)
     sym = report.symbol.upper()
+    mode = normalize_strategy_mode(report.strategy_mode)
 
     if growth:
-        llm_text = _cached_llm_growth_commentary(sym, context)
+        llm_text = _cached_llm_growth_commentary(sym, mode, context)
     else:
-        llm_text = _cached_llm_value_commentary(sym, context)
+        llm_text = _cached_llm_value_commentary(sym, mode, context)
 
     if llm_text:
         commentary = (
@@ -3393,7 +3441,7 @@ def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardIt
     else:
         commentary = _build_value_analyst_commentary(report)
 
-    raw_scorecard = _cached_llm_investment_scorecard(sym, growth, context)
+    raw_scorecard = _cached_llm_investment_scorecard(sym, mode, context)
     if raw_scorecard:
         scorecard = [
             ScorecardItem(

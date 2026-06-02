@@ -246,20 +246,21 @@ _HTML_FENCE_TRAILING_RE = re.compile(r"\n?\s*```\s*$")
 
 def _clean_ai_html(raw: str) -> str:
     """Remove ```html / ``` markdown fences so Streamlit receives pure HTML or text."""
-    text = (raw or "").strip()
+    text = (raw or "").replace("```html", "").replace("```HTML", "").replace("```", "").strip()
     if not text:
         return ""
     block = _HTML_FENCE_BLOCK_RE.match(text)
     if block:
-        return block.group(1).strip()
+        return block.group(1).replace("```html", "").replace("```HTML", "").replace("```", "").strip()
     text = _HTML_FENCE_LEADING_RE.sub("", text)
     text = _HTML_FENCE_TRAILING_RE.sub("", text)
-    return text.strip()
+    return text.replace("```html", "").replace("```HTML", "").replace("```", "").strip()
 
 
 def _render_html(html_content: str) -> None:
     """Render custom HTML/CSS blocks — always strip AI fences and enable HTML parsing."""
-    cleaned = _clean_ai_html(html_content)
+    content = (html_content or "").replace("```html", "").replace("```HTML", "").replace("```", "").strip()
+    cleaned = _clean_ai_html(content)
     if cleaned:
         st.markdown(cleaned, unsafe_allow_html=True)
 
@@ -1086,10 +1087,10 @@ def _score_tone(value: object) -> str:
     return "tone-red"
 
 
-def _format_grade(report: StockReport) -> str:
+def _format_grade(report: object) -> str:
     """Derive grade from business quality score."""
-    growth = is_growth_strategy(report.strategy_mode)
-    quality = report.business_quality_score or report.total_score
+    growth = is_growth_strategy(_report_strategy_mode(report))
+    quality = _report_quality_score(report)
     emoji, label = grade_from_score(quality, growth=growth)
     return f"{emoji} {label}"
 
@@ -1109,9 +1110,11 @@ def _terminal_score_color(score: float | None) -> str:
     return "#EF4444"
 
 
-def _score_detail_pair(report: StockReport, *keywords: str) -> tuple[float | None, float | None]:
+def _score_detail_pair(report: object, *keywords: str) -> tuple[float | None, float | None]:
     """Return (earned, max_points) for first matching score_detail category."""
-    for detail in report.score_details:
+    details_raw = _rget(report, "score_details", None) or []
+    for raw in details_raw:
+        detail = _coerce_score_detail(raw)
         if detail.max_points <= 0:
             continue
         if any(k in detail.category for k in keywords):
@@ -1119,24 +1122,26 @@ def _score_detail_pair(report: StockReport, *keywords: str) -> tuple[float | Non
     return None, None
 
 
-def _collect_death_penalty_messages(report: StockReport) -> list[str]:
+def _collect_death_penalty_messages(report: object) -> list[str]:
     """Detect asymmetric death penalties for fatal red-flag banners."""
-    if is_growth_strategy(report.strategy_mode):
+    if is_growth_strategy(_report_strategy_mode(report)):
         return []
 
     messages: list[str] = []
-    m = report.master
+    m = _report_master(report)
 
-    if m.net_debt_ebitda is not None and m.net_debt_ebitda > NET_DEBT_EBITDA_DEATH_THRESHOLD:
+    nd_ebitda = _rget(m, "net_debt_ebitda")
+    if nd_ebitda is not None and float(nd_ebitda) > NET_DEBT_EBITDA_DEATH_THRESHOLD:
         messages.append(
-            f"🚨 致命紅旗警告：債務槓桿嚴重超標（淨債務/EBITDA {m.net_debt_ebitda:.1f}x > "
+            f"🚨 致命紅旗警告：債務槓桿嚴重超標（淨債務/EBITDA {float(nd_ebitda):.1f}x > "
             f"{NET_DEBT_EBITDA_DEATH_THRESHOLD:.0f}x），觸發財務安全一票否決，"
             f"企業品質分強制封頂 {VALUE_SCORE_DEATH_CAP:.0f}。"
         )
 
-    if m.fcf_payout_ratio is not None and m.fcf_payout_ratio > FCF_PAYOUT_DEATH_THRESHOLD:
+    fcf_pay = _rget(m, "fcf_payout_ratio")
+    if fcf_pay is not None and float(fcf_pay) > FCF_PAYOUT_DEATH_THRESHOLD:
         messages.append(
-            f"🚨 致命紅旗警告：FCF 支付率 {m.fcf_payout_ratio * 100:.1f}% 透支"
+            f"🚨 致命紅旗警告：FCF 支付率 {float(fcf_pay) * 100:.1f}% 透支"
             f"（>{FCF_PAYOUT_DEATH_THRESHOLD * 100:.0f}%），觸發現金流一票否決，"
             f"該維度歸零並額外扣 {FCF_PAYOUT_EXTRA_PENALTY:.0f} 分。"
         )
@@ -1144,10 +1149,10 @@ def _collect_death_penalty_messages(report: StockReport) -> list[str]:
     return messages
 
 
-def _render_terminal_dual_scores(report: StockReport) -> None:
+def _render_terminal_dual_scores(report: object) -> None:
     """Hero dual-track scores — Quality & Valuation (48px, semantic colors)."""
-    quality = report.business_quality_score or report.total_score
-    valuation = report.valuation_safety_score
+    quality = _report_quality_score(report)
+    valuation = _report_valuation_score(report)
     q_color = _terminal_score_color(quality)
     v_color = _terminal_score_color(valuation)
 
@@ -1172,7 +1177,7 @@ def _render_terminal_dual_scores(report: StockReport) -> None:
     )
 
 
-def _render_death_penalty_banners(report: StockReport) -> None:
+def _render_death_penalty_banners(report: object) -> None:
     """Full-width fatal red-flag banners below hero scores."""
     for msg in _collect_death_penalty_messages(report):
         _render_html(f'<div class="death-penalty-banner">{html.escape(msg)}</div>')
@@ -1272,22 +1277,20 @@ def _render_growth_dimension_grid(report: StockReport) -> None:
             )
 
 
-def _render_dimension_grid(report: StockReport) -> None:
-    if is_growth_strategy(report.strategy_mode):
+def _render_dimension_grid(report: object) -> None:
+    if is_growth_strategy(_report_strategy_mode(report)):
         _render_growth_dimension_grid(report)
     else:
         _render_value_dimension_grid(report)
 
 
-def _valuation_trap_warning(report: StockReport) -> bool:
-    quality = report.business_quality_score or report.total_score
-    val = getattr(report, "valuation_safety_score", None)
-    if val is None:
-        val = report.valuation_margin_score
+def _valuation_trap_warning(report: object) -> bool:
+    quality = _report_quality_score(report)
+    val = _report_valuation_score(report)
     return quality >= 70 and val < 50
 
 
-def _render_valuation_trap_alert(report: StockReport) -> None:
+def _render_valuation_trap_alert(report: object) -> None:
     if not _valuation_trap_warning(report):
         return
     _render_html(
@@ -1811,7 +1814,7 @@ def _build_reports_map(tickers: list[str]) -> dict[str, StockReport]:
         sym = raw.upper().strip()
         if not sym:
             continue
-        reports[sym] = load_report_for_symbol(strategy_key, sym)
+        reports[sym] = _coerce_report(load_report_for_symbol(strategy_key, sym))
     return reports
 
 
@@ -2490,6 +2493,35 @@ def _rget(obj: object, key: str, default: object = None) -> object:
     return default if value is None else value
 
 
+def _report_strategy_mode(report: object) -> str:
+    return str(_rget(report, "strategy_mode", STRATEGY_VALUE) or STRATEGY_VALUE)
+
+
+def _report_quality_score(report: object) -> float:
+    q = _rget(report, "business_quality_score", None)
+    if q is None:
+        q = _rget(report, "total_score", 0.0)
+    try:
+        return float(q or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _report_valuation_score(report: object) -> float:
+    v = _rget(report, "valuation_safety_score", None)
+    if v is None:
+        v = _rget(report, "valuation_margin_score", 0.0)
+    try:
+        return float(v or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _report_master(report: object) -> MasterMetrics:
+    raw = _rget(report, "master", None) or _rget(report, "master_metrics", None)
+    return _coerce_master(raw)
+
+
 def _coerce_master(raw: object) -> MasterMetrics:
     """Normalize a master-metrics payload (dict / object / None) into MasterMetrics."""
     if isinstance(raw, MasterMetrics):
@@ -2526,6 +2558,8 @@ def _coerce_master(raw: object) -> MasterMetrics:
         ttm_operating_margin=_rget(raw, "ttm_operating_margin"),
         ttm_gross_margin=_rget(raw, "ttm_gross_margin"),
         ttm_revenue_growth=_rget(raw, "ttm_revenue_growth"),
+        forward_pe=_rget(raw, "forward_pe"),
+        fcf_yield=_rget(raw, "fcf_yield"),
         data_as_of=str(_rget(raw, "data_as_of", "")),
     )
 
@@ -2799,9 +2833,9 @@ def _render_core_scoring_tab() -> None:
         return
 
     by_symbol = _build_reports_map(tickers)
-    reports = [by_symbol[s] for s in tickers if s in by_symbol]
+    reports = [_coerce_report(by_symbol[s]) for s in tickers if s in by_symbol]
 
-    top = [r for r in reports if (r.business_quality_score or r.total_score) >= 85]
+    top = [r for r in reports if _report_quality_score(r) >= 85]
     val_traps = [r for r in reports if _valuation_trap_warning(r)]
     _render_fx_metric_row(
         [
@@ -2811,7 +2845,7 @@ def _render_core_scoring_tab() -> None:
             ("評分權重", _strategy_short_name(mode), weight_caption),
             (
                 "均品質分",
-                _fmt1(sum((r.business_quality_score or r.total_score) for r in reports) / len(reports))
+                _fmt1(sum(_report_quality_score(r) for r in reports) / len(reports))
                 if reports
                 else "—",
             ),

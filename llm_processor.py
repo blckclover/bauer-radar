@@ -1,11 +1,15 @@
 """LLM-based news filtering for System A (Macro Watcher)."""
 from __future__ import annotations
 
+import logging
 import os
+import time
 
 from google import genai
 
 from data_fetcher import NewsItem
+
+logger = logging.getLogger(__name__)
 
 FILTER_PROMPT = (
     "你是一個冷酷的量化投資資訊過濾器。請對以下新聞進行去噪，剔除所有煽動性形容詞與無關炒作（如虛擬貨幣）。"
@@ -14,6 +18,47 @@ FILTER_PROMPT = (
     "請用極簡短的中文列點輸出。若無重要變數，請輸出『今日無重要宏觀或個股變數』。"
 )
 MODEL_NAME = "gemini-2.5-flash"
+_GEMINI_MAX_RETRIES = 3
+_GEMINI_RETRY_SLEEP_SEC = 10
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in ("429", "rate limit", "resource_exhausted", "quota", "too many requests")
+    )
+
+
+def _generate_content_with_backoff(client: genai.Client, *, model: str, contents: str) -> str:
+    """Call Gemini with exponential-style backoff on 429 / transient failures."""
+    last_exc: Exception | None = None
+    for attempt in range(1, _GEMINI_MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(model=model, contents=contents)
+            text = (response.text or "").strip()
+            if not text:
+                raise ValueError("Gemini returned an empty response.")
+            return text
+        except Exception as exc:
+            last_exc = exc
+            kind = "429/rate-limit" if _is_rate_limit_error(exc) else "API"
+            logger.warning(
+                "Gemini %s error (attempt %d/%d): %s",
+                kind,
+                attempt,
+                _GEMINI_MAX_RETRIES,
+                exc,
+            )
+            print(
+                f"Warning: Gemini {kind} error (attempt {attempt}/{_GEMINI_MAX_RETRIES}): {exc}"
+            )
+            if attempt < _GEMINI_MAX_RETRIES:
+                time.sleep(_GEMINI_RETRY_SLEEP_SEC)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Gemini API failed after retries")
+
 
 GROWTH_LEXICON_CONSTRAINT = (
     "在生成技術面與資金面點評時，禁止使用「多頭雛形」「飆股」「爆發」「拉抬」「暴雷」"
@@ -158,14 +203,11 @@ def crush_and_filter_news(news_list: list[NewsItem]) -> str:
 
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
+        return _generate_content_with_backoff(
+            client,
             model=MODEL_NAME,
             contents=f"{FILTER_PROMPT}\n\n{raw_text}",
         )
-        filtered_text = (response.text or "").strip()
-        if not filtered_text:
-            raise ValueError("Gemini returned an empty response.")
-        return filtered_text
     except Exception as exc:
         print(f"Warning: Gemini API call failed ({exc}). Returning raw news.")
         return raw_text
@@ -192,14 +234,11 @@ def generate_company_narrative_text(
 
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
+        return _generate_content_with_backoff(
+            client,
             model=MODEL_NAME,
             contents=f"{NARRATIVE_SYSTEM_PROMPT}\n\n{user_block}",
         )
-        text = (response.text or "").strip()
-        if not text:
-            raise ValueError("Gemini returned an empty narrative.")
-        return text
     except Exception as exc:
         return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"
 
@@ -265,14 +304,11 @@ def generate_growth_narrative_text(
 
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
+        return _generate_content_with_backoff(
+            client,
             model=MODEL_NAME,
             contents=f"{NARRATIVE_GROWTH_LIVE_PROMPT}\n\n{user_block}",
         )
-        text = (response.text or "").strip()
-        if not text:
-            raise ValueError("Gemini returned an empty narrative.")
-        return text
     except Exception as exc:
         return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"
 
@@ -283,13 +319,14 @@ def _call_gemini(system_prompt: str, context: str) -> str | None:
         return None
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
+        text = _generate_content_with_backoff(
+            client,
             model=MODEL_NAME,
             contents=f"{system_prompt}\n\n{context.strip()}",
         )
-        text = (response.text or "").strip()
         return text or None
-    except Exception:
+    except Exception as exc:
+        print(f"Warning: Gemini commentary failed after retries: {exc}")
         return None
 
 
