@@ -1737,12 +1737,16 @@ def reports_to_summary_df(
     rows = []
     growth_mode = is_growth_strategy(strategy_mode)
     for r in reports:
+        grade_emoji, grade_label = grade_from_score(
+            r.total_score, growth=is_growth_strategy(r.strategy_mode)
+        )
+        grade_display = f"{grade_emoji} {grade_label}"
         if growth_mode:
             row = {
                 "Ticker": r.symbol,
                 "Company": r.company_name,
                 "綜合安全得分": r.total_score,
-                "等級": f"{r.grade_emoji} {r.grade_label}",
+                "等級": grade_display,
                 "營收潛力分": _detail_score(r, "營收", "預期"),
                 "技術面分": _detail_score(r, "動能", "技術"),
                 "Beta彈性分": _detail_score(r, "Beta", "彈性"),
@@ -1752,7 +1756,7 @@ def reports_to_summary_df(
                 "Ticker": r.symbol,
                 "Company": r.company_name,
                 "綜合安全得分": r.total_score,
-                "等級": f"{r.grade_emoji} {r.grade_label}",
+                "等級": grade_display,
                 "FCF分": _detail_score(r, "FCF"),
                 "股息分": _detail_score(r, "股息"),
                 "發放率分": _detail_score(r, "發放率"),

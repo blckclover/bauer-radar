@@ -24,6 +24,7 @@ from analyzer_core import (
     fcf_chart_df,
     fetch_index_constituents_safe,
     find_turnaround_opportunities,
+    grade_from_score,
     is_growth_strategy,
     normalize_strategy_mode,
     reports_to_summary_df,
@@ -100,6 +101,13 @@ def _strategy_label_for_mode(mode: str) -> str:
     if is_growth_strategy(mode):
         return STRATEGY_LABEL_GROWTH
     return STRATEGY_LABEL_VALUE
+
+
+def _strategy_short_name(mode: str | None = None) -> str:
+    active = mode or _current_strategy_mode()
+    if is_growth_strategy(active):
+        return "🚀 動能成長"
+    return "💎 價值穩健"
 
 
 def _strategy_weight_caption(mode: str | None = None) -> str:
@@ -179,7 +187,8 @@ def _format_narrative_for_card(raw: str) -> str:
 
 def _render_narrative_card(symbol: str) -> None:
     st.markdown(
-        '<p class="panel-label">💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>',
+        '<p class="panel-label fx-narrative-heading">'
+        "💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>",
         unsafe_allow_html=True,
     )
     strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
@@ -270,6 +279,9 @@ def _inject_css() -> None:
             margin: 0.35rem 0 1.1rem;
             min-height: 88px;
             box-shadow: 0 8px 22px rgba(2, 6, 23, 0.22);
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
         }}
         .fx-metric-label {{
             color: #94a3b8;
@@ -277,13 +289,23 @@ def _inject_css() -> None:
             letter-spacing: 0.05em;
             text-transform: uppercase;
             margin-bottom: 0.45rem;
+            flex-shrink: 0;
         }}
         .fx-metric-value {{
             color: #f8fafc;
-            font-size: 1.2rem;
+            font-size: 1.15rem;
             font-weight: 700;
-            line-height: 1.35;
+            line-height: 1.3;
             word-break: break-word;
+            flex-shrink: 0;
+        }}
+        .fx-metric-subtext {{
+            color: #64748b;
+            font-size: 0.68rem;
+            line-height: 1.45;
+            margin-top: 0.4rem;
+            word-break: break-word;
+            letter-spacing: 0.01em;
         }}
         .fx-table-card {{
             background: linear-gradient(165deg, #1f2937 0%, #172033 50%, #111827 100%);
@@ -365,13 +387,16 @@ def _inject_css() -> None:
             color: #94a3b8;
             margin: 0.5rem 0;
         }}
+        .fx-narrative-heading {{
+            margin-top: 1.5rem !important;
+        }}
         .fx-narrative-card {{
-            background: linear-gradient(165deg, #1e293b 0%, #151d2b 100%);
-            border: none;
+            background: #1e293b;
+            border: 1px solid rgba(100, 116, 139, 0.12);
             border-radius: 10px;
-            padding: 1.5rem;
-            margin: 0.35rem 0 1.25rem;
-            box-shadow: 0 8px 22px rgba(2, 6, 23, 0.22);
+            padding: 1.25rem;
+            margin: 0.5rem 0 1.25rem;
+            box-shadow: 0 6px 18px rgba(2, 6, 23, 0.28);
         }}
         .fx-narrative-body {{
             color: #f1f5f9;
@@ -625,27 +650,44 @@ def _score_tone(value: object) -> str:
     return "tone-red"
 
 
+def _format_grade(report: StockReport) -> str:
+    """Always derive grade from score so cached reports stay in sync with labels."""
+    growth = is_growth_strategy(report.strategy_mode)
+    emoji, label = grade_from_score(report.total_score, growth=growth)
+    return f"{emoji} {label}"
+
+
 def _grade_tone(value: object) -> str:
     text = str(value)
-    if "頂級" in text:
+    if "頂級" in text or "右側結構" in text:
         return "tone-green"
-    if "良好" in text:
+    if "良好" in text or "動能蓄勢" in text:
         return "tone-yellow"
     return "tone-red"
 
 
-def _render_fx_metric_row(items: list[tuple[str, str]]) -> None:
-    """Render a row of gradient metric cards."""
+def _render_fx_metric_row(
+    items: list[tuple[str, str] | tuple[str, str, str]],
+) -> None:
+    """Render a row of gradient metric cards. Optional third tuple element = subtext."""
     if not items:
         return
     cols = st.columns(len(items))
-    for col, (label, value) in zip(cols, items):
+    for col, item in zip(cols, items):
+        label, value = item[0], item[1]
+        subtext = item[2] if len(item) > 2 else ""
+        sub_html = (
+            f'<div class="fx-metric-subtext">{html.escape(subtext)}</div>'
+            if subtext
+            else ""
+        )
         with col:
             st.markdown(
                 f"""
                 <div class="fx-metric-card">
                     <div class="fx-metric-label">{html.escape(label)}</div>
                     <div class="fx-metric-value">{html.escape(str(value))}</div>
+                    {sub_html}
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -756,9 +798,9 @@ def _style_summary_table(df: pd.DataFrame):
 
     def color_grade(val):
         text = str(val)
-        if "頂級" in text:
+        if "頂級" in text or "右側結構" in text:
             color = "#4ade80"
-        elif "良好" in text:
+        elif "良好" in text or "動能蓄勢" in text:
             color = "#facc15"
         else:
             color = "#f87171"
@@ -1077,6 +1119,7 @@ def _fcf_bar_chart(report: StockReport, *, height: int = 400) -> go.Figure | Non
             go.Bar(
                 x=df["Fiscal Year"].astype(str),
                 y=df[y_col],
+                name="FCF",
                 marker_color=CHART_COLORS[0],
                 text=labels,
                 textposition="outside",
@@ -1125,6 +1168,7 @@ def _dps_line_chart(report: StockReport, *, height: int = 400) -> go.Figure | No
                 x=df["Year"],
                 y=df["DPS (USD)"],
                 mode="lines+markers",
+                name="DPS",
                 line=dict(color=CHART_COLORS[1], width=2.5),
                 marker=dict(size=7),
                 hovertemplate="%{x}<br>DPS: $%{y:.3f}<extra></extra>",
@@ -1302,6 +1346,7 @@ def render_technical_chart(
                 shared_xaxes=True,
                 vertical_spacing=0.04,
                 row_heights=[0.72, 0.28],
+                subplot_titles=("", ""),
             )
             price_row, vol_row = 1, 2
             chart_height = TECH_CHART_HEIGHT_VOL
@@ -1417,7 +1462,6 @@ def render_technical_chart(
             )
 
         layout_kwargs = dict(
-            title=None,
             template="plotly_dark",
             paper_bgcolor=TECH_DARK_BG,
             plot_bgcolor=TECH_DARK_BG,
@@ -1444,14 +1488,14 @@ def render_technical_chart(
                 showgrid=True,
                 gridcolor="#334155",
                 zeroline=False,
-                title="Price",
+                title_text="Price",
                 row=1,
                 col=1,
             )
             fig.update_yaxes(
                 showgrid=False,
                 zeroline=False,
-                title="Vol",
+                title_text="Vol",
                 row=2,
                 col=1,
             )
@@ -1497,7 +1541,7 @@ def render_technical_chart(
                     showgrid=True,
                     gridcolor="#334155",
                     zeroline=False,
-                    title="Price (USD)",
+                    title_text="Price (USD)",
                     showspikes=True,
                     spikemode="across",
                     spikesnap="cursor",
@@ -1506,6 +1550,9 @@ def render_technical_chart(
                 ),
             )
             fig.update_xaxes(rangeselector=range_selector)
+
+        # Plotly.js renders literal "undefined" when title is explicitly null — strip it.
+        fig.update_layout(title=dict(text=""))
 
         return fig
     except Exception:
@@ -1613,7 +1660,7 @@ def _render_company_detail(report: StockReport) -> None:
     _render_fx_metric_row(
         [
             ("綜合安全得分", _fmt1(report.total_score)),
-            ("等級", f"{report.grade_emoji} {report.grade_label}"),
+            ("等級", _format_grade(report)),
             (
                 "發放率",
                 f"{report.payout_ratio * 100:.1f}%"
@@ -1697,7 +1744,7 @@ def _render_core_scoring_tab() -> None:
         [
             ("分析標的", str(len(reports))),
             ("頂級穩健 (≥85)", str(len(top))),
-            ("評分權重", weight_caption),
+            ("評分權重", _strategy_short_name(mode), weight_caption),
             (
                 "均分",
                 _fmt1(sum(r.total_score for r in reports) / len(reports))
