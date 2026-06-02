@@ -182,8 +182,15 @@ def _render_narrative_card(symbol: str) -> None:
         '<p class="panel-label">💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>',
         unsafe_allow_html=True,
     )
-    narrative = load_company_narrative(symbol)
+    strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
+    narrative, live_news_degraded = load_company_narrative(strategy_key, symbol)
     card_html = _format_narrative_for_card(narrative)
+    if live_news_degraded and is_growth_strategy(strategy_key):
+        card_html += (
+            '<p class="fx-narrative-footnote">'
+            "（即時新聞流連線超時，目前顯示基礎科技敘事）"
+            "</p>"
+        )
     st.markdown(
         f'<div class="fx-narrative-card"><div class="fx-narrative-body">{card_html}</div></div>',
         unsafe_allow_html=True,
@@ -375,6 +382,13 @@ def _inject_css() -> None:
         .fx-narrative-body strong {{
             color: #ffffff;
             font-weight: 600;
+        }}
+        .fx-narrative-footnote {{
+            color: #64748b;
+            font-size: 0.72rem;
+            line-height: 1.5;
+            margin-top: 0.9rem;
+            opacity: 0.88;
         }}
         .strategy-badge {{
             display: inline-block;
@@ -843,8 +857,10 @@ def load_report_for_symbol(strategy_mode: str, symbol: str) -> StockReport:
 
 
 @st.cache_data(ttl=3600, show_spinner="正在生成科技敘事…")
-def load_company_narrative(symbol: str) -> str:
-    return build_company_narrative(symbol.upper())
+def load_company_narrative(strategy_mode: str, symbol: str) -> tuple[str, bool]:
+    """Cache keyed by strategy_mode + symbol; returns (body, live_news_degraded)."""
+    result = build_company_narrative(symbol.upper(), strategy_mode=strategy_mode)
+    return result.text, result.live_news_degraded
 
 
 def _init_session_state() -> None:

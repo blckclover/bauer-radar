@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from io import StringIO
 
@@ -145,6 +145,25 @@ class TurnaroundOpportunity:
     fcf_source: str
     rd_expense: float | None = None
     rd_fiscal_year: int | None = None
+
+
+NEWS_LOOKBACK_DAYS = 14
+NEWS_MIN_ITEMS = 5
+NEWS_MAX_ITEMS = 8
+
+
+@dataclass
+class LiveNewsItem:
+    title: str
+    published: str
+    summary: str = ""
+    publisher: str = ""
+
+
+@dataclass
+class NarrativeResult:
+    text: str
+    live_news_degraded: bool = False
 
 
 @dataclass
@@ -310,6 +329,138 @@ def fetch_business_summary(symbol: str) -> tuple[str, str, str]:
     sector = str(info.get("sector") or "").strip()
     industry = str(info.get("industry") or "").strip()
     return summary, sector, industry
+
+
+def _parse_news_timestamp(entry: dict) -> datetime | None:
+    """Extract publish time from a yfinance news dict."""
+    for key in ("providerPublishTime", "pubDate", "published_at", "publishDate"):
+        raw = entry.get(key)
+        if raw is None:
+            continue
+        try:
+            if isinstance(raw, (int, float)):
+                return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+            if isinstance(raw, str):
+                text = raw.strip()
+                if text.isdigit():
+                    return datetime.fromtimestamp(float(text), tz=timezone.utc)
+                return pd.Timestamp(text).to_pydatetime().replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _extract_news_summary(entry: dict) -> str:
+    """Best-effort summary from yfinance news payload."""
+    for key in ("summary", "description", "text"):
+        val = entry.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    content = entry.get("content")
+    if isinstance(content, dict):
+        for key in ("summary", "description", "title"):
+            val = content.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return ""
+
+
+def fetch_ticker_live_news(
+    symbol: str,
+    *,
+    lookback_days: int = NEWS_LOOKBACK_DAYS,
+    max_items: int = NEWS_MAX_ITEMS,
+    ticker: yf.Ticker | None = None,
+) -> list[LiveNewsItem]:
+    """
+    Fetch recent ticker-specific headlines via yfinance ``ticker.news``.
+
+    Returns up to ``max_items`` stories within ``lookback_days`` (7–14 day window).
+    Never raises — returns empty list on failure.
+    """
+    sym = symbol.upper().strip()
+    if not sym:
+        return []
+
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=lookback_days)
+    t = ticker or yf.Ticker(sym)
+
+    try:
+        raw_news = t.news
+    except Exception:
+        return []
+
+    if not isinstance(raw_news, list) or not raw_news:
+        return []
+
+    parsed: list[tuple[datetime, LiveNewsItem]] = []
+    for entry in raw_news:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or "").strip()
+        if not title:
+            continue
+
+        published_dt = _parse_news_timestamp(entry)
+        if published_dt and published_dt < cutoff:
+            continue
+
+        published_label = (
+            published_dt.strftime("%Y-%m-%d")
+            if published_dt
+            else "Recent"
+        )
+        parsed.append(
+            (
+                published_dt or datetime.now(tz=timezone.utc),
+                LiveNewsItem(
+                    title=title,
+                    published=published_label,
+                    summary=_extract_news_summary(entry),
+                    publisher=str(entry.get("publisher") or entry.get("source") or "").strip(),
+                ),
+            )
+        )
+
+    parsed.sort(key=lambda row: row[0], reverse=True)
+    items = [item for _, item in parsed[:max_items]]
+    if len(items) < NEWS_MIN_ITEMS and len(raw_news) >= NEWS_MIN_ITEMS:
+        # Relax date filter if feed is sparse but headlines exist
+        relaxed: list[LiveNewsItem] = []
+        for entry in raw_news:
+            if not isinstance(entry, dict):
+                continue
+            title = str(entry.get("title") or "").strip()
+            if not title:
+                continue
+            published_dt = _parse_news_timestamp(entry)
+            relaxed.append(
+                LiveNewsItem(
+                    title=title,
+                    published=published_dt.strftime("%Y-%m-%d") if published_dt else "Recent",
+                    summary=_extract_news_summary(entry),
+                    publisher=str(entry.get("publisher") or entry.get("source") or "").strip(),
+                )
+            )
+            if len(relaxed) >= max_items:
+                break
+        if len(relaxed) > len(items):
+            items = relaxed[:max_items]
+    return items
+
+
+def format_live_news_block(items: list[LiveNewsItem]) -> str:
+    """Plain-text block for Gemini — live news section."""
+    if not items:
+        return ""
+    lines: list[str] = []
+    for index, item in enumerate(items, start=1):
+        lines.append(f"{index}. [{item.published}] {item.title}")
+        if item.publisher:
+            lines.append(f"   Publisher: {item.publisher}")
+        if item.summary:
+            lines.append(f"   Summary: {item.summary}")
+    return "\n".join(lines)
 
 
 def fetch_fcf_from_yfinance(symbol: str, years: int = YEARS_REQUIRED) -> list[YearFCF]:
@@ -1501,15 +1652,53 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
     return report
 
 
-def build_company_narrative(symbol: str) -> str:
-    """Generate Gemini-powered tech narrative from yfinance business summary."""
-    from llm_processor import generate_company_narrative_text
+def build_company_narrative(
+    symbol: str,
+    *,
+    strategy_mode: str = STRATEGY_VALUE,
+) -> NarrativeResult:
+    """Generate tech narrative — static summary (value) or live-news fusion (growth)."""
+    from llm_processor import generate_company_narrative_text, generate_growth_narrative_text
 
     sym = symbol.upper().strip()
+    yf_ticker = yf.Ticker(sym)
     summary, sector, industry = fetch_business_summary(sym)
+    mode = normalize_strategy_mode(strategy_mode)
+
+    if is_growth_strategy(mode):
+        live_news: list[LiveNewsItem] = []
+        degraded = False
+        try:
+            live_news = fetch_ticker_live_news(sym, ticker=yf_ticker)
+            if not live_news:
+                degraded = True
+        except Exception:
+            live_news = []
+            degraded = True
+
+        trend = detect_trend_signals(yf_ticker)
+        live_block = format_live_news_block(live_news)
+        text = generate_growth_narrative_text(
+            sym,
+            summary,
+            sector,
+            industry,
+            live_news_text=live_block,
+            trend_signal=trend,
+        )
+        if text.startswith("⚠️") and summary:
+            text = generate_company_narrative_text(sym, summary, sector, industry)
+        elif not text.strip():
+            text = summary or "暫無可用敘事資料。"
+        return NarrativeResult(text=text, live_news_degraded=degraded)
+
     if not summary:
-        return "尚無官方業務摘要（longBusinessSummary），暫時無法生成科技敘事。"
-    return generate_company_narrative_text(sym, summary, sector, industry)
+        return NarrativeResult(
+            text="尚無官方業務摘要（longBusinessSummary），暫時無法生成科技敘事。",
+            live_news_degraded=False,
+        )
+    text = generate_company_narrative_text(sym, summary, sector, industry)
+    return NarrativeResult(text=text, live_news_degraded=False)
 
 
 def analyze_all(
