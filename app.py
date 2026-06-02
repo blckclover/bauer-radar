@@ -842,13 +842,24 @@ def _turnaround_to_dataframe(candidates: list[TurnaroundOpportunity]) -> pd.Data
     rows = []
     for c in candidates:
         rd = _fmt_money_large(c.rd_expense) if c.rd_expense else "—"
+        coverage = (
+            f"{c.interest_coverage:.1f}x" if c.interest_coverage is not None else "低負債"
+        )
+        if c.gross_margin is not None:
+            margin = f"{c.gross_margin:.1f}%"
+            if c.gross_margin_yoy_change_pp is not None:
+                sign = "+" if c.gross_margin_yoy_change_pp >= 0 else ""
+                margin += f"（YoY {sign}{c.gross_margin_yoy_change_pp:.1f}pp）"
+        else:
+            margin = "—"
         rows.append(
             {
                 "代號": c.symbol,
                 "公司名稱": c.company_name,
                 "相對半年高點跌幅": f"-{c.drawdown_pct:.1f}%",
                 "最新財年 FCF": _fmt_money_large(c.latest_fcf),
-                "FCF 財年": c.latest_fcf_fiscal_year or "—",
+                "利息保障倍數": coverage,
+                "毛利率 (YoY)": margin,
                 "研發費 (R&D)": rd,
                 "FCF 來源": c.fcf_source,
             }
@@ -1815,15 +1826,18 @@ def _render_turnaround_hunter_tab() -> None:
     )
     st.markdown(
         '<p class="subtitle">'
-        "在<strong>市場恐慌（股價大跌）</strong>中，尋找<strong>自由現金流仍為正</strong>的硬事實標的。"
+        "在<strong>市場恐慌（股價大跌）</strong>中，僅保留<strong>現金流為正、站上 20 日線、"
+        "債務護城河穩固且維持定價權</strong>的機構級轉機標的。"
         "</p>",
         unsafe_allow_html=True,
     )
 
     _render_fx_metric_row(
         [
-            ("篩選門檻", "半年高點跌幅 > 15%"),
-            ("硬事實", "最新財年 FCF > 0"),
+            ("價格濾網", "半年高點跌幅 > 15%", "且最新 Close 必須站上 SMA20（右側打底）"),
+            ("現金流濾網", "最新財年 FCF > 0", "SEC EDGAR 優先，Yahoo 備援"),
+            ("債務護城河", "利息保障倍數 > 3x", "EBIT / 利息費用，避開結構脆弱者"),
+            ("定價權濾網", "毛利率 YoY 穩定", "最新一季毛利率 YoY 跌幅 ≤ 5pp"),
             ("上次命中", str(len(st.session_state.hunter_results))),
         ]
     )
@@ -1863,11 +1877,14 @@ def _render_turnaround_hunter_tab() -> None:
             st.caption(f"已載入 **{len(parsed)}** 檔成分股 · 來源：Wikipedia 最新成分股")
 
     if index_key == "sp500":
-        st.info("⏱ 掃描標普 500 全市場需時約 **1–3 分鐘**，請耐心等候…")
+        st.info(
+            "⏱ 標普 500 全市場 × 五道濾網（含均線、利息保障、毛利率 YoY）"
+            "需時約 **3–6 分鐘**，請耐心等候…"
+        )
     elif index_key == "nasdaq100":
-        st.caption("⏱ 掃描納斯達克 100 約需 **30–90 秒**。")
+        st.caption("⏱ 掃描納斯達克 100（五道濾網）約需 **1–2 分鐘**。")
     elif index_key == "dow30":
-        st.caption("⏱ 道瓊 30 快速掃描，通常 **30 秒內** 完成。")
+        st.caption("⏱ 道瓊 30 多濾網掃描，通常 **30–60 秒** 完成。")
 
     col_btn, col_hint = st.columns([1, 2])
     with col_btn:
@@ -1897,14 +1914,15 @@ def _render_turnaround_hunter_tab() -> None:
 
     if not results:
         st.warning(
-            "尚未命中，或尚未執行掃描。"
-            " 請確認清單內有標的符合「半年跌幅 > 15% 且最新 FCF 仍為正」。"
+            "尚未命中，或尚未執行掃描。本雷達採四道機構級濾網（半年跌幅 > 15%、FCF > 0、"
+            "站上 SMA20、利息保障 > 3x、毛利率 YoY 穩定），命中數偏少屬正常現象。"
         )
         return
 
     st.success(
         f"從 {st.session_state.hunter_scanned_count} 檔標的中，"
-        f"找到 **{len(results)}** 檔「股價恐慌但現金流仍穩」的轉機候選。"
+        f"找到 **{len(results)}** 檔通過全部機構級濾網的轉機候選"
+        "（股價恐慌但現金流穩健、站上右側、債務護城河與定價權皆過關）。"
     )
 
     result_df = _turnaround_to_dataframe(results)
@@ -1940,6 +1958,28 @@ def _render_turnaround_hunter_tab() -> None:
                     ("最新 FCF", _fmt_money_large(opp.latest_fcf)),
                 ]
             )
+            cov_value = (
+                f"{opp.interest_coverage:.1f}x"
+                if opp.interest_coverage is not None
+                else "低負債結構"
+            )
+            if opp.gross_margin is not None:
+                gm_value = f"{opp.gross_margin:.1f}%"
+                gm_sub = (
+                    f"YoY {'+' if (opp.gross_margin_yoy_change_pp or 0) >= 0 else ''}"
+                    f"{opp.gross_margin_yoy_change_pp:.1f}pp"
+                    if opp.gross_margin_yoy_change_pp is not None
+                    else "YoY 數據不足"
+                )
+            else:
+                gm_value, gm_sub = "—", "毛利率數據不足"
+            _render_fx_metric_row(
+                [
+                    ("利息保障倍數", cov_value, "EBIT / 利息費用 · 門檻 > 3x"),
+                    ("最新季毛利率", gm_value, gm_sub),
+                    ("右側結構", "✅ 站上 SMA20", "已通過技術面右側濾網"),
+                ]
+            )
             if opp.rd_expense:
                 st.markdown(
                     f"**科技新知儲備（R&D）**：{_fmt_money_large(opp.rd_expense)} "
@@ -1963,9 +2003,14 @@ def _render_sidebar() -> None:
     st.sidebar.header("逆向轉機股雷達")
     st.sidebar.markdown(
         """
+        **五道機構級防禦濾網：**
         1. 半年股價跌幅 **> 15%**
         2. 最新財年 **FCF > 0**（SEC 優先）
-        3. 可選 R&D 事實參考
+        3. 技術面 **Close > SMA20**（右側打底）
+        4. **利息保障倍數 > 3x**（EBIT / 利息）
+        5. **毛利率 YoY** 跌幅 ≤ 5pp（定價權）
+
+        *R&D 事實為輔助參考，不作篩選*
         """
     )
     st.sidebar.header("右側趨勢訊號")

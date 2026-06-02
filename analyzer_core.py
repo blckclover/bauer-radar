@@ -61,6 +61,34 @@ RND_ROW_NAMES = (
     "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
 )
 
+# Institutional defensive filters appended to the reversal radar
+INTEREST_COVERAGE_MIN = 3.0
+# Max allowed YoY gross-margin contraction in percentage points before a
+# ticker is treated as having lost pricing power.
+GROSS_MARGIN_YOY_MAX_DECLINE_PP = 5.0
+EBIT_ROW_NAMES = (
+    "EBIT",
+    "Ebit",
+    "OperatingIncome",
+    "Operating Income",
+    "NormalizedEBITDA",
+)
+INTEREST_EXPENSE_ROW_NAMES = (
+    "InterestExpense",
+    "Interest Expense",
+    "InterestExpenseNonOperating",
+    "NetInterestIncome",
+)
+GROSS_PROFIT_ROW_NAMES = (
+    "GrossProfit",
+    "Gross Profit",
+)
+TOTAL_REVENUE_ROW_NAMES = (
+    "TotalRevenue",
+    "Total Revenue",
+    "OperatingRevenue",
+)
+
 # Index scan universes — Wikipedia constituents with hardcoded fallback
 WIKI_INDEX_PAGES: dict[str, str] = {
     "dow30": "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
@@ -145,6 +173,9 @@ class TurnaroundOpportunity:
     fcf_source: str
     rd_expense: float | None = None
     rd_fiscal_year: int | None = None
+    interest_coverage: float | None = None
+    gross_margin: float | None = None
+    gross_margin_yoy_change_pp: float | None = None
 
 
 NEWS_LOOKBACK_DAYS = 14
@@ -661,13 +692,114 @@ def fetch_latest_rd_expense(
     return None, None
 
 
+def _passes_right_side_filter(
+    ticker: yf.Ticker,
+) -> tuple[bool, dict | None]:
+    """Technical right-side gate: latest Close must sit above SMA20.
+
+    Returns (passed, trend_signal). When the SMA cannot be computed we treat the
+    structure as unverifiable and reject (institutional defensive default).
+    """
+    try:
+        trend = detect_trend_signals(ticker)
+    except Exception:
+        return False, None
+    if not trend:
+        return False, None
+    try:
+        close = float(trend.get("current_price"))
+        sma_20 = float(trend.get("sma_20"))
+    except (TypeError, ValueError):
+        return False, trend
+    return close > sma_20, trend
+
+
+def _interest_coverage_filter(
+    ticker: yf.Ticker,
+) -> tuple[bool, float | None]:
+    """Debt-moat gate: interest coverage = EBIT / |Interest Expense|.
+
+    Only rejects a ticker that actually carries interest expense and whose
+    coverage is below `INTEREST_COVERAGE_MIN`. Debt-light names (no meaningful
+    interest expense) or missing data pass through untouched.
+    """
+    try:
+        income = ticker.get_income_stmt(freq="yearly")
+    except Exception:
+        return True, None
+    if income is None or income.empty:
+        return True, None
+
+    ebit_row = _pick_row(income, *EBIT_ROW_NAMES)
+    interest_row = _pick_row(income, *INTEREST_EXPENSE_ROW_NAMES)
+    if ebit_row is None or interest_row is None:
+        return True, None
+
+    try:
+        latest_col = sorted(income.columns, reverse=True)[0]
+        ebit = float(ebit_row.get(latest_col))
+        interest = abs(float(interest_row.get(latest_col)))
+    except (TypeError, ValueError, IndexError):
+        return True, None
+
+    if pd.isna(ebit) or pd.isna(interest) or interest <= 0:
+        return True, None
+
+    coverage = ebit / interest
+    return coverage >= INTEREST_COVERAGE_MIN, round(coverage, 2)
+
+
+def _gross_margin_filter(
+    ticker: yf.Ticker,
+) -> tuple[bool, float | None, float | None]:
+    """Pricing-power gate: latest-quarter gross margin vs the year-ago quarter.
+
+    Rejects when gross margin contracted by more than
+    `GROSS_MARGIN_YOY_MAX_DECLINE_PP` percentage points YoY (loss of pricing
+    power). Missing quarterly data passes through.
+
+    Returns (passed, latest_margin, yoy_change_pp).
+    """
+    try:
+        quarterly = ticker.quarterly_income_stmt
+    except Exception:
+        return True, None, None
+    if quarterly is None or quarterly.empty:
+        return True, None, None
+
+    gross_row = _pick_row(quarterly, *GROSS_PROFIT_ROW_NAMES)
+    revenue_row = _pick_row(quarterly, *TOTAL_REVENUE_ROW_NAMES)
+    if gross_row is None or revenue_row is None:
+        return True, None, None
+
+    cols = sorted(quarterly.columns, reverse=True)
+    if len(cols) < 5:
+        return True, None, None
+
+    latest_col, yoy_col = cols[0], cols[4]
+    try:
+        gm_latest = float(gross_row.get(latest_col)) / float(revenue_row.get(latest_col))
+        gm_yoy = float(gross_row.get(yoy_col)) / float(revenue_row.get(yoy_col))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return True, None, None
+
+    if pd.isna(gm_latest) or pd.isna(gm_yoy):
+        return True, None, None
+
+    change_pp = (gm_latest - gm_yoy) * 100.0
+    passed = change_pp >= -GROSS_MARGIN_YOY_MAX_DECLINE_PP
+    return passed, round(gm_latest * 100.0, 1), round(change_pp, 1)
+
+
 def _screen_single_turnaround(
     symbol: str,
     min_drawdown_pct: float,
     lookback_period: str,
 ) -> TurnaroundOpportunity | None:
     """
-    Per-ticker pipeline: price drawdown gate → FCF fact check → R&D fact.
+    Per-ticker pipeline with institutional defensive filters:
+      price drawdown gate → positive FCF fact → right-side (Close > SMA20)
+      → interest-coverage moat → gross-margin pricing-power → R&D fact reserve.
 
     Wrapped in try/except at the caller; returns None if any gate fails or
     data is missing (never raises).
@@ -692,6 +824,22 @@ def _screen_single_turnaround(
     if fcf_val is None or fcf_val <= 0:
         return None
 
+    # Filter 1 — technical right-side: reject names still chinning below SMA20.
+    right_side_ok, _trend = _passes_right_side_filter(ticker)
+    if not right_side_ok:
+        return None
+
+    # Filter 2 — debt moat: interest coverage (EBIT / interest) must clear 3.0x
+    # whenever the ticker actually carries interest expense.
+    coverage_ok, interest_coverage = _interest_coverage_filter(ticker)
+    if not coverage_ok:
+        return None
+
+    # Filter 3 — pricing power: gross margin must not collapse YoY.
+    margin_ok, gross_margin, gm_change_pp = _gross_margin_filter(ticker)
+    if not margin_ok:
+        return None
+
     rd_expense, rd_year = fetch_latest_rd_expense(sym, ticker=ticker)
 
     return TurnaroundOpportunity(
@@ -705,6 +853,9 @@ def _screen_single_turnaround(
         fcf_source=fcf_source or "unknown",
         rd_expense=rd_expense,
         rd_fiscal_year=rd_year,
+        interest_coverage=interest_coverage,
+        gross_margin=gross_margin,
+        gross_margin_yoy_change_pp=gm_change_pp,
     )
 
 
@@ -717,24 +868,26 @@ def find_turnaround_opportunities(
     """
     Active turnaround screener: "garbage heap gold" fact detective.
 
-    Refactor notes (turnaround radar extension):
-    -----------------------------------------------
-    1. **Price gate (yfinance `.history`)** — scans each ticker for a
-       drawdown > `min_drawdown_pct` (default 15%) vs the lookback high
-       (default 6 months). Weak price alone is NOT enough; it only qualifies
-       for the hard-facts pass.
+    Refactor notes (institutional-grade reversal radar):
+    -----------------------------------------------------
+    1. **Price gate (yfinance `.history`)** — drawdown > `min_drawdown_pct`
+       (default 15%) vs the lookback high (default 6 months).
 
-    2. **Hard facts (reuse existing helpers)** — `_safe_ticker_info`,
-       `_company_name`, and `fetch_fcf` (SEC EDGAR first, Yahoo fallback)
-       verify the latest fiscal FCF is strictly positive. This strips narrative
-       noise: the market may be pessimistic, but the balance sheet still
-       generates cash.
+    2. **Positive FCF fact** — `fetch_fcf` (SEC EDGAR first, Yahoo fallback)
+       verifies the latest fiscal FCF is strictly positive.
 
-    3. **R&D fact reserve** — `fetch_latest_rd_expense` pulls the most recent
-       annual research spend when disclosed, as an optional innovation
-       capacity signal (not a filter).
+    3. **Technical right-side filter** — latest Close must sit above SMA20;
+       names still bleeding below the 20-day line are discarded.
 
-    4. **Fault isolation** — each ticker runs inside its own try/except;
+    4. **Debt-moat filter** — interest coverage (EBIT / interest expense) must
+       clear 3.0x when the ticker carries interest expense.
+
+    5. **Pricing-power filter** — latest-quarter gross margin must not contract
+       by more than 5 percentage points YoY.
+
+    6. **R&D fact reserve** — optional innovation signal (not a filter).
+
+    7. **Fault isolation** — each ticker runs inside its own try/except;
        one bad symbol never aborts the full scan.
 
     Returns candidates sorted by deepest drawdown first (largest % drop).
@@ -1283,7 +1436,7 @@ def score_growth_momentum_component(
 
     if above_20 and above_50:
         earned = max_pts
-        band = "📈 價格站上中期均線群 · 右側結構確立（確認價格轉入中期上升軌道）"
+        band = "📈 價格已站上中期均線群，呈現右側打底結構（確認價格轉入中期上升軌道）"
     elif above_20 and not above_50:
         earned = max_pts * 0.72
         band = "收盤站上 SMA20，中期均線群尚未完全確認"
@@ -1476,8 +1629,8 @@ def _format_growth_commentary_context(report: StockReport) -> str:
         )
         if above_both:
             lines.append(
-                "- MANDATORY: State price above mid-term MA cluster; right-side structure established; "
-                "confirm transition into mid-term uptrend. Avoid retail lexicon (no 多頭雛形/飆股/爆發)."
+                "- MANDATORY: Describe as 「價格已站上中期均線群，呈現右側打底結構」 and "
+                "confirm transition into mid-term uptrend. Avoid retail lexicon (no 突破/多頭雛形/飆股/爆發)."
             )
     return "\n".join(lines)
 
@@ -1508,7 +1661,7 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
         except (TypeError, ValueError):
             breakout = False
         breakout_line = (
-            "- **📈 價格站上中期均線群 · 右側結構確立** — 收盤同時站上 SMA20 & SMA50，"
+            "- **📈 價格已站上中期均線群，呈現右側打底結構** — 收盤同時站上 SMA20 & SMA50，"
             "確認價格轉入中期上升軌道。"
             if breakout
             else f"- 交叉訊號：**{ts.get('current_signal')}**"

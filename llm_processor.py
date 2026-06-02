@@ -154,7 +154,7 @@ def _format_trend_context(trend_signal: dict | None) -> str:
     ]
     if above_both:
         lines.append(
-            "- Note: Price above mid-term moving-average cluster — right-side structure established."
+            "- Note: 價格已站上中期均線群，呈現右側打底結構（右側結構確立，禁用「突破」等通俗詞）。"
         )
     lines.append(f"- Lexicon: {GROWTH_LEXICON_CONSTRAINT}")
     return "\n".join(lines)
