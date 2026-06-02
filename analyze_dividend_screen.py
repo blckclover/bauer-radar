@@ -6,7 +6,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from analyzer_core import DEFAULT_SCAN_UNIVERSE, analyze_all, reports_to_summary_df
+from analyzer_core import (
+    DEFAULT_SCAN_UNIVERSE,
+    STRATEGY_VALUE,
+    analyze_all,
+    reports_to_summary_df,
+)
 
 DEFAULT_CLI_TICKERS = list(DEFAULT_SCAN_UNIVERSE[:5])
 
@@ -21,8 +26,8 @@ def main() -> None:
             border_style="green",
         )
     )
-    reports = analyze_all(DEFAULT_CLI_TICKERS)
-    df = reports_to_summary_df(reports)
+    reports = analyze_all(DEFAULT_CLI_TICKERS, strategy_mode=STRATEGY_VALUE)
+    df = reports_to_summary_df(reports, strategy_mode=STRATEGY_VALUE)
     table = Table(title="Summary", box=box.ROUNDED)
     for col in df.columns:
         table.add_column(str(col))

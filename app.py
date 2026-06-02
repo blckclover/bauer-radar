@@ -11,8 +11,9 @@ from plotly.subplots import make_subplots
 
 from analyzer_core import (
     FALLBACK_SCAN_UNIVERSE,
-    STRATEGY_GROWTH,
-    STRATEGY_VALUE,
+    STRATEGY_LABEL_GROWTH,
+    STRATEGY_LABEL_VALUE,
+    STRATEGY_LABELS,
     StockReport,
     TurnaroundOpportunity,
     analyze_symbol,
@@ -22,6 +23,8 @@ from analyzer_core import (
     fcf_chart_df,
     fetch_index_constituents_safe,
     find_turnaround_opportunities,
+    is_growth_strategy,
+    normalize_strategy_mode,
     reports_to_summary_df,
 )
 
@@ -39,13 +42,8 @@ GRADE_COLORS = {
 }
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
 SCORE_COLUMNS_VALUE = ("綜合安全得分", "FCF分", "股息分", "發放率分", "Beta分")
-SCORE_COLUMNS_GROWTH = SCORE_COLUMNS_VALUE + ("營收分", "技術面分")
-STRATEGY_MODE_KEY = "investment_strategy_mode"
-STRATEGY_OPTIONS: dict[str, str] = {
-    "🛡️ 價值防禦模式 (長線穩定、現金流、股息)": STRATEGY_VALUE,
-    "🚀 動能成長模式 (波段趨勢、技術面、科技願景)": STRATEGY_GROWTH,
-}
-STRATEGY_LABELS = list(STRATEGY_OPTIONS.keys())
+SCORE_COLUMNS_GROWTH = SCORE_COLUMNS_VALUE + ("營收成長分", "技術面分")
+STRATEGY_SESSION_KEY = "strategy_mode"
 DEFAULT_HUNTER_UNIVERSE = "AAPL, MSFT, NVDA, INTC, BA, DIS, JNJ, KO"
 SCAN_UNIVERSE_OPTIONS: dict[str, str] = {
     "🇺🇸 道瓊 30 (Dow 30) - 快速掃描": "dow30",
@@ -91,46 +89,47 @@ COMPANY_TAB_KEY = "company_tab_radio"
 
 
 def _current_strategy_mode() -> str:
-    label = st.session_state.get(STRATEGY_MODE_KEY, STRATEGY_LABELS[0])
-    return STRATEGY_OPTIONS.get(label, STRATEGY_VALUE)
+    """Return canonical strategy code (value/growth) from session state."""
+    selected = st.session_state.get(STRATEGY_SESSION_KEY, STRATEGY_LABEL_VALUE)
+    return normalize_strategy_mode(selected)
 
 
 def _strategy_label_for_mode(mode: str) -> str:
-    for label, value in STRATEGY_OPTIONS.items():
-        if value == mode:
-            return label
-    return STRATEGY_LABELS[0]
+    if is_growth_strategy(mode):
+        return STRATEGY_LABEL_GROWTH
+    return STRATEGY_LABEL_VALUE
 
 
 def _strategy_weight_caption(mode: str | None = None) -> str:
     active = mode or _current_strategy_mode()
-    if active == STRATEGY_GROWTH:
+    if is_growth_strategy(active):
         return "FCF25 + 股息10 + 發放率10 + Beta5 + 營收成長25 + 技術面25"
     return "FCF40 + 股息30 + 發放率20 + Beta10"
 
 
 def _score_columns_for_mode(mode: str | None = None) -> tuple[str, ...]:
-    if (mode or _current_strategy_mode()) == STRATEGY_GROWTH:
+    if is_growth_strategy(mode or _current_strategy_mode()):
         return SCORE_COLUMNS_GROWTH
     return SCORE_COLUMNS_VALUE
 
 
-def _render_strategy_control(*, widget_key: str = STRATEGY_MODE_KEY) -> None:
-    current = st.session_state.get(STRATEGY_MODE_KEY, STRATEGY_LABELS[0])
-    if current not in STRATEGY_LABELS:
-        current = STRATEGY_LABELS[0]
-        st.session_state[STRATEGY_MODE_KEY] = current
-    if widget_key != STRATEGY_MODE_KEY and st.session_state.get(widget_key) != current:
-        st.session_state[widget_key] = current
-    selected = st.radio(
+def _on_strategy_mode_change() -> None:
+    st.rerun()
+
+
+def _render_strategy_control() -> None:
+    st.radio(
         "🎯 投資策略戰術",
-        STRATEGY_LABELS,
-        key=widget_key,
+        list(STRATEGY_LABELS),
+        key=STRATEGY_SESSION_KEY,
         horizontal=True,
+        on_change=_on_strategy_mode_change,
     )
-    if selected != st.session_state.get(STRATEGY_MODE_KEY):
-        st.session_state[STRATEGY_MODE_KEY] = selected
-        st.rerun()
+    mode = _current_strategy_mode()
+    st.caption(
+        f"評分引擎已切換至：**{_strategy_label_for_mode(mode)}** · "
+        f"權重 `{_strategy_weight_caption(mode)}`"
+    )
 
 
 def _render_narrative_card(symbol: str) -> None:
@@ -778,9 +777,9 @@ def _validate_ticker_symbol(symbol: str) -> bool:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_report_for_symbol(symbol: str, strategy_mode: str = STRATEGY_VALUE) -> StockReport:
-    """Per-symbol cache keyed by strategy mode."""
-    mode = strategy_mode if strategy_mode in (STRATEGY_VALUE, STRATEGY_GROWTH) else STRATEGY_VALUE
+def load_report_for_symbol(symbol: str, strategy_mode: str) -> StockReport:
+    """Per-symbol cache keyed by symbol + strategy_mode."""
+    mode = normalize_strategy_mode(strategy_mode)
     return analyze_symbol(symbol.upper(), strategy_mode=mode)
 
 
@@ -806,8 +805,8 @@ def _init_session_state() -> None:
         st.session_state.focus_ticker = None
     if "scroll_to_analysis" not in st.session_state:
         st.session_state.scroll_to_analysis = False
-    if STRATEGY_MODE_KEY not in st.session_state:
-        st.session_state[STRATEGY_MODE_KEY] = STRATEGY_LABELS[0]
+    if STRATEGY_SESSION_KEY not in st.session_state:
+        st.session_state[STRATEGY_SESSION_KEY] = STRATEGY_LABEL_VALUE
 
 
 def _unlock_ticker_for_analysis(symbol: str) -> None:
@@ -859,9 +858,9 @@ def _load_watchlist_tickers() -> None:
     st.rerun()
 
 
-def _build_reports_map(tickers: list[str], strategy_mode: str | None = None) -> dict[str, StockReport]:
-    """Load cached per-symbol reports for the active watchlist."""
-    mode = strategy_mode or _current_strategy_mode()
+def _build_reports_map(tickers: list[str]) -> dict[str, StockReport]:
+    """Load cached per-symbol reports using active strategy from session state."""
+    mode = _current_strategy_mode()
     reports: dict[str, StockReport] = {}
     for raw in tickers:
         sym = raw.upper().strip()
@@ -1430,7 +1429,7 @@ def _render_watchlist_bar() -> None:
         loaded = st.session_state.analyzed_tickers
         if loaded:
             st.caption(f"已載入 **{len(loaded)}** 檔：" + ", ".join(loaded))
-        _render_strategy_control(widget_key=STRATEGY_MODE_KEY)
+        _render_strategy_control()
 
 
 def _format_fcf_table(report: StockReport) -> pd.DataFrame:
@@ -1544,7 +1543,7 @@ def _render_core_scoring_tab() -> None:
         st.info("請從上方輸入股票代號並載入，或使用轉機雷達解鎖標的，以查看綜合摘要。")
         return
 
-    by_symbol = _build_reports_map(tickers, mode)
+    by_symbol = _build_reports_map(tickers)
     reports = [by_symbol[s] for s in tickers if s in by_symbol]
 
     top = [r for r in reports if r.total_score >= 85]
@@ -1563,7 +1562,7 @@ def _render_core_scoring_tab() -> None:
     )
 
     summary_df = _format_summary_df(
-        reports_to_summary_df(reports),
+        reports_to_summary_df(reports, strategy_mode=mode),
         score_columns=_score_columns_for_mode(mode),
     )
     st.markdown('<p class="panel-label">綜合摘要</p>', unsafe_allow_html=True)
@@ -1584,8 +1583,6 @@ def _render_company_deep_analysis() -> None:
             "請從上方輸入股票代號，或使用轉機雷達進行掃描以載入深度分析。"
         )
         return
-
-    _render_strategy_control(widget_key="strategy_detail_radio")
 
     if COMPANY_TAB_KEY not in st.session_state:
         st.session_state[COMPANY_TAB_KEY] = tickers[0]

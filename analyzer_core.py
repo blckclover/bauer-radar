@@ -30,6 +30,13 @@ WEIGHT_PAYOUT = 20.0
 WEIGHT_BETA = 10.0
 STRATEGY_VALUE = "value"
 STRATEGY_GROWTH = "growth"
+STRATEGY_LABEL_VALUE = "🛡️ 價值防禦模式 (長線穩定、現金流、股息)"
+STRATEGY_LABEL_GROWTH = "🚀 動能成長模式 (波段趨勢、技術面、科技願景)"
+STRATEGY_LABELS: tuple[str, ...] = (STRATEGY_LABEL_VALUE, STRATEGY_LABEL_GROWTH)
+STRATEGY_LABEL_TO_MODE: dict[str, str] = {
+    STRATEGY_LABEL_VALUE: STRATEGY_VALUE,
+    STRATEGY_LABEL_GROWTH: STRATEGY_GROWTH,
+}
 WEIGHT_GROWTH_FCF = 25.0
 WEIGHT_GROWTH_DIV = 10.0
 WEIGHT_GROWTH_PAYOUT = 10.0
@@ -1203,17 +1210,29 @@ def build_analyst_commentary(report: StockReport) -> str:
     return "\n".join(sections)
 
 
+def normalize_strategy_mode(strategy_mode: str) -> str:
+    """Map UI label or internal code to canonical value/growth."""
+    if strategy_mode in (STRATEGY_VALUE, STRATEGY_GROWTH):
+        return strategy_mode
+    return STRATEGY_LABEL_TO_MODE.get(strategy_mode, STRATEGY_VALUE)
+
+
+def is_growth_strategy(strategy_mode: str) -> bool:
+    return normalize_strategy_mode(strategy_mode) == STRATEGY_GROWTH
+
+
 def compute_scores(
     fcf_rows: list[YearFCF],
     div_rows: list[YearDividend],
     payout: float | None,
     beta: float | None,
     *,
-    strategy_mode: str = STRATEGY_VALUE,
+    strategy_mode: str,
     trend_signal: dict[str, float | str | None] | None = None,
     info: dict | None = None,
 ) -> tuple[list[ScoreDetail], float, str, str]:
-    if strategy_mode == STRATEGY_GROWTH:
+    mode = normalize_strategy_mode(strategy_mode)
+    if mode == STRATEGY_GROWTH:
         revenue_growth = _safe_info_float(info or {}, "revenueGrowth")
         details = [
             _rescale_score_detail(score_fcf_component(fcf_rows), WEIGHT_GROWTH_FCF),
@@ -1237,9 +1256,9 @@ def compute_scores(
     return details, total, emoji, label
 
 
-def analyze_symbol(symbol: str, *, strategy_mode: str = STRATEGY_VALUE) -> StockReport:
+def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
     sym = symbol.upper()
-    mode = strategy_mode if strategy_mode in (STRATEGY_VALUE, STRATEGY_GROWTH) else STRATEGY_VALUE
+    mode = normalize_strategy_mode(strategy_mode)
     ticker = yf.Ticker(sym)
     info = _safe_ticker_info(ticker, sym)
     name = _company_name(info, sym)
@@ -1321,9 +1340,13 @@ def _detail_score(report: StockReport, *keywords: str) -> float | None:
     return None
 
 
-def reports_to_summary_df(reports: list[StockReport]) -> pd.DataFrame:
+def reports_to_summary_df(
+    reports: list[StockReport],
+    *,
+    strategy_mode: str,
+) -> pd.DataFrame:
     rows = []
-    growth_mode = any(r.strategy_mode == STRATEGY_GROWTH for r in reports)
+    growth_mode = is_growth_strategy(strategy_mode)
     for r in reports:
         row = {
             "Ticker": r.symbol,
@@ -1336,7 +1359,7 @@ def reports_to_summary_df(reports: list[StockReport]) -> pd.DataFrame:
             "Beta分": _detail_score(r, "Beta"),
         }
         if growth_mode:
-            row["營收分"] = _detail_score(r, "營收")
+            row["營收成長分"] = _detail_score(r, "營收")
             row["技術面分"] = _detail_score(r, "SMA")
         rows.append(row)
     return pd.DataFrame(rows)
