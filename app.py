@@ -124,6 +124,11 @@ SCAN_UNIVERSE_OPTIONS: dict[str, str] = {
     "✍️ 自訂輸入 (Custom Input)": "custom",
 }
 SCAN_UNIVERSE_LABELS = list(SCAN_UNIVERSE_OPTIONS.keys())
+HUNTER_PRESET_KEY = "hunter_scan_preset"
+HUNTER_PRESET_OPTIONS: dict[str, str] = {
+    "Dow 30 (快速)": "dow30",
+    "S&P 500 (完整)": "sp500",
+}
 HUNTER_SCAN_UNIVERSE_KEY = "hunter_scan_universe_label"
 HUNTER_CUSTOM_INPUT_KEY = "hunter_custom_input"
 WATCHLIST_INPUT_KEY = "watchlist_input"
@@ -922,7 +927,7 @@ def _inject_css() -> None:
 
 def _score_tone(value: object) -> str:
     try:
-        score = float(value)
+        score = float(str(value).replace("🛡️", "").strip())
     except (TypeError, ValueError):
         return ""
     if score >= 85:
@@ -1073,6 +1078,8 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
                 tone = _score_tone(raw)
             elif col == "等級":
                 tone = _grade_tone(raw)
+            elif col in ("防禦模式得分", "綜合安全得分"):
+                tone = _score_tone(raw)
             elif col == "相對半年高點跌幅":
                 tone = "tone-red"
             elif col == "最新財年 FCF" and str(raw).startswith("$"):
@@ -1272,6 +1279,21 @@ def _turnaround_to_dataframe(candidates: list[TurnaroundOpportunity]) -> pd.Data
         nd_ebitda = (
             f"{c.net_debt_ebitda:.1f}x" if c.net_debt_ebitda is not None else "—"
         )
+        if c.value_defense_score is not None:
+            score_cell = f"{c.value_defense_score:.1f}"
+            if c.value_defense_score >= 85:
+                score_cell = f"🛡️ {score_cell}"
+        else:
+            score_cell = "—"
+        if c.reason_tag:
+            tag_cell = f"{c.reason_tag} {c.reason_comment}".strip()
+        else:
+            tag_cell = "—"
+        peg_cell = f"{c.peg_ratio:.2f}" if c.peg_ratio is not None else "—"
+        if c.price_vs_52w_high is not None:
+            off_high = f"-{(1 - c.price_vs_52w_high) * 100:.1f}%"
+        else:
+            off_high = "—"
         if c.gross_margin is not None:
             margin = f"{c.gross_margin:.1f}%"
             if c.gross_margin_yoy_change_pp is not None:
@@ -1283,13 +1305,16 @@ def _turnaround_to_dataframe(candidates: list[TurnaroundOpportunity]) -> pd.Data
             {
                 "代號": c.symbol,
                 "公司名稱": c.company_name,
+                "防禦模式得分": score_cell,
+                "錯殺原因標籤": tag_cell,
                 "相對半年高點跌幅": f"-{c.drawdown_pct:.1f}%",
+                "距52週高點": off_high,
+                "PEG": peg_cell,
                 "最新財年 FCF": _fmt_money_large(c.latest_fcf),
-                "利息保障倍數": coverage,
                 "淨債務/EBITDA": nd_ebitda,
+                "利息保障倍數": coverage,
                 "毛利率 (YoY)": margin,
                 "研發費 (R&D)": rd,
-                "FCF 來源": c.fcf_source,
             }
         )
     return pd.DataFrame(rows)
@@ -1353,8 +1378,8 @@ def _init_session_state() -> None:
         st.session_state.analyzed_tickers = []
     if WATCHLIST_INPUT_KEY not in st.session_state:
         st.session_state[WATCHLIST_INPUT_KEY] = ""
-    if HUNTER_SCAN_UNIVERSE_KEY not in st.session_state:
-        st.session_state[HUNTER_SCAN_UNIVERSE_KEY] = SCAN_UNIVERSE_LABELS[0]
+    if HUNTER_PRESET_KEY not in st.session_state:
+        st.session_state[HUNTER_PRESET_KEY] = list(HUNTER_PRESET_OPTIONS.keys())[0]
     if HUNTER_CUSTOM_INPUT_KEY not in st.session_state:
         st.session_state[HUNTER_CUSTOM_INPUT_KEY] = DEFAULT_HUNTER_UNIVERSE
     if "hunter_results" not in st.session_state:
@@ -1443,7 +1468,16 @@ def _cached_index_constituents(index_key: str) -> tuple[tuple[str, ...], str]:
 
 
 def _resolve_hunter_universe() -> tuple[list[str], str, str]:
-    """Resolve scan tickers from selected universe label."""
+    """Resolve scan tickers — preset (Dow 30 / S&P 500) or advanced selectbox."""
+    use_advanced = st.session_state.get("hunter_use_advanced", False)
+    if not use_advanced:
+        preset = st.session_state.get(
+            HUNTER_PRESET_KEY, list(HUNTER_PRESET_OPTIONS.keys())[0]
+        )
+        index_key = HUNTER_PRESET_OPTIONS.get(preset, "dow30")
+        tickers, source = _cached_index_constituents(index_key)
+        return list(tickers), source, preset
+
     label = st.session_state.get(HUNTER_SCAN_UNIVERSE_KEY, SCAN_UNIVERSE_LABELS[0])
     index_key = SCAN_UNIVERSE_OPTIONS.get(label, "dow30")
 
@@ -2457,67 +2491,86 @@ def _render_turnaround_hunter_tab() -> None:
     )
     st.markdown(
         '<p class="subtitle">'
-        "在<strong>市場恐慌（股價大跌）</strong>中，僅保留<strong>現金流為正、站上 20 日線、"
-        "淨槓桿 &lt; 3x、利息保障 &gt; 3x 且維持定價權</strong>的機構級轉機標的。"
-        "（SQLite 快取加速掃描）"
+        "逆向價值投資閉環 · 雷達篩選 → 🛡️ 100分防禦評分 → Gemini 錯殺標籤"
         "</p>",
         unsafe_allow_html=True,
     )
 
+    preset = st.radio(
+        "掃描母體",
+        list(HUNTER_PRESET_OPTIONS.keys()),
+        horizontal=True,
+        key=HUNTER_PRESET_KEY,
+        help="S&P 500 完整掃描依賴 SQLite 本地快取以降低 API 阻斷風險。",
+    )
+    use_advanced = st.toggle("進階母體選項（Nasdaq 100 / 自訂）", key="hunter_use_advanced")
+
     _render_fx_metric_row(
         [
-            ("價格濾網", "半年高點跌幅 > 15%", "且最新 Close 必須站上 SMA20（右側打底）"),
-            ("現金流濾網", "最新財年 FCF > 0", "SQLite 快取 · SEC 優先"),
-            ("防破產濾網", "淨債務/EBITDA < 3x", "剔除高槓桿價值陷阱"),
-            ("債務護城河", "利息保障倍數 > 3x", "EBIT / 利息費用"),
-            ("定價權濾網", "毛利率 YoY 穩定", "YoY 跌幅 ≤ 5pp"),
+            ("價格濾網", "半年跌幅 > 15%", "Close > SMA20 右側確認"),
+            ("估值濾網", "距52週高點 ≥25% 或 PEG<1.5", "錯殺確認"),
+            ("防破產濾網", "淨債務/EBITDA < 3x", "FCF > 0 · 利息保障 > 3x"),
+            ("評分引擎", "🛡️ 100分防禦模式", "≥85 分優先排序"),
             ("上次命中", str(len(st.session_state.hunter_results))),
         ]
     )
 
-    st.markdown('<p class="panel-label">選擇掃描母體 (Scan Universe)</p>', unsafe_allow_html=True)
-    selected_label = st.selectbox(
-        "選擇掃描母體 (Scan Universe)",
-        SCAN_UNIVERSE_LABELS,
-        key=HUNTER_SCAN_UNIVERSE_KEY,
-        label_visibility="collapsed",
-    )
-    index_key = SCAN_UNIVERSE_OPTIONS[selected_label]
-
-    if index_key == "custom":
-        st.text_area(
-            "輸入股票代號（逗號或換行分隔）",
-            height=120,
-            placeholder="AAPL, MSFT, NVDA",
-            help="僅在「自訂輸入」模式下使用。",
-            key=HUNTER_CUSTOM_INPUT_KEY,
+    if use_advanced:
+        st.markdown('<p class="panel-label">進階掃描母體 (Advanced Universe)</p>', unsafe_allow_html=True)
+        selected_label = st.selectbox(
+            "選擇掃描母體 (Scan Universe)",
+            SCAN_UNIVERSE_LABELS,
+            key=HUNTER_SCAN_UNIVERSE_KEY,
+            label_visibility="collapsed",
         )
+        index_key = SCAN_UNIVERSE_OPTIONS[selected_label]
+        if index_key == "custom":
+            st.text_area(
+                "輸入股票代號（逗號或換行分隔）",
+                height=120,
+                placeholder="AAPL, MSFT, NVDA",
+                help="僅在「自訂輸入」模式下使用。",
+                key=HUNTER_CUSTOM_INPUT_KEY,
+            )
+    else:
+        if preset == "S&P 500 (完整)":
+            st.info(
+                "⏱ S&P 500 完整掃描（六道濾網 + 防禦評分 + 錯殺標籤）"
+                "依賴 SQLite 快取，約需 3–6 分鐘。"
+            )
+        else:
+            st.caption("⏱ Dow 30 快速掃描，通常 30–90 秒完成（含防禦評分）。")
 
     parsed, source, _ = _resolve_hunter_universe()
 
-    if index_key == "custom":
-        preview = ", ".join(parsed[:12]) + (" …" if len(parsed) > 12 else "")
-        st.caption(
-            f"已解析 **{len(parsed)}** 檔自訂標的："
-            + (preview if parsed else "（無）")
+    if use_advanced:
+        index_key = SCAN_UNIVERSE_OPTIONS.get(
+            st.session_state.get(HUNTER_SCAN_UNIVERSE_KEY, SCAN_UNIVERSE_LABELS[0]), "dow30"
         )
-    else:
-        if source == "fallback":
+        if index_key == "custom":
+            preview = ", ".join(parsed[:12]) + (" …" if len(parsed) > 12 else "")
             st.caption(
-                f"已載入 **{len(parsed)}** 檔成分股 · 已啟用離線市值前 20 大備用清單"
+                f"已解析 {len(parsed)} 檔自訂標的："
+                + (preview if parsed else "（無）")
+            )
+        elif source == "fallback":
+            st.caption(
+                f"已載入 {len(parsed)} 檔成分股 · 已啟用離線市值前 20 大備用清單"
             )
         else:
-            st.caption(f"已載入 **{len(parsed)}** 檔成分股 · 來源：Wikipedia 最新成分股")
-
-    if index_key == "sp500":
-        st.info(
-            "⏱ 標普 500 全市場 × 六道濾網（含防破產、均線、利息保障、毛利率 YoY）"
-            "需時約 **3–6 分鐘**，請耐心等候…"
-        )
-    elif index_key == "nasdaq100":
-        st.caption("⏱ 掃描納斯達克 100（六道濾網 · SQLite 快取）約需 **1–2 分鐘**。")
-    elif index_key == "dow30":
-        st.caption("⏱ 道瓊 30 多濾網掃描，通常 **30–60 秒** 完成。")
+            st.caption(f"已載入 {len(parsed)} 檔成分股 · 來源：Wikipedia 最新成分股")
+        if index_key == "sp500":
+            st.info(
+                "⏱ 標普 500 全市場 × 六道濾網（SQLite 快取加速）需時約 3–6 分鐘。"
+            )
+        elif index_key == "nasdaq100":
+            st.caption("⏱ 掃描納斯達克 100（六道濾網 · SQLite 快取）約需 1–2 分鐘。")
+        elif index_key == "dow30":
+            st.caption("⏱ 道瓊 30 多濾網掃描，通常 30–60 秒 完成。")
+    elif preset == "S&P 500 (完整)":
+        st.caption(f"已載入 {len(parsed)} 檔 S&P 500 成分股 · SQLite 快取已啟用")
+    else:
+        st.caption(f"已載入 {len(parsed)} 檔 Dow 30 成分股")
 
     col_btn, col_hint = st.columns([1, 2])
     with col_btn:
@@ -2535,7 +2588,8 @@ def _render_turnaround_hunter_tab() -> None:
             st.warning("請至少提供一個有效股票代號，或選擇可載入的指數成分股清單。")
         else:
             with st.spinner(
-                f"偵探引擎正在掃描 **{len(parsed)}** 檔標的，剝離市場噪音、審查核心現金流…"
+                f"偵探引擎正在掃描 {len(parsed)} 檔標的"
+                "（六道濾網 → 🛡️ 防禦評分 → Gemini 錯殺標籤）…"
             ):
                 st.session_state.hunter_results = find_turnaround_opportunities(parsed)
                 st.session_state.hunter_scanned_count = len(parsed)
@@ -2547,15 +2601,17 @@ def _render_turnaround_hunter_tab() -> None:
 
     if not results:
         st.warning(
-            "尚未命中，或尚未執行掃描。本雷達採四道機構級濾網（半年跌幅 > 15%、FCF > 0、"
-            "站上 SMA20、利息保障 > 3x、毛利率 YoY 穩定），命中數偏少屬正常現象。"
+            "尚未命中，或尚未執行掃描。本雷達採六道機構級濾網"
+            "（半年跌幅 > 15%、估值吸引力、FCF > 0、站上 SMA20、"
+            "淨槓桿 < 3x、利息保障 > 3x），命中數偏少屬正常現象。"
         )
         return
 
+    high_defense = sum(1 for r in results if (r.value_defense_score or 0) >= 85)
     st.success(
         f"從 {st.session_state.hunter_scanned_count} 檔標的中，"
-        f"找到 **{len(results)}** 檔通過全部機構級濾網的轉機候選"
-        "（股價恐慌但現金流穩健、站上右側、債務護城河與定價權皆過關）。"
+        f"找到 {len(results)} 檔通過全部濾網的轉機候選"
+        f"（其中 {high_defense} 檔防禦得分 ≥85，優先排序）。"
     )
 
     result_df = _turnaround_to_dataframe(results)
@@ -2577,15 +2633,38 @@ def _render_turnaround_hunter_tab() -> None:
 
     st.markdown('<p class="panel-subheading">個股快覽</p>', unsafe_allow_html=True)
     for opp in results:
+        defense_line = ""
+        if opp.value_defense_score is not None:
+            emoji = opp.value_grade_emoji or ""
+            defense_line = f"| 🛡️ {opp.value_defense_score:.1f}分 "
+        tag_line = ""
+        if opp.reason_tag:
+            tag_line = f"| {opp.reason_tag} {opp.reason_comment or ''}"
         with st.expander(
             f"{opp.symbol} · {opp.company_name}  "
-            f"|  **-{opp.drawdown_pct:.1f}%**  "
+            f"|  -{opp.drawdown_pct:.1f}%  "
+            f"{defense_line}"
             f"| FCF {_fmt_money_large(opp.latest_fcf)}"
+            f"{tag_line}"
         ):
+            if opp.value_defense_score is not None:
+                st.markdown(
+                    f"**🛡️ 價值防禦得分**：{opp.value_defense_score:.1f}/100 "
+                    f"（{opp.value_grade_emoji or ''} {opp.value_grade_label or ''}）"
+                )
+            if opp.reason_tag:
+                st.markdown(
+                    f"**錯殺原因**：{opp.reason_tag} — {opp.reason_comment or ''}"
+                )
             _render_trend_signal_block(_cached_trend_signal(opp.symbol))
             _render_fx_metric_row(
                 [
                     ("相對半年高點跌幅", f"-{opp.drawdown_pct:.1f}%"),
+                    ("距52週高點", (
+                        f"-{(1 - opp.price_vs_52w_high) * 100:.1f}%"
+                        if opp.price_vs_52w_high is not None else "—"
+                    )),
+                    ("PEG", f"{opp.peg_ratio:.2f}" if opp.peg_ratio is not None else "—"),
                     ("現價", f"${opp.current_price:.2f}"),
                     ("半年高點", f"${opp.six_month_high:.2f}"),
                     ("最新 FCF", _fmt_money_large(opp.latest_fcf)),
@@ -2643,15 +2722,16 @@ def _render_sidebar() -> None:
     st.sidebar.header("逆向轉機股雷達")
     st.sidebar.markdown(
         """
-        **六道機構級防禦濾網（SQLite 快取加速）：**
-        1. 半年股價跌幅 **> 15%**
-        2. 最新財年 **FCF > 0**
-        3. 技術面 **Close > SMA20**（右側打底）
+        **逆向價值投資閉環（SQLite 快取加速）：**
+        1. 半年股價跌幅 **> 15%** + **Close > SMA20**
+        2. **估值吸引力**：距52週高點 ≥25% 或 **PEG < 1.5**
+        3. 最新財年 **FCF > 0**
         4. **淨債務/EBITDA < 3x**（防破產）
         5. **利息保障倍數 > 3x**
         6. **毛利率 YoY** 跌幅 ≤ 5pp
 
-        *R&D 事實為輔助參考，不作篩選*
+        通過後自動執行 **🛡️ 100分防禦評分** 與 **Gemini 錯殺標籤**。
+        *≥85 分優先排序 · R&D 為輔助參考*
         """
     )
     st.sidebar.header("右側趨勢訊號")

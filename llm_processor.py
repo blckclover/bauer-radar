@@ -55,6 +55,22 @@ GROWTH_ANALYST_SYSTEM_PROMPT = (
     f"{GROWTH_LEXICON_CONSTRAINT}"
 )
 
+TURNAROUND_REASON_TAG_PROMPT = (
+    "你是對沖基金量化分析師。根據最近新聞標題與跌幅數據，判斷該股大跌核心原因。"
+    "嚴格歸類為以下三種標籤之一（必須完全一致，含方括號）："
+    "[產業週期下行] · [短期利空/公關危機] · [成長放緩但護城河存]"
+    "禁止 Markdown、禁止客套、禁止多於兩行。"
+    "僅輸出："
+    "TAG: <三選一標籤>"
+    "COMMENT: <15字以內繁體中文短評>"
+)
+
+TURNAROUND_REASON_TAGS: tuple[str, ...] = (
+    "[產業週期下行]",
+    "[短期利空/公關危機]",
+    "[成長放緩但護城河存]",
+)
+
 VALUE_ANALYST_SYSTEM_PROMPT = (
     "你是華爾街頂級 DGI（股息成長投資）量化首席分析師（Graham/Buffett 框架）。"
     "請以股息安全與真實資本回報視角，結合硬數據進行多空平衡分析——禁止行銷包裝。"
@@ -332,3 +348,59 @@ def generate_investment_scorecard(context: str, *, growth: bool = False) -> list
     if not raw:
         return None
     return _parse_scorecard_block(raw)
+
+
+def _parse_turnaround_reason_tag(text: str) -> tuple[str, str] | None:
+    import re
+
+    if not text:
+        return None
+    tag_match = re.search(
+        r"TAG:\s*(\[[^\]]+\])",
+        text,
+        re.IGNORECASE,
+    )
+    comment_match = re.search(
+        r"COMMENT:\s*(.+)",
+        text,
+        re.IGNORECASE,
+    )
+    if not tag_match:
+        return None
+    tag = tag_match.group(1).strip()
+    if tag not in TURNAROUND_REASON_TAGS:
+        for candidate in TURNAROUND_REASON_TAGS:
+            if candidate in tag or candidate in text:
+                tag = candidate
+                break
+        else:
+            return None
+    comment = comment_match.group(1).strip() if comment_match else ""
+    comment = comment.replace("**", "").replace("#", "").strip()
+    if len(comment) > 15:
+        comment = comment[:15]
+    return tag, comment
+
+
+def _fallback_turnaround_reason_tag(context: str) -> tuple[str, str]:
+    """Heuristic tag when Gemini is unavailable."""
+    blob = context.lower()
+    if any(k in blob for k in ("訴訟", "scandal", "召回", "調查", "裁員", "layoff", "probe")):
+        return "[短期利空/公關危機]", "突發事件衝擊情緒"
+    if any(k in blob for k in ("recession", "cycle", "demand", "週期", "景氣", "庫存")):
+        return "[產業週期下行]", "景氣循環壓抑估值"
+    return "[成長放緩但護城河存]", "成長放緩錯殺"
+
+
+def generate_turnaround_reason_tag(context: str) -> tuple[str, str]:
+    """
+    Classify mispricing reason into one of three institutional tags.
+
+    Returns (tag, comment≤15 chars). Never raises.
+    """
+    raw = _call_gemini(TURNAROUND_REASON_TAG_PROMPT, context)
+    if raw:
+        parsed = _parse_turnaround_reason_tag(raw)
+        if parsed:
+            return parsed
+    return _fallback_turnaround_reason_tag(context)

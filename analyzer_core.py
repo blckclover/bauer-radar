@@ -82,6 +82,9 @@ CAPEX_TAGS = (
 # Turnaround screener (active fact-finding radar)
 TURNAROUND_LOOKBACK = "6mo"
 TURNAROUND_MIN_DRAWDOWN_PCT = 15.0
+# Valuation attractiveness — price vs 52-week high OR trailing PEG
+TURNAROUND_52W_HIGH_RATIO_MAX = 0.75   # current / 52w high < 0.75 → ≥25% off highs
+TURNAROUND_PEG_MAX = 1.5
 RND_ROW_NAMES = (
     "ResearchAndDevelopment",
     "Research And Development",
@@ -242,6 +245,17 @@ class TurnaroundOpportunity:
     gross_margin: float | None = None
     gross_margin_yoy_change_pp: float | None = None
     net_debt_ebitda: float | None = None
+    # Valuation filter outputs
+    fifty_two_week_high: float | None = None
+    price_vs_52w_high: float | None = None   # current / 52w high
+    peg_ratio: float | None = None
+    # Value-defense scoring loop (100-pt engine)
+    value_defense_score: float | None = None
+    value_grade_emoji: str = ""
+    value_grade_label: str = ""
+    # LLM mispricing reason tag
+    reason_tag: str = ""
+    reason_comment: str = ""
 
 
 NEWS_LOOKBACK_DAYS = 14
@@ -1389,6 +1403,119 @@ def _net_debt_ebitda_filter(net_debt_ebitda: float | None) -> tuple[bool, float 
     return net_debt_ebitda < NET_DEBT_EBITDA_MAX, net_debt_ebitda
 
 
+def _fetch_fifty_two_week_high(
+    info: dict,
+    ticker: yf.Ticker,
+) -> float | None:
+    """52-week high from yfinance info or trailing 1Y history."""
+    high = _safe_info_float(info, "fiftyTwoWeekHigh")
+    if high is not None and high > 0:
+        return high
+    try:
+        hist = ticker.history(period="1y")
+        if hist is not None and not hist.empty and "High" in hist.columns:
+            val = float(hist["High"].max())
+            return val if val > 0 else None
+    except Exception:
+        pass
+    return None
+
+
+def _valuation_attractiveness_filter(
+    current_price: float,
+    info: dict,
+    ticker: yf.Ticker,
+) -> tuple[bool, float | None, float | None, float | None]:
+    """
+    Valuation gate: (price / 52w high) < 0.75 OR trailing PEG < 1.5.
+
+    Returns (passed, price_to_52w_ratio, peg, fifty_two_week_high).
+    Rejects when neither condition can be verified.
+    """
+    high_52 = _fetch_fifty_two_week_high(info, ticker)
+    ratio: float | None = None
+    if high_52 is not None and high_52 > 0:
+        ratio = current_price / high_52
+
+    peg = _safe_info_float(info, "trailingPegRatio")
+
+    passed = False
+    if ratio is not None and ratio < TURNAROUND_52W_HIGH_RATIO_MAX:
+        passed = True
+    if peg is not None and peg > 0 and peg < TURNAROUND_PEG_MAX:
+        passed = True
+
+    return passed, ratio, peg, high_52
+
+
+def compute_value_defense_score_only(symbol: str) -> tuple[float, str, str]:
+    """
+    Run the 🛡️ value-defense 100-pt engine without LLM commentary.
+
+    Returns (total_score, grade_emoji, grade_label). Never raises.
+    """
+    sym = symbol.upper().strip()
+    try:
+        ticker = yf.Ticker(sym)
+        info = _safe_ticker_info(ticker, sym)
+        fcf_rows = fetch_fcf(sym)
+        div_rows = fetch_dividends(sym, ticker=ticker)
+        payout = fetch_payout_ratio(sym, ticker=ticker)
+        beta = _safe_beta(info)
+        trend = detect_trend_signals(sym)
+        master = fetch_master_metrics(sym, info, ticker=ticker)
+        _, total, emoji, label = compute_scores(
+            fcf_rows,
+            div_rows,
+            payout,
+            beta,
+            strategy_mode=STRATEGY_VALUE,
+            trend_signal=trend,
+            info=info,
+            symbol=sym,
+            ticker=ticker,
+            master=master,
+        )
+        return total, emoji, label
+    except Exception:
+        return 0.0, "🔴", "防禦不足"
+
+
+def _attach_value_defense_score(opp: TurnaroundOpportunity) -> TurnaroundOpportunity:
+    """Enrich a turnaround hit with 100-pt value-defense score."""
+    total, emoji, label = compute_value_defense_score_only(opp.symbol)
+    opp.value_defense_score = total
+    opp.value_grade_emoji = emoji
+    opp.value_grade_label = label
+    return opp
+
+
+def _attach_reason_tag(opp: TurnaroundOpportunity) -> TurnaroundOpportunity:
+    """Enrich with Gemini mispricing reason tag (fallback when API unavailable)."""
+    from llm_processor import generate_turnaround_reason_tag
+
+    try:
+        news = fetch_ticker_live_news(opp.symbol)
+        news_block = format_live_news_block(news)
+    except Exception:
+        news_block = "（無可用新聞）"
+
+    context = (
+        f"Ticker: {opp.symbol}\n"
+        f"Company: {opp.company_name}\n"
+        f"Drawdown vs 6M high: -{opp.drawdown_pct:.1f}%\n"
+        f"Value defense score: {opp.value_defense_score or 'N/A'}/100\n"
+        f"PEG: {opp.peg_ratio if opp.peg_ratio is not None else 'N/A'}\n"
+        f"Price / 52w high: "
+        f"{opp.price_vs_52w_high if opp.price_vs_52w_high is not None else 'N/A'}\n\n"
+        f"Recent headlines:\n{news_block}"
+    )
+    tag, comment = generate_turnaround_reason_tag(context)
+    opp.reason_tag = tag
+    opp.reason_comment = comment
+    return opp
+
+
 def _screen_single_turnaround(
     symbol: str,
     min_drawdown_pct: float,
@@ -1423,6 +1550,13 @@ def _screen_single_turnaround(
 
     current_price, period_high, drawdown_pct = price_facts
     if drawdown_pct <= min_drawdown_pct:
+        return None
+
+    # Filter 0 — valuation attractiveness: ≥25% off 52w high OR PEG < 1.5.
+    val_ok, price_ratio, peg, high_52 = _valuation_attractiveness_filter(
+        current_price, info, ticker
+    )
+    if not val_ok:
         return None
 
     fcf_val = fin.latest_fcf
@@ -1475,6 +1609,9 @@ def _screen_single_turnaround(
         gross_margin=gross_margin,
         gross_margin_yoy_change_pp=gm_change_pp,
         net_debt_ebitda=nd_ebitda,
+        fifty_two_week_high=round(high_52, 2) if high_52 is not None else None,
+        price_vs_52w_high=round(price_ratio, 3) if price_ratio is not None else None,
+        peg_ratio=round(peg, 2) if peg is not None else None,
     )
 
 
@@ -1483,37 +1620,22 @@ def find_turnaround_opportunities(
     *,
     min_drawdown_pct: float = TURNAROUND_MIN_DRAWDOWN_PCT,
     lookback_period: str = TURNAROUND_LOOKBACK,
+    enrich_scores: bool = True,
+    enrich_tags: bool = True,
 ) -> list[TurnaroundOpportunity]:
     """
-    Active turnaround screener: "garbage heap gold" fact detective.
+    Active turnaround screener — integrated with 🛡️ value-defense scoring loop.
 
-    Refactor notes (institutional-grade reversal radar):
-    -----------------------------------------------------
-    1. **Price gate (yfinance `.history`)** — drawdown > `min_drawdown_pct`
-       (default 15%) vs the lookback high (default 6 months).
+    Filters (all mandatory):
+      6M drawdown > 15% · valuation (52w high ≥25% off OR PEG < 1.5)
+      FCF > 0 · Close > SMA20 · Net Debt/EBITDA < 3 · interest coverage > 3x
+      gross margin YoY stable (≤ 5pp decline)
 
-    2. **Positive FCF fact** — `fetch_fcf` (SEC EDGAR first, Yahoo fallback)
-       verifies the latest fiscal FCF is strictly positive.
+    Post-scan enrichment (default on):
+      · 100-pt value-defense score per candidate
+      · Gemini mispricing reason tag ([產業週期下行] / [短期利空] / [成長放緩但護城河存])
 
-    3. **Technical right-side filter** — latest Close must sit above SMA20;
-       names still bleeding below the 20-day line are discarded.
-
-    4. **Anti-bankruptcy filter** — Net Debt / EBITDA must be strictly < 3.0x.
-
-    5. **Debt-moat filter** — interest coverage (EBIT / interest expense) must
-       clear 3.0x when the ticker carries interest expense.
-
-    6. **Pricing-power filter** — latest-quarter gross margin must not contract
-       by more than 5 percentage points YoY.
-
-    7. **R&D fact reserve** — optional innovation signal (not a filter).
-
-    8. **SQLite cache** — core metrics via `data_layer.get_financial_data`.
-
-    9. **Fault isolation** — each ticker runs inside its own try/except;
-       one bad symbol never aborts the full scan.
-
-    Returns candidates sorted by deepest drawdown first (largest % drop).
+    Core metrics via `data_layer` SQLite cache. Sorted by defense score, then drawdown.
     """
     candidates: list[TurnaroundOpportunity] = []
 
@@ -1525,7 +1647,24 @@ def find_turnaround_opportunities(
         except Exception:
             continue
 
-    candidates.sort(key=lambda o: o.drawdown_pct, reverse=True)
+    if enrich_scores:
+        for i, hit in enumerate(candidates):
+            try:
+                candidates[i] = _attach_value_defense_score(hit)
+            except Exception:
+                continue
+
+    if enrich_tags:
+        for i, hit in enumerate(candidates):
+            try:
+                candidates[i] = _attach_reason_tag(hit)
+            except Exception:
+                continue
+
+    candidates.sort(
+        key=lambda o: (o.value_defense_score or 0.0, o.drawdown_pct),
+        reverse=True,
+    )
     return candidates
 
 

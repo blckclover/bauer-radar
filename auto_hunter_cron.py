@@ -196,22 +196,40 @@ def run_system_b_scan(universe: list[str]) -> tuple[list[TurnaroundHit], int]:
 
 def _format_turnaround_section(hits: list[TurnaroundHit], scanned: int) -> str:
     lines = [
-        f"掃描 **{scanned}** 檔標的 | 命中 **{len(hits)}** 檔（半年跌幅 >15% 且 FCF > 0）",
+        f"掃描 **{scanned}** 檔標的 | 命中 **{len(hits)}** 檔"
+        "（六道濾網 + 🛡️ 防禦評分 + 錯殺標籤）",
         "",
     ]
 
     if not hits:
-        lines.append("_今日未命中轉機候選股。市場可能尚未出現「恐慌但現金流仍穩」的標的。_")
+        lines.append("_今日未命中轉機候選股。市場可能尚未出現「錯殺但現金流仍穩」的標的。_")
         return "\n".join(lines)
 
     for hit in hits:
         opp = hit.opportunity
         fcf_year = f"（{opp.latest_fcf_fiscal_year}）" if opp.latest_fcf_fiscal_year else ""
+        defense = (
+            f"**{opp.value_defense_score:.1f}/100**"
+            if opp.value_defense_score is not None
+            else "N/A"
+        )
+        tag_line = (
+            f"{opp.reason_tag} {opp.reason_comment or ''}".strip()
+            if opp.reason_tag
+            else "—"
+        )
+        off_52w = (
+            f"-{(1 - opp.price_vs_52w_high) * 100:.1f}%"
+            if opp.price_vs_52w_high is not None
+            else "—"
+        )
         lines.extend(
             [
                 f"### {opp.symbol} · {opp.company_name}",
-                f"- 跌幅：**-{opp.drawdown_pct:.1f}%**（相對半年高點 ${opp.six_month_high:.2f}）",
-                f"- 現價：${opp.current_price:.2f}",
+                f"- 🛡️ 防禦得分：{defense}",
+                f"- 錯殺標籤：{tag_line}",
+                f"- 跌幅：**-{opp.drawdown_pct:.1f}%** | 距52週高點：{off_52w}",
+                f"- 現價：${opp.current_price:.2f}（半年高點 ${opp.six_month_high:.2f}）",
                 f"- 最新 FCF：**{_fmt_money_large(opp.latest_fcf)}** {fcf_year}",
                 f"- 均線訊號：{hit.trend_detail}",
                 "",
