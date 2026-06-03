@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import re
+from textwrap import dedent
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -263,13 +264,18 @@ def _clean_ai_html(raw: str) -> str:
     return _HTML_FENCE_RE.sub("", clean_html).replace("```", "").strip()
 
 
+def _render_trusted_html(html_content: str) -> None:
+    """Render app-owned HTML templates (dedented — Streamlit requires unindented blocks)."""
+    content = dedent(html_content or "").strip()
+    if content:
+        st.markdown(content, unsafe_allow_html=True)
+
+
 def _render_html(html_content: str) -> None:
-    """Render custom HTML/CSS blocks — always strip AI fences and enable HTML parsing."""
-    content = html_content or ""
-    clean_html = _HTML_FENCE_RE.sub("", content).replace("```", "").strip()
-    cleaned = _clean_ai_html(clean_html)
+    """Render AI or fenced HTML after fence stripping."""
+    cleaned = _clean_ai_html(html_content or "")
     if cleaned:
-        st.markdown(cleaned, unsafe_allow_html=True)
+        _render_trusted_html(cleaned)
 
 
 def _is_llm_error_payload(text: object) -> bool:
@@ -373,8 +379,10 @@ def _render_narrative_card(symbol: str) -> None:
             "即時新聞流連線超時 · 目前顯示基礎科技敘事"
             "</p>"
         )
-    _render_html(
-        f'<div class="fx-narrative-card"><div class="fx-narrative-body">{card_html}</div></div>'
+    _render_trusted_html(
+        f'<div class="fx-narrative-card">'
+        f'<div class="fx-narrative-body">{card_html}</div>'
+        f"</div>"
     )
 
 
@@ -862,9 +870,6 @@ def _inject_css() -> None:
             font-size: 0.82rem;
             margin: 0.35rem 0 0.85rem;
         }}
-        .ai-terminal-panel {{
-            display: none;
-        }}
         .ai-terminal-body {{
             border: 1px solid #334155;
             border-radius: 10px;
@@ -907,40 +912,6 @@ def _inject_css() -> None:
             margin: 0.85rem 0 0.45rem;
             letter-spacing: 0.04em;
             text-transform: uppercase;
-        }}
-        .ai-terminal-panel + div[data-testid="stMarkdownContainer"],
-        .ai-terminal-panel + div {{
-            border: 1px solid #334155;
-            border-radius: 10px;
-            background: #0f172a;
-            padding: 1rem 1.15rem;
-            margin: 0.75rem 0 1.35rem;
-            box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.05);
-        }}
-        .ai-terminal-panel + div h3 {{
-            font-size: 0.95rem !important;
-            color: #e2e8f0 !important;
-            margin: 0.65rem 0 0.35rem !important;
-        }}
-        .ai-terminal-panel + div h4 {{
-            font-size: 0.88rem !important;
-            color: #94a3b8 !important;
-            margin: 0.55rem 0 0.25rem !important;
-        }}
-        .ai-terminal-panel + div p,
-        .ai-terminal-panel + div li {{
-            color: #cbd5e1;
-            font-size: 0.86rem;
-            line-height: 1.65;
-        }}
-        .ai-terminal-panel + div strong {{
-            color: #f1f5f9;
-        }}
-        .ai-terminal-panel + div blockquote {{
-            border-left: 3px solid var(--accent);
-            padding-left: 0.75rem;
-            color: #94a3b8;
-            margin: 0.5rem 0;
         }}
         .fx-narrative-heading {{
             margin-top: 1.5rem !important;
@@ -1267,31 +1238,31 @@ def _render_terminal_dual_scores(report: object) -> None:
     q_color = _terminal_score_color(quality)
     v_color = _terminal_score_color(valuation)
 
-    _render_html(
-        f"""
-        <div class="terminal-score-grid">
-            <div class="terminal-score-card">
-                <div class="terminal-score-label">企業品質分 · Quality</div>
-                <div class="terminal-score-sublabel">Business Quality Score</div>
-                <div class="terminal-score-value" style="color:{q_color};">{quality:.1f}</div>
-                <div class="terminal-score-cap">滿分 100 · Red Team 封頂 95</div>
-            </div>
-            <div class="terminal-score-card">
-                <div class="terminal-score-label">估值安全邊際 · Valuation</div>
-                <div class="terminal-score-sublabel">Valuation Safety Score</div>
-                <div class="terminal-score-value" style="color:{v_color};">{valuation:.1f}</div>
-                <div class="terminal-score-cap">Forward P/E · PEG · FCF Yield</div>
-            </div>
-        </div>
-        <div class="terminal-grade-strip">等級 {_format_grade(report)}</div>
-        """
+    _render_trusted_html(
+        f'<div class="terminal-score-grid">'
+        f'<div class="terminal-score-card">'
+        f'<div class="terminal-score-label">企業品質分 · Quality</div>'
+        f'<div class="terminal-score-sublabel">Business Quality Score</div>'
+        f'<div class="terminal-score-value" style="color:{q_color};">{quality:.1f}</div>'
+        f'<div class="terminal-score-cap">滿分 100 · Red Team 封頂 95</div>'
+        f"</div>"
+        f'<div class="terminal-score-card">'
+        f'<div class="terminal-score-label">估值安全邊際 · Valuation</div>'
+        f'<div class="terminal-score-sublabel">Valuation Safety Score</div>'
+        f'<div class="terminal-score-value" style="color:{v_color};">{valuation:.1f}</div>'
+        f'<div class="terminal-score-cap">Forward P/E · PEG · FCF Yield</div>'
+        f"</div>"
+        f"</div>"
+        f'<div class="terminal-grade-strip">等級 {_format_grade(report)}</div>'
     )
 
 
 def _render_death_penalty_banners(report: object) -> None:
     """Full-width fatal red-flag banners below hero scores."""
     for msg in _collect_death_penalty_messages(report):
-        _render_html(f'<div class="death-penalty-banner">{html.escape(msg)}</div>')
+        _render_trusted_html(
+            f'<div class="death-penalty-banner">{html.escape(msg)}</div>'
+        )
 
 
 def _render_value_dimension_grid(report: StockReport) -> None:
@@ -1388,7 +1359,7 @@ def _valuation_trap_warning(report: object) -> bool:
 def _render_valuation_trap_alert(report: object) -> None:
     if not _valuation_trap_warning(report):
         return
-    _render_html(
+    _render_trusted_html(
         '<div class="valuation-trap-alert">'
         "⚠️ 品質極優，但估值過高，注意安全邊際"
         "</div>"
@@ -1458,14 +1429,12 @@ def _render_fx_metric_row(
             else ""
         )
         with col:
-            _render_html(
-                f"""
-                <div class="fx-metric-card">
-                    <div class="fx-metric-label">{html.escape(label)}{tip_html}</div>
-                    <div class="fx-metric-value">{html.escape(str(value))}</div>
-                    {sub_html}
-                </div>
-                """
+            _render_trusted_html(
+                f'<div class="fx-metric-card">'
+                f'<div class="fx-metric-label">{html.escape(label)}{tip_html}</div>'
+                f'<div class="fx-metric-value">{html.escape(str(value))}</div>'
+                f"{sub_html}"
+                f"</div>"
             )
 
 
@@ -1475,7 +1444,7 @@ def _render_factor_glossary(mode: str | None = None) -> None:
     tips = SCORE_WEIGHT_TOOLTIPS_GROWTH if is_growth_strategy(active) else SCORE_WEIGHT_TOOLTIPS_VALUE
     with st.expander("📊 量化因子方法論 · Factor Methodology"):
         for dim, desc in tips.items():
-            _render_html(
+            _render_trusted_html(
                 f'<p class="factor-glossary-item">'
                 f'<span class="factor-glossary-dim">{html.escape(dim)}</span>'
                 f'<span class="factor-glossary-desc">{html.escape(desc)}</span>'
@@ -1542,18 +1511,16 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
     title_html = (
         f'<div class="fx-table-title">{html.escape(title)}</div>' if title else ""
     )
-    _render_html(
-        f"""
-        <div class="fx-table-card">
-            {title_html}
-            <div class="fx-table-wrap">
-                <table class="fx-table">
-                    <thead><tr>{headers}</tr></thead>
-                    <tbody>{"".join(rows)}</tbody>
-                </table>
-            </div>
-        </div>
-        """
+    _render_trusted_html(
+        f'<div class="fx-table-card">'
+        f"{title_html}"
+        f'<div class="fx-table-wrap">'
+        f'<table class="fx-table">'
+        f"<thead><tr>{headers}</tr></thead>"
+        f'<tbody>{"".join(rows)}</tbody>'
+        f"</table>"
+        f"</div>"
+        f"</div>"
     )
 
 
@@ -1586,10 +1553,8 @@ def _render_ai_terminal_block(text: str | None) -> None:
     clean = _sanitize_ai_commentary(safe)
     if not clean:
         return
-    _render_html('<div class="ai-terminal-panel"></div>')
-    _render_html(
-        f'<div class="ai-terminal-body">{html.escape(clean).replace(chr(10), "<br>")}</div>'
-    )
+    body_html = html.escape(clean).replace(chr(10), "<br>")
+    _render_trusted_html(f'<div class="ai-terminal-body">{body_html}</div>')
 
 
 def _scorecard_tone(score: int) -> str:
@@ -1631,20 +1596,18 @@ def _render_investment_scorecard(report: object) -> None:
                 f'<span class="fx-metric-tip" data-tip="{html.escape(tip)}">?</span>'
             )
         cards.append(
-            f"""
-            <div class="scorecard-progress-card">
-                <div class="scorecard-progress-header">
-                    <div class="scorecard-progress-name">
-                        {html.escape(short_name)}{tip_html}
-                    </div>
-                    <div class="scorecard-progress-score {tone}">{item.score}/10</div>
-                </div>
-                <div class="scorecard-progress-track">
-                    <div class="scorecard-progress-fill {tone}" style="width:{pct}%;"></div>
-                </div>
-                <div class="scorecard-progress-rationale">{html.escape(rationale)}</div>
-            </div>
-            """
+            f'<div class="scorecard-progress-card">'
+            f'<div class="scorecard-progress-header">'
+            f'<div class="scorecard-progress-name">'
+            f"{html.escape(short_name)}{tip_html}"
+            f"</div>"
+            f'<div class="scorecard-progress-score {tone}">{item.score}/10</div>'
+            f"</div>"
+            f'<div class="scorecard-progress-track">'
+            f'<div class="scorecard-progress-fill {tone}" style="width:{pct}%;"></div>'
+            f"</div>"
+            f'<div class="scorecard-progress-rationale">{html.escape(rationale)}</div>'
+            f"</div>"
         )
 
     if not cards:
@@ -1652,17 +1615,12 @@ def _render_investment_scorecard(report: object) -> None:
         return
 
     scorecard_html = (
-        f"""
-        <div class="scorecard-grid-title">
-            Master Investment Scorecard · 大師級多空量化項目評價表
-        </div>
-        <div class="scorecard-progress-grid">
-            {"".join(cards)}
-        </div>
-        """
+        f'<div class="scorecard-grid-title">'
+        f"Master Investment Scorecard · 大師級多空量化項目評價表"
+        f"</div>"
+        f'<div class="scorecard-progress-grid">{"".join(cards)}</div>'
     )
-    clean_html = _HTML_FENCE_RE.sub("", scorecard_html).replace("```", "").strip()
-    _render_html(clean_html)
+    _render_trusted_html(scorecard_html)
 
 
 def _render_deep_analysis_divider() -> None:
