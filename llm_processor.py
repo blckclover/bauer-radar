@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from google import genai
 
@@ -14,6 +15,26 @@ FILTER_PROMPT = (
     "請用極簡短的中文列點輸出。若無重要變數，請輸出『今日無重要宏觀或個股變數』。"
 )
 MODEL_NAME = "gemini-2.5-flash"
+
+
+def is_narrative_error_payload(text: str) -> bool:
+    """True when text looks like a leaked API/JSON error, not user-facing narrative."""
+    if not (text or "").strip():
+        return False
+    t = text.strip()
+    if t.startswith("{"):
+        return True
+    upper = t.upper()
+    if "RESOURCE_EXHAUSTED" in upper:
+        return True
+    if re.search(r"\b429\b", t):
+        return True
+    if re.search(r"""['"]error['"]\s*:""", t):
+        return True
+    if t.startswith("⚠️ 科技敘事生成失敗"):
+        return True
+    return False
+
 
 GROWTH_LEXICON_CONSTRAINT = (
     "在生成技術面與資金面點評時，禁止使用「多頭雛形」「飆股」「爆發」「拉抬」「暴雷」"
@@ -203,9 +224,11 @@ def generate_company_narrative_text(
         text = (response.text or "").strip()
         if not text:
             raise ValueError("Gemini returned an empty narrative.")
+        if is_narrative_error_payload(text):
+            return ""
         return text
-    except Exception as exc:
-        return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"
+    except Exception:
+        return ""
 
 
 def _format_trend_context(trend_signal: dict | None) -> str:
@@ -276,9 +299,11 @@ def generate_growth_narrative_text(
         text = (response.text or "").strip()
         if not text:
             raise ValueError("Gemini returned an empty narrative.")
+        if is_narrative_error_payload(text):
+            return ""
         return text
-    except Exception as exc:
-        return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"
+    except Exception:
+        return ""
 
 
 def _call_gemini(system_prompt: str, context: str) -> str | None:

@@ -3700,6 +3700,8 @@ def build_company_narrative(
         master = fetch_master_metrics(sym, info, ticker=yf_ticker)
         master_block = format_master_metrics_block(master)
         trend_json = json.dumps(trend or {}, sort_keys=True, default=str)
+        from llm_processor import is_narrative_error_payload
+
         text = _cached_llm_growth_narrative(
             sym,
             mode,
@@ -3710,10 +3712,14 @@ def build_company_narrative(
             trend_json,
             master_block,
         )
-        if text.startswith("⚠️") and summary:
+        if is_narrative_error_payload(text):
+            text = ""
+        if text.startswith("⚠️") and summary and not text.startswith("⚠️ 科技敘事生成失敗"):
             text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
+            if is_narrative_error_payload(text):
+                text = ""
         elif not text.strip():
-            text = summary or "暫無可用敘事資料。"
+            text = ""
         return NarrativeResult(text=text, live_news_degraded=degraded)
 
     if not summary:
@@ -3721,7 +3727,11 @@ def build_company_narrative(
             text="尚無官方業務摘要（longBusinessSummary），暫時無法生成科技敘事。",
             live_news_degraded=False,
         )
+    from llm_processor import is_narrative_error_payload
+
     text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
+    if is_narrative_error_payload(text):
+        text = ""
     return NarrativeResult(text=text, live_news_degraded=False)
 
 

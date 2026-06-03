@@ -10,6 +10,8 @@ import streamlit.components.v1 as components
 import yfinance as yf
 from plotly.subplots import make_subplots
 
+from llm_processor import is_narrative_error_payload
+
 from analyzer_core import (
     FALLBACK_SCAN_UNIVERSE,
     STRATEGY_LABEL_GROWTH,
@@ -313,6 +315,11 @@ def _format_narrative_for_card(raw: str) -> str:
     return "<br>".join("".join(parts).split("\n"))
 
 
+_NARRATIVE_UNAVAILABLE_WARNING = (
+    "⚠️ 目前 AI 伺服器擁擠，科技敘事與最新嘗試暫時無法載入，請稍後重試。"
+)
+
+
 def _render_narrative_card(symbol: str) -> None:
     _render_trusted_html(
         '<p class="panel-label fx-narrative-heading">'
@@ -320,6 +327,9 @@ def _render_narrative_card(symbol: str) -> None:
     )
     strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
     narrative, live_news_degraded = load_company_narrative(strategy_key, symbol)
+    if is_narrative_error_payload(narrative) or not (narrative or "").strip():
+        st.warning(_NARRATIVE_UNAVAILABLE_WARNING)
+        return
     card_html = _format_narrative_for_card(narrative)
     if live_news_degraded and is_growth_strategy(strategy_key):
         card_html += (
