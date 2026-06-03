@@ -278,38 +278,28 @@ def _clean_ai_html(raw: str) -> str:
     return _strip_div_tags_from_fragment(clean_html)
 
 
-def _repair_html_with_beautifulsoup(html_str: str) -> str:
-    """Parse and auto-close tags via BeautifulSoup to prevent React DOM crashes."""
-    content = dedent(html_str or "").strip()
-    if not content:
-        return ""
-    document = f"<!DOCTYPE html><html><head></head><body>{content}</body></html>"
-    soup = BeautifulSoup(document, "html.parser")
-    body = soup.body
-    if body is None:
-        return content
-    return body.decode_contents().strip()
-
-
-def _render_trusted_html(html_content: str) -> None:
-    """Render HTML through BeautifulSoup repair before unsafe_allow_html."""
+def _render_trusted_html(html_str: str) -> None:
+    """Render HTML via BeautifulSoup auto-close repair (prevents React DOM crashes)."""
     try:
-        safe_html = _repair_html_with_beautifulsoup(html_content)
-        if not safe_html:
+        raw = dedent(html_str or "").strip()
+        if not raw:
             return
-        st.markdown(safe_html, unsafe_allow_html=True)
+        soup = BeautifulSoup(raw, "html.parser")
+        st.markdown(str(soup), unsafe_allow_html=True)
     except Exception:
-        st.error("UI 渲染發生錯誤，已啟動安全防護。")
+        st.error("UI 渲染安全防護攔截了破圖錯誤。")
 
 
-def _render_sidebar_trusted_html(html_content: str) -> None:
-    """Sidebar variant — same BeautifulSoup repair pipeline."""
+def _render_sidebar_trusted_html(html_str: str) -> None:
+    """Sidebar variant — same BeautifulSoup pipeline."""
     try:
-        safe_html = _repair_html_with_beautifulsoup(html_content)
-        if safe_html:
-            st.sidebar.markdown(safe_html, unsafe_allow_html=True)
+        raw = dedent(html_str or "").strip()
+        if not raw:
+            return
+        soup = BeautifulSoup(raw, "html.parser")
+        st.sidebar.markdown(str(soup), unsafe_allow_html=True)
     except Exception:
-        st.sidebar.error("UI 渲染發生錯誤，已啟動安全防護。")
+        st.sidebar.error("UI 渲染安全防護攔截了破圖錯誤。")
 
 
 def _render_html(html_content: str) -> None:
@@ -402,23 +392,15 @@ def _render_narrative_card(symbol: str) -> None:
         try:
             narrative, live_news_degraded = load_company_narrative(strategy_key, symbol)
         except Exception:
-            st.warning(
-                "⚠️ 目前 AI 伺服器擁擠，科技敘事暫時無法載入，請稍後重試。"
-            )
+            st.warning("目前 AI 伺服器擁擠，請稍後重試。")
             return
 
         safe_narrative = _safe_render_text(narrative)
-        if not safe_narrative:
-            st.warning(
-                "⚠️ 目前 AI 伺服器擁擠，科技敘事暫時無法載入，請稍後重試。"
-            )
-            return
-
-        card_html = _format_narrative_for_card(safe_narrative)
-        if not card_html:
-            st.warning(
-                "⚠️ 目前 AI 伺服器擁擠，科技敘事暫時無法載入，請稍後重試。"
-            )
+        card_html = (
+            _format_narrative_for_card(safe_narrative) if safe_narrative else ""
+        )
+        if not safe_narrative or not card_html:
+            st.warning("目前 AI 伺服器擁擠，請稍後重試。")
             return
         if live_news_degraded and is_growth_strategy(strategy_key):
             card_html += (
@@ -451,15 +433,14 @@ def _fmt_money_large(value: float | None) -> str:
 
 
 def _inject_css() -> None:
-    st.markdown(
+    _render_trusted_html(
         """
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-        """,
-        unsafe_allow_html=True,
+        """
     )
-    st.markdown(
+    _render_trusted_html(
         f"""
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
@@ -1211,8 +1192,7 @@ def _inject_css() -> None:
             border: 1px solid var(--border-subtle) !important;
         }}
         </style>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -1588,19 +1568,10 @@ def _render_ai_commentary_section(report: object) -> None:
     with st.container():
         _render_trusted_html('<p class="panel-label">AI 決策點評</p>')
         raw = _rget(report, "analyst_commentary", None)
-        if _is_llm_error_payload(raw):
-            st.warning(
-                "⚠️ 目前 AI 伺服器擁擠，紅隊決策點評暫時無法載入，請稍後重試。"
-            )
-            return
-
-        commentary = _safe_render_text(raw)
+        commentary = _safe_render_text(raw) if raw is not None else None
         if not commentary:
-            st.warning(
-                "⚠️ 目前 AI 伺服器擁擠，紅隊決策點評暫時無法載入，請稍後重試。"
-            )
+            st.warning("目前 AI 伺服器擁擠，請稍後重試。")
             return
-
         _render_ai_terminal_block(commentary)
 
 
@@ -2577,7 +2548,7 @@ def _display_technical_chart(symbol: str) -> None:
 def _render_watchlist_bar() -> None:
     """Top watchlist input — user-defined ticker universe."""
     with st.container(border=True):
-        st.markdown('<p class="panel-label">自訂觀察清單</p>', unsafe_allow_html=True)
+        _render_trusted_html('<p class="panel-label">自訂觀察清單</p>')
         col_input, col_btn = st.columns([4, 1])
         with col_input:
             st.text_input(
@@ -2966,9 +2937,8 @@ def _render_core_scoring_tab() -> None:
     tickers: list[str] = st.session_state.analyzed_tickers
     mode = _current_strategy_mode()
     weight_caption = _strategy_weight_caption(mode)
-    st.markdown(
-        f'<p class="subtitle">100 分制財務紀律評分 · {html.escape(weight_caption)}</p>',
-        unsafe_allow_html=True,
+    _render_trusted_html(
+        f'<p class="subtitle">100 分制財務紀律評分 · {html.escape(weight_caption)}</p>'
     )
     _render_factor_glossary(mode)
 
@@ -3000,7 +2970,7 @@ def _render_core_scoring_tab() -> None:
         reports_to_summary_df(reports, strategy_mode=mode),
         score_columns=_score_columns_for_mode(mode),
     )
-    st.markdown('<p class="panel-label">綜合摘要</p>', unsafe_allow_html=True)
+    _render_trusted_html('<p class="panel-label">綜合摘要</p>')
     _render_fx_table_card(summary_df, title="Watchlist Summary")
 
 
@@ -3008,7 +2978,7 @@ def _render_company_deep_analysis() -> None:
     """Dynamic per-ticker view driven by session_state.analyzed_tickers."""
     tickers: list[str] = st.session_state.analyzed_tickers
     _render_deep_analysis_divider()
-    st.markdown('<p class="panel-heading">公司深度分析</p>', unsafe_allow_html=True)
+    _render_trusted_html('<p class="panel-heading">公司深度分析</p>')
     st.caption(
         f"已解鎖 {len(tickers)} 檔 · 選擇標的切換（含從轉機雷達解鎖的新標的）"
     )
@@ -3051,15 +3021,14 @@ def _render_company_deep_analysis() -> None:
 
 def _render_turnaround_hunter_tab() -> None:
     """Turnaround radar — index universes or custom list feed analyzed_tickers."""
-    st.markdown(
-        '<p class="panel-label" style="margin-top:0.25rem;">掃描工作區 · Reversal Scan Workspace</p>',
-        unsafe_allow_html=True,
+    _render_trusted_html(
+        '<p class="panel-label" style="margin-top:0.25rem;">'
+        "掃描工作區 · Reversal Scan Workspace</p>"
     )
-    st.markdown(
+    _render_trusted_html(
         '<p class="subtitle">'
         "逆向價值投資閉環 · 雷達篩選 → 🛡️ 100分防禦評分 → Gemini 錯殺標籤"
-        "</p>",
-        unsafe_allow_html=True,
+        "</p>"
     )
 
     preset = st.radio(
@@ -3083,7 +3052,7 @@ def _render_turnaround_hunter_tab() -> None:
     )
 
     if use_advanced:
-        st.markdown('<p class="panel-label">進階掃描母體 (Advanced Universe)</p>', unsafe_allow_html=True)
+        _render_trusted_html('<p class="panel-label">進階掃描母體 (Advanced Universe)</p>')
         selected_label = st.selectbox(
             "選擇掃描母體 (Scan Universe)",
             SCAN_UNIVERSE_LABELS,
@@ -3184,7 +3153,7 @@ def _render_turnaround_hunter_tab() -> None:
     result_df = _turnaround_to_dataframe(results)
     _render_fx_table_card(result_df, title="Turnaround Candidates")
 
-    st.markdown('<p class="panel-subheading">解鎖深度財報分析</p>', unsafe_allow_html=True)
+    _render_trusted_html('<p class="panel-subheading">解鎖深度財報分析</p>')
     st.caption("點擊後將自動聚焦至下方「公司深度分析」並切換至該標的。")
     unlock_cols = st.columns(min(len(results), 4) or 1)
     for i, opp in enumerate(results):
@@ -3198,7 +3167,7 @@ def _render_turnaround_hunter_tab() -> None:
             ):
                 _unlock_ticker_for_analysis(opp.symbol)
 
-    st.markdown('<p class="panel-subheading">個股快覽</p>', unsafe_allow_html=True)
+    _render_trusted_html('<p class="panel-subheading">個股快覽</p>')
     for opp in results:
         defense_line = ""
         if opp.value_defense_score is not None:
