@@ -4,7 +4,9 @@ from __future__ import annotations
 import html
 import re
 from textwrap import dedent
+
 import pandas as pd
+from bs4 import BeautifulSoup
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
@@ -251,13 +253,6 @@ _DIV_OPEN_RE = re.compile(r"<div\b[^>]*>", re.IGNORECASE)
 _DIV_CLOSE_RE = re.compile(r"</div>", re.IGNORECASE)
 
 
-def _count_div_tags(html: str) -> tuple[int, int]:
-    """Return (opening <div count, closing </div> count)."""
-    opens = len(_DIV_OPEN_RE.findall(html))
-    closes = len(_DIV_CLOSE_RE.findall(html))
-    return opens, closes
-
-
 def _strip_div_tags_from_fragment(text: str) -> str:
     """Remove div wrappers from untrusted LLM fragments — outer shells stay balanced."""
     if not text:
@@ -283,17 +278,38 @@ def _clean_ai_html(raw: str) -> str:
     return _strip_div_tags_from_fragment(clean_html)
 
 
-def _render_trusted_html(html_content: str) -> None:
-    """Render app-owned HTML templates (dedented — Streamlit requires unindented blocks)."""
-    content = dedent(html_content or "").strip()
+def _repair_html_with_beautifulsoup(html_str: str) -> str:
+    """Parse and auto-close tags via BeautifulSoup to prevent React DOM crashes."""
+    content = dedent(html_str or "").strip()
     if not content:
-        return
-    opens, closes = _count_div_tags(content)
-    if opens != closes:
-        plain = _strip_div_tags_from_fragment(content)
-        plain = html.escape(plain).replace("\n", "<br>")
-        content = f'<div class="fx-html-shell"><p>{plain}</p></div>'
-    st.markdown(content, unsafe_allow_html=True)
+        return ""
+    document = f"<!DOCTYPE html><html><head></head><body>{content}</body></html>"
+    soup = BeautifulSoup(document, "html.parser")
+    body = soup.body
+    if body is None:
+        return content
+    return body.decode_contents().strip()
+
+
+def _render_trusted_html(html_content: str) -> None:
+    """Render HTML through BeautifulSoup repair before unsafe_allow_html."""
+    try:
+        safe_html = _repair_html_with_beautifulsoup(html_content)
+        if not safe_html:
+            return
+        st.markdown(safe_html, unsafe_allow_html=True)
+    except Exception:
+        st.error("UI 渲染發生錯誤，已啟動安全防護。")
+
+
+def _render_sidebar_trusted_html(html_content: str) -> None:
+    """Sidebar variant — same BeautifulSoup repair pipeline."""
+    try:
+        safe_html = _repair_html_with_beautifulsoup(html_content)
+        if safe_html:
+            st.sidebar.markdown(safe_html, unsafe_allow_html=True)
+    except Exception:
+        st.sidebar.error("UI 渲染發生錯誤，已啟動安全防護。")
 
 
 def _render_html(html_content: str) -> None:
@@ -376,10 +392,9 @@ def _format_narrative_for_card(raw: str) -> str:
 def _render_narrative_card(symbol: str) -> None:
     """Narrative block — warnings render here only (never during cached LLM fetch)."""
     with st.container():
-        st.markdown(
+        _render_trusted_html(
             '<p class="panel-label fx-narrative-heading">'
-            "💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>",
-            unsafe_allow_html=True,
+            "💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>"
         )
         strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
         narrative = ""
@@ -1571,7 +1586,7 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
 def _render_ai_commentary_section(report: object) -> None:
     """AI commentary block only — failures must not abort the rest of the page."""
     with st.container():
-        st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
+        _render_trusted_html('<p class="panel-label">AI 決策點評</p>')
         raw = _rget(report, "analyst_commentary", None)
         if _is_llm_error_payload(raw):
             st.warning(
@@ -2001,7 +2016,7 @@ def _fmt_price(value: float | str | None) -> str:
 
 def _render_trend_signal_block(trend: dict | None, *, growth_mode: bool = False) -> None:
     """Render compact right-side trend tag + price facts."""
-    st.markdown('<p class="panel-label">右側動態趨勢</p>', unsafe_allow_html=True)
+    _render_trusted_html('<p class="panel-label">右側動態趨勢</p>')
 
     if not trend:
         _render_trusted_html(
@@ -2037,13 +2052,12 @@ def _render_trend_signal_block(trend: dict | None, *, growth_mode: bool = False)
     )
 
     as_of = trend.get("as_of_date") or "—"
-    st.markdown(
+    _render_trusted_html(
         f'<p class="trend-facts">'
-        f"現價 <strong>{_fmt_price(trend.get('current_price'))}</strong> · "
-        f"SMA20 <strong>{_fmt_price(trend.get('sma_20'))}</strong> · "
-        f"SMA50 <strong>{_fmt_price(trend.get('sma_50'))}</strong><br>"
-        f"截至 {as_of}</p>",
-        unsafe_allow_html=True,
+        f"現價 <strong>{html.escape(_fmt_price(trend.get('current_price')))}</strong> · "
+        f"SMA20 <strong>{html.escape(_fmt_price(trend.get('sma_20')))}</strong> · "
+        f"SMA50 <strong>{html.escape(_fmt_price(trend.get('sma_50')))}</strong><br>"
+        f"截至 {html.escape(str(as_of))}</p>"
     )
 
 
@@ -2540,9 +2554,9 @@ def _display_technical_chart(symbol: str) -> None:
         )
 
     freq_label = frequency.split("(")[0].strip()
-    st.markdown(
-        f'<p class="panel-label">📉 {sym} · {freq_label}技術線圖（預設近3個月）</p>',
-        unsafe_allow_html=True,
+    _render_trusted_html(
+        f'<p class="panel-label">📉 {html.escape(sym)} · {html.escape(freq_label)}'
+        f"技術線圖（預設近3個月）</p>"
     )
     fig = render_technical_chart(sym, frequency=frequency, indicators=indicators)
     ind_suffix = "_".join(i.split()[0] for i in indicators) or "base"
@@ -2859,12 +2873,13 @@ def _render_master_metric_row(report: object) -> None:
 def _render_company_detail(report: StockReport) -> None:
     report = _coerce_report(report)
     mode_label = _strategy_label_for_mode(report.strategy_mode)
-    st.markdown(
+    _render_trusted_html(
         f'<p class="subtitle" style="margin-bottom:0.35rem;">'
-        f"{html.escape(report.symbol)} · {html.escape(report.company_name)}</p>",
-        unsafe_allow_html=True,
+        f"{html.escape(report.symbol)} · {html.escape(report.company_name)}</p>"
     )
-    st.markdown(f'<span class="strategy-badge">{html.escape(mode_label)}</span>', unsafe_allow_html=True)
+    _render_trusted_html(
+        f'<span class="strategy-badge">{html.escape(mode_label)}</span>'
+    )
 
     _render_terminal_dual_scores(report)
     _render_death_penalty_banners(report)
@@ -3293,7 +3308,7 @@ def _render_sidebar() -> None:
         f"**已載入深度分析**：{len(st.session_state.get('analyzed_tickers', []))} 檔"
     )
     st.sidebar.markdown("---")
-    _sidebar_html = dedent(
+    _render_sidebar_trusted_html(
         """
         <div class="sidebar-lab-card">
         <div class="sidebar-lab-badge">COMING SOON</div>
@@ -3301,10 +3316,7 @@ def _render_sidebar() -> None:
         <p class="sidebar-lab-hint">TODO: 接入 Reddit / TikTok API</p>
         </div>
         """
-    ).strip()
-    opens, closes = _count_div_tags(_sidebar_html)
-    if opens == closes:
-        st.sidebar.markdown(_sidebar_html, unsafe_allow_html=True)
+    )
     st.sidebar.button(
         "社會套利 · Social Sentiment Lab",
         disabled=True,
@@ -3332,13 +3344,9 @@ def main() -> None:
 
     main_container = st.container()
     with main_container:
-        st.markdown(
-            '<p class="main-title">股息安全 · 綜合分析儀表板</p>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            '<p class="subtitle">自訂觀察清單 · 100 分制財務評分 · 轉機股雷達 · 技術線圖</p>',
-            unsafe_allow_html=True,
+        _render_trusted_html('<p class="main-title">股息安全 · 綜合分析儀表板</p>')
+        _render_trusted_html(
+            '<p class="subtitle">自訂觀察清單 · 100 分制財務評分 · 轉機股雷達 · 技術線圖</p>'
         )
         _render_watchlist_bar()
 
