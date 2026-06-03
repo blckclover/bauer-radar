@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -41,6 +40,11 @@ STRATEGY_LABEL_TO_MODE: dict[str, str] = {
     STRATEGY_LABEL_GROWTH: STRATEGY_GROWTH,
 }
 
+# Red Team Protocol — no score may imply absolute safety above this cap
+SCORE_CAP = 95.0
+VALUATION_TRAP_QUALITY_MIN = 70.0
+VALUATION_TRAP_SAFETY_MAX = 50.0
+
 # --- Master-grade scoring weights (DGI value defence — master asymmetric model) ---
 # 🛡️ Value defence — 35 / 25 / 25 / 15 with death penalties
 WEIGHT_VALUE_QUALITY = 35.0     # ROIC + gross-margin stability + operating margin
@@ -54,14 +58,12 @@ VALUE_SCORE_DEATH_CAP = 69.0
 FCF_PAYOUT_EXTRA_PENALTY = 10.0
 # Turnaround radar — anti-bankruptcy gate (shared with death penalty)
 NET_DEBT_EBITDA_MAX = 3.0
-# Red Team Protocol — absolute score ceiling (no 100/100 «perfect safety»)
-SCORE_CAP = 95.0
-# 🚀 Growth momentum — nerfed technicals; quality vs valuation split (30/25/25/15/5)
+# 🚀 Growth momentum — nerfed technicals; quality vs valuation split
 WEIGHT_GROWTH_FUNDAMENTAL = 30.0   # revenue / CapEx fundamental growth
 WEIGHT_GROWTH_SURPRISE = 25.0      # EPS surprise / revision
 WEIGHT_GROWTH_PEG_VAL = 25.0       # PEG relative-growth valuation
 WEIGHT_GROWTH_TECH_TIMING = 15.0   # SMA timing auxiliary only (demoted)
-WEIGHT_GROWTH_RISK_BUFFER = 5.0    # balance-sheet / red-flag risk cushion
+WEIGHT_GROWTH_RISK_BUFFER = 5.0    # leverage / red-flag risk cushion (quality track)
 # Legacy aliases (backward compat for helpers)
 WEIGHT_GROWTH_FORWARD = WEIGHT_GROWTH_FUNDAMENTAL + WEIGHT_GROWTH_PEG_VAL
 WEIGHT_GROWTH_MOMENTUM = WEIGHT_GROWTH_TECH_TIMING
@@ -94,19 +96,19 @@ TURNAROUND_LOOKBACK = "6mo"
 TURNAROUND_MIN_DRAWDOWN_PCT = 15.0
 TURNAROUND_REVENUE_CAGR_YEARS = 3
 TURNAROUND_STRUCTURAL_GM_DECLINE_PP = 5.0
-# Sector gross-margin median benchmarks (%, approximate) for anti-decay filter
-SECTOR_GM_MEDIAN_PCT: dict[str, float] = {
-    "Technology": 52.0,
+# Sector gross-margin median proxies (%, TTM) — anti structural decay vs peers
+SECTOR_GROSS_MARGIN_MEDIAN_PCT: dict[str, float] = {
+    "Technology": 55.0,
     "Healthcare": 58.0,
+    "Financial Services": 45.0,
+    "Consumer Cyclical": 38.0,
     "Consumer Defensive": 32.0,
-    "Consumer Cyclical": 28.0,
-    "Industrials": 35.0,
-    "Energy": 38.0,
-    "Utilities": 42.0,
-    "Real Estate": 55.0,
-    "Basic Materials": 30.0,
-    "Communication Services": 45.0,
-    "Financial Services": 0.0,
+    "Industrials": 28.0,
+    "Energy": 25.0,
+    "Utilities": 35.0,
+    "Real Estate": 50.0,
+    "Communication Services": 48.0,
+    "Basic Materials": 22.0,
 }
 DEFAULT_SECTOR_GM_MEDIAN_PCT = 35.0
 # Valuation attractiveness — price vs 52-week high OR trailing PEG
@@ -385,8 +387,8 @@ class StockReport:
     beta: float | None = None
     score_details: list[ScoreDetail] = field(default_factory=list)
     total_score: float = 0.0                       # legacy alias → business_quality_score
-    business_quality_score: float = 0.0            # Business Quality 0–100 (capped)
-    valuation_safety_score: float = 0.0            # Valuation Safety 0–100 (capped)
+    business_quality_score: float = 0.0            # Business Quality 0–100
+    valuation_margin_score: float = 0.0            # Valuation Safety Score 0–100
     grade_label: str = ""
     grade_emoji: str = ""
     analyst_commentary: str = ""
@@ -406,13 +408,13 @@ class StockReport:
             return None
         return (
             self.business_quality_score >= 70
-            and self.valuation_safety_score >= 50
+            and self.valuation_margin_score >= VALUATION_TRAP_SAFETY_MAX
         )
 
     @property
-    def valuation_margin_score(self) -> float:
-        """Legacy alias — Red Team Protocol uses valuation_safety_score."""
-        return self.valuation_safety_score
+    def valuation_safety_score(self) -> float:
+        """Alias — Red Team Protocol naming."""
+        return self.valuation_margin_score
 
 
 @lru_cache(maxsize=1)
@@ -1383,42 +1385,51 @@ def fetch_master_metrics(
     )
 
 
-def _cap_red_team_score(score: float) -> float:
-    """Red Team Protocol — no score may exceed SCORE_CAP (absolute safety forbidden)."""
-    return round(min(max(float(score), 0.0), SCORE_CAP), 1)
-
-
-def _sector_gm_median_pct(info: dict) -> float:
-    """Approximate sector gross-margin median for anti-decay comparison."""
-    sector = str(info.get("sector") or "").strip()
-    if sector in SECTOR_GM_MEDIAN_PCT:
-        med = SECTOR_GM_MEDIAN_PCT[sector]
-        if med > 0:
-            return med
+def _sector_gross_margin_median_pct(info: dict | None) -> float:
+    """Proxy industry median gross margin from yfinance sector label."""
+    info = info or {}
+    sector = str(info.get("sector") or info.get("industry") or "").strip()
+    if not sector:
+        return DEFAULT_SECTOR_GM_MEDIAN_PCT
+    for key, median in SECTOR_GROSS_MARGIN_MEDIAN_PCT.items():
+        if key.lower() in sector.lower() or sector.lower() in key.lower():
+            return median
     return DEFAULT_SECTOR_GM_MEDIAN_PCT
+
+
+def _margin_above_industry_or_stable(
+    ticker: yf.Ticker,
+    info: dict | None,
+) -> bool:
+    """
+    Latest-quarter GM above sector median proxy AND no structural YoY collapse.
+    """
+    margin_ok, latest_gm_pct, _ = _gross_margin_filter(ticker)
+    if latest_gm_pct is None:
+        return False
+    if not margin_ok:
+        return False
+    sector_median = _sector_gross_margin_median_pct(info)
+    return latest_gm_pct >= sector_median
 
 
 def _anti_value_trap_filter(ticker: yf.Ticker, info: dict | None = None) -> bool:
     """
-    Anti-decay gate (Red Team Protocol):
+    Anti-structural-decay gate (Red Team Protocol).
 
-    Pass when ANY of:
-      · 3Y revenue CAGR > 0
-      · latest-quarter gross margin > sector median
-      · gross margin shows no structural collapse (YoY decline ≤ threshold)
+    Pass when:
+      · 3Y revenue CAGR > 0, OR
+      · latest-quarter gross margin ≥ sector-median proxy AND no structural collapse.
+
+    Hard reject when 3Y CAGR is known and ≤ 0 (shrinking core business).
     """
-    info = info or {}
     cagr_3y = fetch_revenue_cagr_3y(ticker)
-    if cagr_3y is not None and cagr_3y > 0:
+    if cagr_3y is not None:
+        if cagr_3y <= 0:
+            return False
         return True
 
-    margin_ok, gm_pct, _ = _gross_margin_filter(ticker)
-    if gm_pct is not None:
-        sector_med = _sector_gm_median_pct(info)
-        if sector_med > 0 and gm_pct > sector_med:
-            return True
-
-    return margin_ok
+    return _margin_above_industry_or_stable(ticker, info)
 
 
 def _passes_right_side_filter(
@@ -1632,11 +1643,7 @@ def _attach_reason_tag(opp: TurnaroundOpportunity) -> TurnaroundOpportunity:
         f"{opp.price_vs_52w_high if opp.price_vs_52w_high is not None else 'N/A'}\n\n"
         f"Recent headlines:\n{news_block}"
     )
-    tag, comment = _cached_llm_turnaround_reason_tag(
-        opp.symbol.upper(),
-        STRATEGY_VALUE,
-        context,
-    )
+    tag, comment = _cached_llm_turnaround_reason_tag(opp.symbol.upper(), context)
     opp.reason_tag = tag
     opp.reason_comment = comment
     return opp
@@ -2635,7 +2642,7 @@ def _apply_value_death_penalties(
     if cap_total:
         total = min(total, VALUE_SCORE_DEATH_CAP)
 
-    return round(total, 1)
+    return apply_score_cap(total)
 
 
 def score_earnings_surprise_component(
@@ -2733,6 +2740,44 @@ def score_growth_fundamental_component(master: MasterMetrics) -> ScoreDetail:
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
 
+def score_growth_risk_buffer_component(
+    master: MasterMetrics,
+    beta: float | None = None,
+) -> ScoreDetail:
+    """🚀 Risk buffer (5): leverage, red flags, volatility — quality-track cushion."""
+    max_pts = WEIGHT_GROWTH_RISK_BUFFER
+    category = "風險緩衝"
+    earned = max_pts * 0.55
+    parts: list[str] = []
+
+    if master.net_debt_ebitda is not None:
+        if master.net_debt_ebitda > NET_DEBT_EBITDA_DEATH_THRESHOLD:
+            earned = max_pts * 0.10
+            parts.append(f"淨債務/EBITDA {master.net_debt_ebitda:.1f}x 超標")
+        elif master.net_debt_ebitda < 1.5:
+            earned = max(earned, max_pts * 0.90)
+            parts.append(f"槓桿溫和 {master.net_debt_ebitda:.1f}x")
+
+    if master.operating_margin_red_flag:
+        earned = min(earned, max_pts * 0.25)
+        parts.append("營業利益率紅旗")
+    if master.capex_red_flag:
+        earned = min(earned, max_pts * 0.35)
+        parts.append("CapEx 效率陷阱紅旗")
+
+    if beta is not None:
+        if beta > 2.5:
+            earned = min(earned, max_pts * 0.20)
+            parts.append(f"Beta {beta:.2f} 過高")
+        elif 0.9 <= beta <= 1.8:
+            earned = max(earned, max_pts * 0.75)
+
+    if not parts:
+        parts.append("無重大結構紅旗")
+    rationale = " · ".join(parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
+    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
+
+
 def score_growth_peg_valuation_component(master: MasterMetrics) -> ScoreDetail:
     """🚀 PEG relative-growth valuation (25) — isolated valuation track."""
     max_pts = WEIGHT_GROWTH_PEG_VAL
@@ -2756,56 +2801,12 @@ def score_growth_peg_valuation_component(master: MasterMetrics) -> ScoreDetail:
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
 
-def score_growth_risk_buffer_component(
-    master: MasterMetrics,
-    beta: float | None = None,
-) -> ScoreDetail:
-    """Risk buffer (5): deduct for red flags — balance sheet, volatility, margin/CapEx traps."""
-    max_pts = WEIGHT_GROWTH_RISK_BUFFER
-    category = "風險緩衝"
-    earned = max_pts
-    parts: list[str] = ["基準滿分"]
-
-    if master.operating_margin_red_flag:
-        earned -= 2.0
-        parts.append("營業利益率紅旗 -2")
-    if master.capex_red_flag:
-        earned -= 1.5
-        parts.append("CapEx 效率陷阱 -1.5")
-    if master.net_debt_ebitda is not None and master.net_debt_ebitda > NET_DEBT_EBITDA_MAX:
-        earned -= 2.0
-        parts.append(f"淨槓桿 {master.net_debt_ebitda:.1f}x -2")
-    if beta is not None and beta > 2.5:
-        earned -= 1.0
-        parts.append(f"高 Beta {beta:.2f} -1")
-
-    earned = max(0.0, min(earned, max_pts))
-    rationale = " · ".join(parts) + f"，本項得 {earned:.1f}/{max_pts:.0f} 分。"
-    return ScoreDetail(category, max_pts, round(earned, 1), rationale)
-
-
 def score_valuation_safety_component(
     master: MasterMetrics,
     info: dict | None = None,
 ) -> ScoreDetail:
-    """Valuation Safety (100): Forward P/E + PEG + FCF Yield — isolated from quality."""
-    return _score_valuation_safety_inner(master, info)
-
-
-def score_valuation_margin_component(
-    master: MasterMetrics,
-    info: dict | None = None,
-) -> ScoreDetail:
-    """Legacy alias → Valuation Safety component."""
-    return score_valuation_safety_component(master, info)
-
-
-def _score_valuation_safety_inner(
-    master: MasterMetrics,
-    info: dict | None = None,
-) -> ScoreDetail:
     """
-    Valuation Margin (100): Forward P/E + PEG + FCF Yield.
+    Valuation Safety Score (100): Forward P/E + PEG + FCF Yield.
 
     Isolated from Business Quality — exposes 'great company, bad price' traps.
     """
@@ -2872,7 +2873,25 @@ def _score_valuation_safety_inner(
         parts.append("FCF Yield 缺失")
 
     rationale = " · ".join(parts) + f"，估值安全 {earned:.1f}/{max_pts:.0f} 分。"
-    return ScoreDetail(category, max_pts, round(min(earned, max_pts), 1), rationale)
+    raw = round(min(earned, max_pts), 1)
+    return ScoreDetail(category, max_pts, apply_score_cap(raw), rationale)
+
+
+def score_valuation_margin_component(
+    master: MasterMetrics,
+    info: dict | None = None,
+) -> ScoreDetail:
+    """Legacy alias → Valuation Safety Score."""
+    return score_valuation_safety_component(master, info)
+
+
+def apply_score_cap(score: float) -> float:
+    """Red Team Protocol — absolute safety scores cannot exceed SCORE_CAP."""
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(min(max(0.0, value), SCORE_CAP), 1)
 
 
 def grade_from_score(total: float, *, growth: bool = False) -> tuple[str, str]:
@@ -3021,19 +3040,20 @@ def _format_master_commentary_context(report: StockReport) -> str:
         else STRATEGY_LABEL_VALUE
     )
     quality = report.business_quality_score or report.total_score
-    valuation = report.valuation_safety_score
+    valuation = report.valuation_margin_score
     lines = [
         f"Ticker: {report.symbol}",
         f"Company: {report.company_name}",
         f"Strategy: {mode_label}",
-        f"Business Quality Score: {quality:.1f}/100 (cap {SCORE_CAP:.0f})",
-        f"Valuation Safety Score: {valuation:.1f}/100 (cap {SCORE_CAP:.0f})",
+        f"Business Quality Score: {quality:.1f}/100",
+        f"Valuation Margin Score: {valuation:.1f}/100",
         f"Grade (quality-based): {report.grade_emoji} {report.grade_label}",
     ]
-    if quality >= 70 and valuation < 50:
+    if quality >= VALUATION_TRAP_QUALITY_MIN and valuation < VALUATION_TRAP_SAFETY_MAX:
         lines.append(
-            "⚠ VALUATION TRAP ALERT: Business quality strong but Valuation Safety <50 — "
-            "Red Team MUST attack overvaluation / priced-in perfection."
+            f"⚠ VALUATION TRAP ALERT: Business quality elite but Valuation Safety <"
+            f"{VALUATION_TRAP_SAFETY_MAX:.0f} — Red Team MUST attack overvaluation / "
+            "priced-in perfection."
         )
     lines.extend([
         "",
@@ -3072,176 +3092,14 @@ def _format_master_commentary_context(report: StockReport) -> str:
     return "\n".join(lines)
 
 
-def _sleep_gemini_retry(attempt: int) -> None:
-    """Pause before next Gemini retry (exponential backoff + jitter)."""
-    from llm_processor import gemini_retry_sleep_seconds
-
-    time.sleep(gemini_retry_sleep_seconds(attempt))
-
-
-def _build_red_team_attack_block(report: StockReport) -> list[str]:
-    """Deterministic 2–3 red-team attack lines when LLM is offline."""
-    m = report.master
-    quality = float(report.business_quality_score or report.total_score or 0.0)
-    valuation = float(report.valuation_safety_score or 0.0)
-    growth = is_growth_strategy(report.strategy_mode)
-    attacks: list[str] = []
-
-    if quality >= 70 and valuation < 50:
-        attacks.append(
-            f"品質分 {quality:.0f} 但估值安全僅 {valuation:.0f}：屬「好公司、貴價格」陷阱，"
-            "市場可能已透支未來完美預期。"
-        )
-    if m.peg_ratio is not None and m.peg_ratio > 1.8:
-        attacks.append(
-            f"前瞻 PEG {m.peg_ratio:.2f} 偏高：若 CapEx 無法轉化為毛利，"
-            "高成長敘事易淪為估值下修。"
-        )
-    elif m.peg_ratio is not None and m.peg_ratio > 1.35:
-        attacks.append(
-            f"PEG {m.peg_ratio:.2f} 未見明顯安全邊際，股價已提前反映中高速成長假設。"
-        )
-    if m.fcf_payout_ratio is not None and m.fcf_payout_ratio > FCF_PAYOUT_DEATH_THRESHOLD:
-        attacks.append(
-            f"FCF 支付率 {m.fcf_payout_ratio * 100:.1f}% 透支股息承諾，"
-            f"裁息或舉債填缺口風險上升（>{FCF_PAYOUT_DEATH_THRESHOLD * 100:.0f}% 門檻）。"
-        )
-    elif m.fcf_payout_ratio is not None and m.fcf_payout_ratio > 0.75:
-        attacks.append(
-            f"FCF 支付率 {m.fcf_payout_ratio * 100:.1f}% 偏高，"
-            "自由現金流對股東回饋的緩衝有限。"
-        )
-    if m.net_debt_ebitda is not None and m.net_debt_ebitda > NET_DEBT_EBITDA_DEATH_THRESHOLD:
-        attacks.append(
-            f"淨債務/EBITDA {m.net_debt_ebitda:.1f}x 逾 {NET_DEBT_EBITDA_DEATH_THRESHOLD:.0f}x 死亡線，"
-            f"財務安全應視為一票否決級風險（品質分封頂 {VALUE_SCORE_DEATH_CAP:.0f}）。"
-        )
-    elif m.net_debt_ebitda is not None and m.net_debt_ebitda > 2.0:
-        attacks.append(
-            f"淨槓桿 {m.net_debt_ebitda:.1f}x 仍處高區間，利率與再融資敏感度偏高。"
-        )
-    if m.interest_coverage is not None and m.interest_coverage < 3.0:
-        attacks.append(
-            f"利息保障倍數僅 {m.interest_coverage:.1f}x，"
-            "景氣下行時利息支出對利潤侵蝕顯著。"
-        )
-    if m.operating_margin_red_flag:
-        msg = (m.operating_margin_red_flag_msg or "").strip()
-        attacks.append(
-            f"營業利益率紅旗：{msg}" if msg else "營業利益率同比惡化，定價權/成本轉嫁能力存疑。"
-        )
-    if m.capex_red_flag:
-        msg = (m.capex_red_flag_msg or "").strip()
-        attacks.append(
-            f"CapEx 警訊：{msg}" if msg else "CapEx 異常波動，需質疑擴張能否轉為毛利。"
-        )
-    if growth:
-        if m.surprise_latest_pct is not None and m.surprise_latest_pct < 0:
-            attacks.append(
-                f"最新 Surprise {m.surprise_latest_pct:+.1f}% 為負，"
-                "預期修正向下風險尚未解除。"
-            )
-        elif (m.surprise_beat_streak or 0) == 0 and (m.surprise_sample or 0) > 0:
-            attacks.append("缺乏連續超預期紀錄，動能敘事缺少盈利驗證支撐。")
-        ts = report.trend_signal or {}
-        sig = str(ts.get("current_signal", "") or "")
-        if sig == "Sell":
-            attacks.append("技術面 Death Cross：中期動能衰竭，不宜過度解讀反彈。")
-        elif sig == "Wait":
-            attacks.append("價格仍處弱勢通道，右側結構未確認。")
-    if quality < 65:
-        attacks.append(
-            f"企業品質分僅 {quality:.0f}，護城河與現金流紀律不足以支撐積極倉位。"
-        )
-    if valuation < 45:
-        attacks.append(
-            f"估值安全分 {valuation:.0f} 偏低，即使基本面尚可，風險報酬比仍不利做多。"
-        )
-    if report.fcf_pass is False:
-        note = (report.fcf_note or "自由現金流不穩定").strip()
-        attacks.append(f"FCF 紀律未通過：{note}")
-
-    unique: list[str] = []
-    seen: set[str] = set()
-    for line in attacks:
-        if line in seen:
-            continue
-        seen.add(line)
-        unique.append(line)
-        if len(unique) >= 3:
-            break
-    while len(unique) < 2:
-        unique.append(
-            "離線紅隊：請人工複核 Forward P/E、PEG 與 FCF Yield 是否與敘事一致，"
-            "避免單邊樂觀偏誤。"
-        )
-    return unique[:3]
-
-
-def _red_team_section_lines(report: StockReport) -> list[str]:
-    """Red-team attack block matching LLM prompt contract (2–3 bullets)."""
-    lines = ["", "【🩸 紅隊漏洞審查 (Red Team Attack)】"]
-    for attack in _build_red_team_attack_block(report):
-        lines.append(f"- {attack}")
-    return lines
-
-
-def _value_debt_decline_section_lines(report: StockReport) -> list[str]:
-    """Value-mode second red-team section: leverage & decline risks."""
-    m = report.master
-    bullets: list[str] = []
-    if m.net_debt_ebitda is not None:
-        bullets.append(
-            f"淨債務/EBITDA {m.net_debt_ebitda:.1f}x："
-            + (
-                "已觸發死亡懲罰區間，再融資與利息成本可能壓縮股東回報。"
-                if m.net_debt_ebitda > NET_DEBT_EBITDA_DEATH_THRESHOLD
-                else "槓桿偏高時，景氣反轉易放大每股盈利波動。"
-            )
-        )
-    if m.interest_coverage is not None and m.interest_coverage < 5.0:
-        bullets.append(
-            f"利息保障 {m.interest_coverage:.1f}x 偏弱，"
-            "利率上行或 EBIT 下滑將直接侵蝕自由現金流。"
-        )
-    if m.revenue_cagr_5y is not None and m.revenue_cagr_5y < 0:
-        bullets.append(
-            f"5Y 營收 CAGR {_fmt_pct(m.revenue_cagr_5y)} 為負，"
-            "衰退型價值陷阱風險高於單純「便宜」標籤。"
-        )
-    if m.roe and m.roic and m.roe > m.roic * 1.8:
-        bullets.append(
-            f"ROE {_fmt_pct(m.roe)} 顯著高於 ROIC {_fmt_pct(m.roic)}，"
-            "護城河敘事可能由槓桿而非真實資本回報支撐。"
-        )
-    if not bullets:
-        bullets.append(
-            "離線模式：仍須人工核對債務契約、到期牆與景氣敏感度，"
-            "避免低估週期性下行。"
-        )
-    lines = ["", "【債務槓桿與衰退風險】"]
-    for b in bullets[:2]:
-        lines.append(f"- {b}")
-    return lines
-
-
-def _safe_narrative_fallback_text(raw: str | None) -> str:
-    """Sanitize static summary fallback — never cache or show poisoned API text."""
-    from llm_processor import accept_llm_cache_result
-
-    if not raw:
-        return ""
-    return accept_llm_cache_result(str(raw).strip()) or ""
-
-
 def _build_value_analyst_commentary(report: StockReport) -> str:
     quality = report.business_quality_score or report.total_score
-    valuation = report.valuation_safety_score
+    valuation = report.valuation_margin_score
     sections: list[str] = [
         "AI 首席分析師決策點評",
         f"{report.symbol} · {report.company_name}",
         "策略戰術：🛡️ 價值防禦模式",
-        f"Red Team 雙軌：企業品質 {quality:.1f}/95 · 估值安全 {valuation:.1f}/95 — "
+        f"綜合評分（雙軌 · 封頂{SCORE_CAP:.0f}）：企業品質 {quality:.1f} · 估值安全 {valuation:.1f} — "
         f"{report.grade_emoji} {report.grade_label}",
         "",
         "【評分明細（微觀原因）】",
@@ -3298,9 +3156,6 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
         f"營業利益率 {_fmt_pct(m.ttm_operating_margin)}"
     )
 
-    sections.extend(_red_team_section_lines(report))
-    sections.extend(_value_debt_decline_section_lines(report))
-
     sections.append("")
     sections.append("【投資風格提示】")
     sections.append(
@@ -3309,8 +3164,11 @@ def _build_value_analyst_commentary(report: StockReport) -> str:
         "建議與 產業景氣、估值與個人風險偏好 一併考量。"
     )
 
-    if quality >= 70 and valuation < 50:
-        sections.append("\n⚠️ 品質極優但估值安全不足 — 詳見上方紅隊區塊。")
+    if quality >= VALUATION_TRAP_QUALITY_MIN and valuation < VALUATION_TRAP_SAFETY_MAX:
+        sections.append(
+            "\n⚠️ 品質極優，但估值過高，注意安全邊際。"
+            "紅隊必須質疑：當前價格已透支多少未來的完美預期？"
+        )
     elif quality >= 85:
         sections.append(
             "\n結論：護城河與現金流紀律俱佳；仍須確認估值邊際是否提供足夠安全墊。"
@@ -3334,7 +3192,7 @@ def _format_growth_commentary_context(report: StockReport) -> str:
         f"Company: {report.company_name}",
         f"Strategy: {STRATEGY_LABEL_GROWTH}",
         f"Business Quality: {report.business_quality_score or report.total_score:.1f}/100",
-        f"Valuation Safety: {report.valuation_safety_score:.1f}/100",
+        f"Valuation Margin: {report.valuation_margin_score:.1f}/100",
         f"Grade: {report.grade_emoji} {report.grade_label}",
         "",
         "Score breakdown (FCF/Dividend/Payout excluded — weight 0):",
@@ -3374,12 +3232,12 @@ def _format_growth_commentary_context(report: StockReport) -> str:
 
 def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
     quality = report.business_quality_score or report.total_score
-    valuation = report.valuation_safety_score
+    valuation = report.valuation_margin_score
     sections: list[str] = [
         "AI 首席分析師決策點評",
         f"{report.symbol} · {report.company_name}",
         "策略戰術：🚀 動能成長模式 · 紅隊審查視角",
-        f"Red Team 雙軌：企業品質 {quality:.1f}/95 · 估值安全 {valuation:.1f}/95 — "
+        f"雙軌得分（封頂{SCORE_CAP:.0f}）：企業品質 {quality:.1f} · 估值安全 {valuation:.1f} — "
         f"{report.grade_emoji} {report.grade_label}",
         "",
         "【評分明細（動能引擎）】",
@@ -3428,15 +3286,6 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
             f"最新 Surprise {surprise_txt}（連續超預期 {m.surprise_beat_streak} 季）",
         ]
     )
-    sections.extend(_red_team_section_lines(report))
-    sections.extend(
-        [
-            "",
-            "【嚴格空頭風險與對手競爭防禦】",
-            "- 動能模式不評 FCF/股息；須防「敘事先行、盈利後驗」的估值透支。",
-            "- 若 PEG 與 Surprise 無法同步改善，波段多單風險報酬比惡化。",
-        ]
-    )
     sections.append(
         "\n機構視角結論：本模式 零權重 評估 FCF / 股息 / 發放率，避免對燒錢新創的防禦偏見。"
         "聚焦 PEG 剪刀差 + CapEx 擴張、右側通道支撐 與 預期修正動態。"
@@ -3444,113 +3293,46 @@ def _build_growth_analyst_commentary_fallback(report: StockReport) -> str:
     return "\n".join(sections)
 
 
-_LLM_BUSY_MESSAGE = "目前 AI 伺服器擁擠，請稍後重試。"
-
-
-def _notify_llm_busy() -> None:
-    """Log rate-limit / LLM outage only — UI alerts render in app.py section blocks."""
-    print(f"Warning: {_LLM_BUSY_MESSAGE}")
-
-
-def _accept_cached_llm_text(text: str | None) -> str | None:
-    from llm_processor import accept_llm_cache_result
-
-    return accept_llm_cache_result(text)
-
-
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_llm_value_commentary(symbol: str, strategy_mode: str, context: str) -> str | None:
-    """Cache value-mode analyst commentary — keyed by ticker + strategy (context is plain str)."""
+def _cached_llm_value_commentary(symbol: str, context: str) -> str | None:
+    """Cache value-mode analyst commentary — keyed by ticker + context."""
     from llm_processor import generate_value_analyst_commentary
 
-    sym = symbol.upper().strip()
-    mode = normalize_strategy_mode(strategy_mode)
-    for attempt in range(1, 4):
-        try:
-            result = generate_value_analyst_commentary(context)
-            accepted = _accept_cached_llm_text(result)
-            if accepted:
-                return accepted
-        except Exception as exc:
-            print(f"Warning: value commentary failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
-        if attempt < 3:
-            _sleep_gemini_retry(attempt)
-    _notify_llm_busy()
-    return None
+    return generate_value_analyst_commentary(context)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_llm_growth_commentary(symbol: str, strategy_mode: str, context: str) -> str | None:
-    """Cache growth-mode analyst commentary — keyed by ticker + strategy (context is plain str)."""
+def _cached_llm_growth_commentary(symbol: str, context: str) -> str | None:
+    """Cache growth-mode analyst commentary — keyed by ticker + context."""
     from llm_processor import generate_growth_analyst_commentary
 
-    sym = symbol.upper().strip()
-    mode = normalize_strategy_mode(strategy_mode)
-    for attempt in range(1, 4):
-        try:
-            result = generate_growth_analyst_commentary(context)
-            accepted = _accept_cached_llm_text(result)
-            if accepted:
-                return accepted
-        except Exception as exc:
-            print(f"Warning: growth commentary failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
-        if attempt < 3:
-            _sleep_gemini_retry(attempt)
-    _notify_llm_busy()
-    return None
+    return generate_growth_analyst_commentary(context)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_llm_investment_scorecard(
     symbol: str,
-    strategy_mode: str,
+    growth: bool,
     context: str,
 ) -> tuple[tuple[str, int, str], ...] | None:
     """Cache Master Investment Scorecard rows as a hashable tuple."""
-    from llm_processor import accept_llm_cache_result, generate_investment_scorecard
+    from llm_processor import generate_investment_scorecard
 
-    sym = symbol.upper().strip()
-    mode = normalize_strategy_mode(strategy_mode)
-    growth = is_growth_strategy(mode)
-    for attempt in range(1, 4):
-        try:
-            raw = generate_investment_scorecard(context, growth=growth)
-            if raw:
-                rows: list[tuple[str, int, str]] = []
-                for row in raw:
-                    rationale = accept_llm_cache_result(str(row.get("rationale", "")))
-                    if not rationale:
-                        continue
-                    rows.append(
-                        (str(row["dimension"]), int(row["score"]), rationale)
-                    )
-                if rows:
-                    return tuple(rows)
-        except Exception as exc:
-            print(f"Warning: scorecard failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
-        if attempt < 3:
-            _sleep_gemini_retry(attempt)
-    _notify_llm_busy()
-    return None
+    raw = generate_investment_scorecard(context, growth=growth)
+    if not raw:
+        return None
+    return tuple(
+        (str(row["dimension"]), int(row["score"]), str(row["rationale"]))
+        for row in raw
+    )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_llm_turnaround_reason_tag(symbol: str, strategy_mode: str, context: str) -> tuple[str, str]:
+def _cached_llm_turnaround_reason_tag(symbol: str, context: str) -> tuple[str, str]:
     """Cache Gemini mispricing reason tag for turnaround radar hits."""
     from llm_processor import generate_turnaround_reason_tag
 
-    sym = symbol.upper().strip()
-    mode = normalize_strategy_mode(strategy_mode)
-    for attempt in range(1, 4):
-        try:
-            return generate_turnaround_reason_tag(context)
-        except Exception as exc:
-            print(f"Warning: reason tag failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
-        if attempt < 3:
-            _sleep_gemini_retry(attempt)
-    from llm_processor import _fallback_turnaround_reason_tag
-
-    return _fallback_turnaround_reason_tag(context)
+    return generate_turnaround_reason_tag(context)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -3560,24 +3342,11 @@ def _cached_llm_value_narrative(
     business_summary: str,
     sector: str,
     industry: str,
-) -> str | None:
+) -> str:
     """Cache value-mode tech narrative (static business summary)."""
     from llm_processor import generate_company_narrative_text
 
-    sym = symbol.upper().strip()
-    mode = normalize_strategy_mode(strategy_mode)
-    for attempt in range(1, 4):
-        try:
-            result = generate_company_narrative_text(sym, business_summary, sector, industry)
-            accepted = _accept_cached_llm_text(result)
-            if accepted:
-                return accepted
-        except Exception as exc:
-            print(f"Warning: value narrative failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
-        if attempt < 3:
-            _sleep_gemini_retry(attempt)
-    _notify_llm_busy()
-    return None
+    return generate_company_narrative_text(symbol, business_summary, sector, industry)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -3590,38 +3359,25 @@ def _cached_llm_growth_narrative(
     live_news_text: str,
     trend_json: str,
     master_text: str,
-) -> str | None:
+) -> str:
     """Cache growth-mode live-news narrative — trend serialized as JSON."""
     from llm_processor import generate_growth_narrative_text
 
-    sym = symbol.upper().strip()
-    mode = normalize_strategy_mode(strategy_mode)
     trend: dict | None = None
     if trend_json:
         try:
             trend = json.loads(trend_json)
         except json.JSONDecodeError:
             trend = None
-    for attempt in range(1, 4):
-        try:
-            result = generate_growth_narrative_text(
-                sym,
-                business_summary,
-                sector,
-                industry,
-                live_news_text=live_news_text,
-                trend_signal=trend,
-                master_text=master_text,
-            )
-            accepted = _accept_cached_llm_text(result)
-            if accepted:
-                return accepted
-        except Exception as exc:
-            print(f"Warning: growth narrative failed ({sym}/{mode}) attempt {attempt}/3: {exc}")
-        if attempt < 3:
-            _sleep_gemini_retry(attempt)
-    _notify_llm_busy()
-    return None
+    return generate_growth_narrative_text(
+        symbol,
+        business_summary,
+        sector,
+        industry,
+        live_news_text=live_news_text,
+        trend_signal=trend,
+        master_text=master_text,
+    )
 
 
 def clear_gemini_llm_cache() -> None:
@@ -3644,14 +3400,11 @@ def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardIt
     )
     context = _format_master_commentary_context(report)
     sym = report.symbol.upper()
-    mode = normalize_strategy_mode(report.strategy_mode)
 
     if growth:
-        llm_text = _cached_llm_growth_commentary(sym, mode, context)
+        llm_text = _cached_llm_growth_commentary(sym, context)
     else:
-        llm_text = _cached_llm_value_commentary(sym, mode, context)
-
-    llm_text = _accept_cached_llm_text(llm_text)
+        llm_text = _cached_llm_value_commentary(sym, context)
 
     if llm_text:
         commentary = (
@@ -3665,7 +3418,7 @@ def build_analyst_commentary(report: StockReport) -> tuple[str, list[ScorecardIt
     else:
         commentary = _build_value_analyst_commentary(report)
 
-    raw_scorecard = _cached_llm_investment_scorecard(sym, mode, context)
+    raw_scorecard = _cached_llm_investment_scorecard(sym, growth, context)
     if raw_scorecard:
         scorecard = [
             ScorecardItem(
@@ -3804,10 +3557,9 @@ def compute_scores(
     master: MasterMetrics | None = None,
 ) -> tuple[list[ScoreDetail], float, float, str, str]:
     """
-    Dual-track scoring: Business Quality (100) + Valuation Safety (100).
+    Dual-track scoring: Business Quality (100) + Valuation Margin (100).
 
-    Both tracks capped at SCORE_CAP (95). Returns
-    (score_details, business_quality_score, valuation_safety_score, emoji, label).
+    Returns (score_details, business_quality_score, valuation_margin_score, emoji, label).
     """
     mode = normalize_strategy_mode(strategy_mode)
     master = master or MasterMetrics()
@@ -3819,8 +3571,8 @@ def compute_scores(
             master, category="預期修正 Surprise", max_pts=WEIGHT_GROWTH_SURPRISE
         )
         peg_val = score_growth_peg_valuation_component(master)
-        tech = score_growth_technical_timing_component(trend_signal)
         risk_buf = score_growth_risk_buffer_component(master, beta)
+        tech = score_growth_technical_timing_component(trend_signal)
         excluded = [
             _growth_excluded_component(
                 "FCF 連續為正", "🚀 成長模式：歷史 FCF 不計分（權重 0）。"
@@ -3832,15 +3584,21 @@ def compute_scores(
                 "股息發放率", "🚀 成長模式：發放率不計分（權重 0）。"
             ),
         ]
-        details = excluded + [fund, surp, peg_val, tech, risk_buf]
-        quality_raw = fund.earned + surp.earned
-        quality_max = WEIGHT_GROWTH_FUNDAMENTAL + WEIGHT_GROWTH_SURPRISE
-        business_quality = _cap_red_team_score(quality_raw / quality_max * 100.0)
-        valuation_safety = _cap_red_team_score(
-            peg_val.earned / WEIGHT_GROWTH_PEG_VAL * 100.0
+        details = excluded + [fund, surp, peg_val, risk_buf, tech]
+        quality_raw = fund.earned + surp.earned + risk_buf.earned
+        quality_max = (
+            WEIGHT_GROWTH_FUNDAMENTAL
+            + WEIGHT_GROWTH_SURPRISE
+            + WEIGHT_GROWTH_RISK_BUFFER
+        )
+        business_quality = apply_score_cap(
+            min(100.0, quality_raw / quality_max * 100.0)
+        )
+        valuation_margin = apply_score_cap(
+            min(100.0, peg_val.earned / WEIGHT_GROWTH_PEG_VAL * 100.0)
         )
         emoji, label = grade_from_score(business_quality, growth=True)
-        return details, business_quality, valuation_safety, emoji, label
+        return details, business_quality, valuation_margin, emoji, label
 
     quality_details = [
         score_value_quality_component(master),
@@ -3848,14 +3606,12 @@ def compute_scores(
         score_value_cashflow_component(master, div_rows),
         score_value_revenue_stability_component(master),
     ]
-    business_quality = _cap_red_team_score(
-        _apply_value_death_penalties(quality_details, master)
-    )
+    business_quality = _apply_value_death_penalties(quality_details, master)
     val_detail = score_valuation_safety_component(master, info)
-    valuation_safety = _cap_red_team_score(val_detail.earned)
+    valuation_margin = val_detail.earned
     details = quality_details + [val_detail]
     emoji, label = grade_from_score(business_quality, growth=False)
-    return details, business_quality, valuation_safety, emoji, label
+    return details, business_quality, valuation_margin, emoji, label
 
 
 def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
@@ -3899,7 +3655,7 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
         score_details=score_details,
         total_score=quality,
         business_quality_score=quality,
-        valuation_safety_score=valuation,
+        valuation_margin_score=valuation,
         grade_label=label,
         grade_emoji=emoji,
         fcf_pass=fcf_pass,
@@ -3954,11 +3710,11 @@ def build_company_narrative(
             trend_json,
             master_block,
         )
-        if not text and summary:
+        if text.startswith("⚠️") and summary:
             text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
-        if not text and summary:
-            text = _safe_narrative_fallback_text(summary)
-        return NarrativeResult(text=text or "", live_news_degraded=degraded)
+        elif not text.strip():
+            text = summary or "暫無可用敘事資料。"
+        return NarrativeResult(text=text, live_news_degraded=degraded)
 
     if not summary:
         return NarrativeResult(
@@ -3966,9 +3722,7 @@ def build_company_narrative(
             live_news_degraded=False,
         )
     text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
-    if not text:
-        text = _safe_narrative_fallback_text(summary)
-    return NarrativeResult(text=text or "", live_news_degraded=False)
+    return NarrativeResult(text=text, live_news_degraded=False)
 
 
 def analyze_all(
@@ -4006,7 +3760,7 @@ def reports_to_summary_df(
     growth_mode = is_growth_strategy(strategy_mode)
     for r in reports:
         quality = r.business_quality_score or r.total_score
-        valuation = r.valuation_safety_score
+        valuation = r.valuation_margin_score
         grade_emoji, grade_label = grade_from_score(quality, growth=growth_mode)
         grade_display = f"{grade_emoji} {grade_label}"
         if growth_mode:
@@ -4020,7 +3774,6 @@ def reports_to_summary_df(
                 "預期修正分": _detail_score(r, "預期修正", "Surprise"),
                 "PEG估值分": _detail_score(r, "PEG", "估值相對"),
                 "Timing輔助": _detail_score(r, "Timing", "技術面輔助"),
-                "風險緩衝": _detail_score(r, "風險緩衝"),
             }
         else:
             row = {

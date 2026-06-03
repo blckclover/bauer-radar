@@ -1,55 +1,11 @@
 """LLM-based news filtering for System A (Macro Watcher)."""
 from __future__ import annotations
 
-import logging
 import os
-import random
-import re
-import time
 
 from google import genai
 
 from data_fetcher import NewsItem
-
-logger = logging.getLogger(__name__)
-
-_HTML_FENCE_RE = re.compile(r"```(?:html)?\n?", re.IGNORECASE)
-_LLM_ERROR_MARKERS = (
-    "429",
-    "resource_exhausted",
-    "rate limit",
-    "too many requests",
-    "quota exceeded",
-    "科技敘事生成失敗",
-    "生成失敗",
-)
-
-
-def _strip_llm_fences(text: str) -> str:
-    return _HTML_FENCE_RE.sub("", text or "").replace("```", "").strip()
-
-
-def is_poisoned_llm_output(text: str | None) -> bool:
-    """True when text looks like an API failure — must not be cached or rendered."""
-    if text is None:
-        return True
-    raw = str(text).strip()
-    if not raw:
-        return True
-    if raw.startswith("⚠️"):
-        return True
-    lower = raw.lower()
-    if any(marker in lower or marker in raw for marker in _LLM_ERROR_MARKERS):
-        return True
-    return False
-
-
-def accept_llm_cache_result(text: str | None) -> str | None:
-    """Return sanitized LLM text safe to cache, or None to avoid cache poisoning."""
-    if is_poisoned_llm_output(text):
-        return None
-    cleaned = _strip_llm_fences(str(text).strip())
-    return cleaned or None
 
 FILTER_PROMPT = (
     "你是一個冷酷的量化投資資訊過濾器。請對以下新聞進行去噪，剔除所有煽動性形容詞與無關炒作（如虛擬貨幣）。"
@@ -58,57 +14,6 @@ FILTER_PROMPT = (
     "請用極簡短的中文列點輸出。若無重要變數，請輸出『今日無重要宏觀或個股變數』。"
 )
 MODEL_NAME = "gemini-2.5-flash"
-_GEMINI_MAX_RETRIES = 3
-_GEMINI_RETRY_MAX_SLEEP_SEC = 60.0
-
-
-def gemini_retry_sleep_seconds(attempt: int) -> float:
-    """Exponential backoff with jitter after failed attempt (1-based index)."""
-    if attempt < 1:
-        attempt = 1
-    sleep_time = (2**attempt) + random.uniform(0, 1)
-    return min(sleep_time, _GEMINI_RETRY_MAX_SLEEP_SEC)
-
-
-def _is_rate_limit_error(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return any(
-        token in msg
-        for token in ("429", "rate limit", "resource_exhausted", "quota", "too many requests")
-    )
-
-
-def _generate_content_with_backoff(client: genai.Client, *, model: str, contents: str) -> str:
-    """Call Gemini with exponential backoff + jitter on 429 / transient failures."""
-    last_exc: Exception | None = None
-    for attempt in range(1, _GEMINI_MAX_RETRIES + 1):
-        try:
-            response = client.models.generate_content(model=model, contents=contents)
-            text = (response.text or "").strip()
-            if not text:
-                raise ValueError("Gemini returned an empty response.")
-            return text
-        except Exception as exc:
-            last_exc = exc
-            kind = "429/rate-limit" if _is_rate_limit_error(exc) else "API"
-            logger.warning(
-                "Gemini %s error (attempt %d/%d): %s",
-                kind,
-                attempt,
-                _GEMINI_MAX_RETRIES,
-                exc,
-            )
-            print(
-                f"Warning: Gemini {kind} error (attempt {attempt}/{_GEMINI_MAX_RETRIES}): {exc}"
-            )
-            if attempt < _GEMINI_MAX_RETRIES:
-                delay = gemini_retry_sleep_seconds(attempt)
-                logger.info("Gemini retry backoff: sleeping %.2fs", delay)
-                time.sleep(delay)
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("Gemini API failed after retries")
-
 
 GROWTH_LEXICON_CONSTRAINT = (
     "在生成技術面與資金面點評時，禁止使用「多頭雛形」「飆股」「爆發」「拉抬」「暴雷」"
@@ -126,42 +31,46 @@ CAPEX_DIALECTIC_CONSTRAINT = (
 
 GROWTH_ANALYST_SYSTEM_PROMPT = (
     "你是華爾街頂級做空機構的首席紅隊審查員（Short-Side Red Team Commander）。"
-    "Red Team Protocol：禁止為高分找藉口，專責證偽與拆穿估值泡沫。"
+    "你的任務不是為高分找藉口，而是無情拆解財報與估值中最脆弱的環節。"
     "硬性規則："
     "1. [A] 季度 vs [B] TTM 絕對不可混淆；引用數字必須標明期間。"
-    "2. 嚴禁合理化包裝；Business Quality 高但 Valuation Safety <50 時，"
-    "   必須優先攻擊「偉大公司買太貴」陷阱。"
-    "3. CapEx 激增必須質問：若無法轉化為毛利，估值下修風險多大？"
+    "2. 嚴禁對高分進行合理化包裝；若 Business Quality 高但 Valuation Safety <50，"
+    "   必須優先攻擊「偉大公司買太貴」陷阱，質問當前價格已透支多少未來完美預期。"
+    "3. CapEx 激增時必須質問：若投入無法轉化為毛利，估值面臨多大下修風險？"
     "4. 禁止客套、禁止散戶情緒詞、禁止 Markdown #/**；"
     f"5. {CAPEX_DIALECTIC_CONSTRAINT}"
-    "6. 250–380 字；直接從第 1 點開始。"
+    "6. 280–400 字；直接從第 1 點開始。"
     "僅輸出以下四段（標題完整保留）："
-    "【部門拆解與 AI 轉型實質進展】：冷靜拆解剪刀差，禁止行銷。"
-    "【核心催化劑與開牌時間表】：若催化劑已被定價，必須點明。"
+    "【部門拆解與 AI 轉型實質進展】："
+    "冷靜拆解高增長 vs 衰退業務剪刀差；禁止行銷包裝。"
+    "【核心催化劑與開牌時間表】："
+    "未來 12 個月預期修正節點；若催化劑已被定價，必須點明。"
     "【🩸 紅隊漏洞審查 (Red Team Attack)】："
-    "硬性 2–3 點最殘酷證偽：估值透支、CapEx 轉換失敗、競爭/定價權流失；"
-    "每點須引用具體數字，禁止粉飾。"
-    "【嚴格空頭風險與對手競爭防禦】：至少 2 點空頭觀點。"
+    "硬性列出 2–3 個最殘酷的證偽風險與質疑（估值透支、CapEx 轉換失敗、"
+    "財報弱點或分析師下修）；每點須引用具體數字；禁止粉飾。"
+    "【嚴格空頭風險與對手競爭防禦】："
+    "至少 2 點最殘酷的空頭觀點。"
     f"{GROWTH_LEXICON_CONSTRAINT}"
 )
 
 VALUE_ANALYST_SYSTEM_PROMPT = (
     "你是華爾街頂級做空機構的首席紅隊審查員（Short-Side Red Team Commander）。"
-    "Red Team Protocol：剝離「好公司」與「好價格」，禁止啦啦隊式分析。"
+    "你以 Graham/Buffett 框架審查，但核心任務是剝離「好公司」與「好價格」。"
     "硬性規則："
     "1. [A] 季度 vs [B] TTM 絕對不可混淆。"
-    "2. ROIC 優先於 ROE；槓桿撐高 ROE 必須點破。"
-    "3. Business Quality 高但 Valuation Safety <50 → 必須亮紅燈攻擊估值。"
-    "4. FCF 支付率 >90%、淨債務/EBITDA >3x、營收衰退 → 點名價值陷阱。"
+    "2. ROIC 優先於 ROE；ROE 顯著高於 ROIC 必須點出槓桿假象。"
+    "3. 嚴禁對高分合理化；Business Quality 高且 Valuation Safety <50 時，"
+    "   必須亮紅燈：品質極優但估值過高，質問安全邊際何在。"
+    "4. FCF 支付率 >90%、淨債務/EBITDA >3x、5Y 營收 CAGR 為負 → 必須點名價值陷阱。"
     f"5. {CAPEX_DIALECTIC_CONSTRAINT}"
-    "6. 250–360 字；禁止客套與 Markdown #/**。"
+    "6. 280–380 字；禁止客套與 Markdown #/**。"
     "僅輸出以下四段："
-    "【ROIC 與真實護城河】：資本配置效率；禁止粉飾。"
-    "【FCF 股息安全網】：裁息風險；禁止粉飾。"
+    "【ROIC 與真實護城河】：以 ROIC 判定資本配置；指出槓桿撐高 ROE 假象。"
+    "【FCF 股息安全網】：FCF 支付率與裁息風險；禁止粉飾。"
     "【🩸 紅隊漏洞審查 (Red Team Attack)】："
-    "硬性 2–3 點：Forward P/E/PEG/FCF Yield 透支、CapEx 轉毛利失敗、"
-    "衰退型陷阱；每點引用數字。"
-    "【債務槓桿與衰退風險】：至少 2 點空頭觀點。"
+    "硬性 2–3 個最殘酷證偽風險：估值透支（Forward P/E/PEG/FCF Yield）、"
+    "CapEx 無法轉化毛利、衰退型價值陷阱或財報弱點；每點引用數字；禁止粉飾。"
+    "【債務槓桿與衰退風險】：淨槓桿、利息保障、營收 CAGR；至少 2 點空頭觀點。"
     f"{GROWTH_LEXICON_CONSTRAINT}"
 )
 
@@ -253,11 +162,14 @@ def crush_and_filter_news(news_list: list[NewsItem]) -> str:
 
     try:
         client = genai.Client(api_key=api_key)
-        return _generate_content_with_backoff(
-            client,
+        response = client.models.generate_content(
             model=MODEL_NAME,
             contents=f"{FILTER_PROMPT}\n\n{raw_text}",
         )
+        filtered_text = (response.text or "").strip()
+        if not filtered_text:
+            raise ValueError("Gemini returned an empty response.")
+        return filtered_text
     except Exception as exc:
         print(f"Warning: Gemini API call failed ({exc}). Returning raw news.")
         return raw_text
@@ -268,7 +180,7 @@ def generate_company_narrative_text(
     business_summary: str,
     sector: str = "",
     industry: str = "",
-) -> str | None:
+) -> str:
     """Summarize official business summary into concise Traditional Chinese tech narrative."""
     context_parts = [f"Ticker: {symbol.upper()}"]
     if sector:
@@ -280,19 +192,20 @@ def generate_company_narrative_text(
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return None
+        return "⚠️ 未設定 GEMINI_API_KEY，無法生成科技敘事。請在環境變數中設定後重新整理。"
 
     try:
         client = genai.Client(api_key=api_key)
-        text = _generate_content_with_backoff(
-            client,
+        response = client.models.generate_content(
             model=MODEL_NAME,
             contents=f"{NARRATIVE_SYSTEM_PROMPT}\n\n{user_block}",
         )
-        return accept_llm_cache_result(text)
+        text = (response.text or "").strip()
+        if not text:
+            raise ValueError("Gemini returned an empty narrative.")
+        return text
     except Exception as exc:
-        print(f"Warning: company narrative failed for {symbol}: {exc}")
-        return None
+        return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"
 
 
 def _format_trend_context(trend_signal: dict | None) -> str:
@@ -331,7 +244,7 @@ def generate_growth_narrative_text(
     live_news_text: str = "",
     trend_signal: dict | None = None,
     master_text: str = "",
-) -> str | None:
+) -> str:
     """Growth-mode narrative: fuse static summary + live news + master metrics + technical catalyst."""
     context_parts = [f"Ticker: {symbol.upper()}"]
     if sector:
@@ -352,19 +265,20 @@ def generate_growth_narrative_text(
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return None
+        return "⚠️ 未設定 GEMINI_API_KEY，無法生成科技敘事。請在環境變數中設定後重新整理。"
 
     try:
         client = genai.Client(api_key=api_key)
-        text = _generate_content_with_backoff(
-            client,
+        response = client.models.generate_content(
             model=MODEL_NAME,
             contents=f"{NARRATIVE_GROWTH_LIVE_PROMPT}\n\n{user_block}",
         )
-        return accept_llm_cache_result(text)
+        text = (response.text or "").strip()
+        if not text:
+            raise ValueError("Gemini returned an empty narrative.")
+        return text
     except Exception as exc:
-        print(f"Warning: growth narrative failed for {symbol}: {exc}")
-        return None
+        return f"⚠️ 科技敘事生成失敗（{exc}）。請稍後再試或清除快取後重試。"
 
 
 def _call_gemini(system_prompt: str, context: str) -> str | None:
@@ -373,14 +287,13 @@ def _call_gemini(system_prompt: str, context: str) -> str | None:
         return None
     try:
         client = genai.Client(api_key=api_key)
-        text = _generate_content_with_backoff(
-            client,
+        response = client.models.generate_content(
             model=MODEL_NAME,
             contents=f"{system_prompt}\n\n{context.strip()}",
         )
-        return accept_llm_cache_result(text)
-    except Exception as exc:
-        print(f"Warning: Gemini commentary failed after retries: {exc}")
+        text = (response.text or "").strip()
+        return text or None
+    except Exception:
         return None
 
 

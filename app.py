@@ -3,10 +3,7 @@ from __future__ import annotations
 
 import html
 import re
-from textwrap import dedent
-
 import pandas as pd
-from bs4 import BeautifulSoup
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
@@ -15,22 +12,10 @@ from plotly.subplots import make_subplots
 
 from analyzer_core import (
     FALLBACK_SCAN_UNIVERSE,
-    FCF_PAYOUT_DEATH_THRESHOLD,
-    FCF_PAYOUT_EXTRA_PENALTY,
-    NET_DEBT_EBITDA_DEATH_THRESHOLD,
     STRATEGY_LABEL_GROWTH,
     STRATEGY_LABEL_VALUE,
     STRATEGY_LABELS,
     STRATEGY_VALUE,
-    VALUE_SCORE_DEATH_CAP,
-    WEIGHT_GROWTH_FUNDAMENTAL,
-    WEIGHT_GROWTH_PEG_VAL,
-    WEIGHT_GROWTH_SURPRISE,
-    WEIGHT_GROWTH_TECH_TIMING,
-    WEIGHT_VALUE_CASHFLOW,
-    WEIGHT_VALUE_QUALITY,
-    WEIGHT_VALUE_REVENUE,
-    WEIGHT_VALUE_SAFETY,
     MasterMetrics,
     ScoreDetail,
     ScorecardItem,
@@ -52,7 +37,6 @@ from analyzer_core import (
     reports_to_summary_df,
 )
 
-# Must run before any @st.cache_data registration (decorators execute at import time).
 st.set_page_config(
     page_title="股息安全分析儀表板",
     page_icon="📊",
@@ -70,7 +54,7 @@ GRADE_COLORS = {
 }
 CHART_COLORS = ["#3b82f6", "#8b5cf6", "#06b6d4", "#f59e0b", "#ec4899"]
 SCORE_COLUMNS_VALUE = ("企業品質分", "估值安全分", "護城河分", "現金流品質分", "財務安全分", "營收穩定分")
-SCORE_COLUMNS_GROWTH = ("企業品質分", "估值安全分", "基本面增長分", "PEG估值分", "預期修正分", "Timing輔助", "風險緩衝")
+SCORE_COLUMNS_GROWTH = ("企業品質分", "估值安全分", "基本面增長分", "PEG估值分", "預期修正分", "風險緩衝", "Timing輔助")
 
 # Institutional factor glossary — surfaced via hover tooltips & glossary expander
 METRIC_TOOLTIPS: dict[str, str] = {
@@ -90,8 +74,8 @@ METRIC_TOOLTIPS: dict[str, str] = {
         "五年營收複合成長率，用於排除「便宜但衰退」的價值陷阱；"
         "負成長直接觸發營收穩定 0 分。"
     ),
-    "企業品質分": "Business Quality 0–95（Red Team 封頂）：護城河、現金流、財務、營收。",
-    "估值安全分": "Valuation Safety 0–95：Forward P/E、PEG、FCF Yield。<50 觸發買太貴紅燈。",
+    "企業品質分": "Business Quality 0–100（Red Team 封頂 95）：護城河、現金流、財務安全。",
+    "估值安全分": "Valuation Safety 0–100（封頂 95）：Forward P/E、PEG、FCF Yield。<50 觸發紅燈。",
     "等級": "依企業品質分映射；估值過高時另顯示紅燈警告。",
     "發放率": "每股盈餘發放率（輔助指標）；價值模式以 FCF 支付率為主判斷股息安全。",
     "Beta": "相對大盤波動係數；價值防禦模式不計入 Beta，僅供風險參考。",
@@ -120,10 +104,10 @@ SCORE_WEIGHT_TOOLTIPS_VALUE: dict[str, str] = {
 
 SCORE_WEIGHT_TOOLTIPS_GROWTH: dict[str, str] = {
     "基本面增長": "營收成長 + CapEx 擴張（30 分）→ 併入企業品質軌。",
-    "估值相對成長 (PEG)": "PEG 相對成長估值（25 分）→ 併入估值安全分軌。",
-    "預期修正 Surprise": "EPS Surprise / 分析師修正（25 分）→ 併入企業品質軌。",
-    "技術面輔助 (Timing)": "SMA 均線僅作 Timing 輔助（15 分），不主導決策。",
-    "風險緩衝": "紅旗扣分緩衝（5 分）：槓桿、CapEx/利益率陷阱、高 Beta。",
+    "估值相對成長 (PEG)": "PEG 估值（25 分）→ 併入估值安全分軌。",
+    "預期修正 Surprise": "EPS Surprise（25 分）→ 併入企業品質軌。",
+    "風險緩衝": "槓桿 / 紅旗 / Beta（5 分）→ 併入企業品質軌。",
+    "技術面輔助 (Timing)": "SMA 僅 Timing 輔助（15 分），不主導決策。",
 }
 
 SCORECARD_TOOLTIPS: dict[str, str] = {
@@ -205,10 +189,17 @@ def _strategy_short_name(mode: str | None = None) -> str:
 
 
 def _strategy_weight_caption(mode: str | None = None) -> str:
+    """Red Team Protocol weight caption — always returns a non-empty string."""
     active = mode or _current_strategy_mode()
     if is_growth_strategy(active):
-        return "雙軌計分 · 品質(30+25) / 估值(PEG25) / Timing15 / 風險緩衝5 · 封頂95"
-    return "雙軌計分 · 品質(35+25+25+15) / 估值(Fwd P/E+PEG+FCF Yield) · 封頂95"
+        return (
+            "Red Team 雙軌 · 品質(基本面30+Surprise25+風險緩衝5) / "
+            "估值(PEG25) / Timing15 · 封頂95"
+        )
+    return (
+        "Red Team 雙軌 · 品質(35+25+25+15) / "
+        "估值(Fwd P/E+PEG+FCF Yield) · 封頂95"
+    )
 
 
 def _on_strategy_mode_change() -> None:
@@ -248,101 +239,44 @@ _HTML_FENCE_LEADING_RE = re.compile(r"^\s*```(?:html|HTML)?\s*\n?", re.IGNORECAS
 _HTML_FENCE_TRAILING_RE = re.compile(r"\n?\s*```\s*$")
 
 
-_HTML_FENCE_RE = re.compile(r"```(?:html)?\n?", re.IGNORECASE)
-_DIV_OPEN_RE = re.compile(r"<div\b[^>]*>", re.IGNORECASE)
-_DIV_CLOSE_RE = re.compile(r"</div>", re.IGNORECASE)
-
-
-def _strip_div_tags_from_fragment(text: str) -> str:
-    """Remove div wrappers from untrusted LLM fragments — outer shells stay balanced."""
-    if not text:
-        return ""
-    out = _DIV_OPEN_RE.sub("", text)
-    out = _DIV_CLOSE_RE.sub("", out)
-    return out.strip()
-
-
 def _clean_ai_html(raw: str) -> str:
     """Remove ```html / ``` markdown fences so Streamlit receives pure HTML or text."""
-    content = raw or ""
-    clean_html = _HTML_FENCE_RE.sub("", content).replace("```", "").strip()
-    if not clean_html:
+    text = (raw or "").strip()
+    if not text:
         return ""
-    block = _HTML_FENCE_BLOCK_RE.match(clean_html)
+    block = _HTML_FENCE_BLOCK_RE.match(text)
     if block:
-        inner = block.group(1)
-        clean_html = _HTML_FENCE_RE.sub("", inner).replace("```", "").strip()
-    clean_html = _HTML_FENCE_LEADING_RE.sub("", clean_html)
-    clean_html = _HTML_FENCE_TRAILING_RE.sub("", clean_html)
-    clean_html = _HTML_FENCE_RE.sub("", clean_html).replace("```", "").strip()
-    return _strip_div_tags_from_fragment(clean_html)
+        return block.group(1).strip()
+    text = _HTML_FENCE_LEADING_RE.sub("", text)
+    text = _HTML_FENCE_TRAILING_RE.sub("", text)
+    return text.strip()
 
 
-def _render_trusted_html(html_str: str) -> None:
-    """Render HTML via BeautifulSoup auto-close repair (prevents React DOM crashes)."""
-    try:
-        raw = dedent(html_str or "").strip()
-        if not raw:
-            return
-        soup = BeautifulSoup(raw, "html.parser")
-        st.markdown(str(soup), unsafe_allow_html=True)
-    except Exception:
-        st.error("UI 渲染安全防護攔截了破圖錯誤。")
-
-
-def _render_sidebar_trusted_html(html_str: str) -> None:
-    """Sidebar variant — same BeautifulSoup pipeline."""
-    try:
-        raw = dedent(html_str or "").strip()
-        if not raw:
-            return
-        soup = BeautifulSoup(raw, "html.parser")
-        st.sidebar.markdown(str(soup), unsafe_allow_html=True)
-    except Exception:
-        st.sidebar.error("UI 渲染安全防護攔截了破圖錯誤。")
+def _render_trusted_html(html_str: str, *, container: object | None = None) -> None:
+    """
+    Centralized HTML renderer — minify to one line so Streamlit Markdown
+    never treats nested indentation as a code block (e.g. literal </div>).
+    """
+    cleaned = _clean_ai_html(html_str or "")
+    if not cleaned:
+        return
+    flat_html = cleaned.replace("\n", "").replace("\r", "").strip()
+    if not flat_html:
+        return
+    target = container if container is not None else st
+    target.markdown(flat_html, unsafe_allow_html=True)
 
 
 def _render_html(html_content: str) -> None:
-    """Render AI or fenced HTML after fence stripping."""
-    cleaned = _clean_ai_html(html_content or "")
-    if cleaned:
-        _render_trusted_html(cleaned)
-
-
-def _is_llm_error_payload(text: object) -> bool:
-    """Detect API failures / rate-limit strings that must never be rendered or cached."""
-    if text is None:
-        return True
-    raw = str(text).strip()
-    if not raw:
-        return True
-    lower = raw.lower()
-    if raw.startswith("⚠️") or "科技敘事生成失敗" in raw or "生成失敗" in raw:
-        return True
-    if any(
-        token in lower
-        for token in ("429", "resource_exhausted", "rate limit", "too many requests", "quota exceeded")
-    ):
-        return True
-    return False
-
-
-def _safe_render_text(text: object) -> str | None:
-    """Return stripped text safe to render, or None when empty / poisoned."""
-    if text is None:
-        return None
-    raw = str(text).strip()
-    if not raw or _is_llm_error_payload(raw):
-        return None
-    cleaned = _clean_ai_html(raw)
-    return cleaned if cleaned else None
+    """Alias — route all custom HTML through trusted minified renderer."""
+    _render_trusted_html(html_content)
 
 
 def _format_narrative_for_card(raw: str) -> str:
     """Strip AI filler / markdown artifacts; convert **bold** to HTML <strong>."""
-    text = _strip_div_tags_from_fragment(_clean_ai_html(raw))
-    if not text:
-        return ""
+    text = _clean_ai_html(raw)
+    if text.lstrip().startswith("<"):
+        return text
     filler_re = re.compile(
         r"^(好的[，,].*?|分析師報告如下[：:].*?|以下是.*?[：:].*?|"
         r"Sure[,.].*?|Here(?:'s| is).*?:)\s*\n?",
@@ -380,39 +314,22 @@ def _format_narrative_for_card(raw: str) -> str:
 
 
 def _render_narrative_card(symbol: str) -> None:
-    """Narrative block — warnings render here only (never during cached LLM fetch)."""
-    with st.container():
-        _render_trusted_html(
-            '<p class="panel-label fx-narrative-heading">'
-            "💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>"
+    _render_trusted_html(
+        '<p class="panel-label fx-narrative-heading">'
+        "💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>"
+    )
+    strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
+    narrative, live_news_degraded = load_company_narrative(strategy_key, symbol)
+    card_html = _format_narrative_for_card(narrative)
+    if live_news_degraded and is_growth_strategy(strategy_key):
+        card_html += (
+            '<p class="fx-narrative-footnote">'
+            "即時新聞流連線超時 · 目前顯示基礎科技敘事"
+            "</p>"
         )
-        strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
-        narrative = ""
-        live_news_degraded = False
-        try:
-            narrative, live_news_degraded = load_company_narrative(strategy_key, symbol)
-        except Exception:
-            st.warning("目前 AI 伺服器擁擠，請稍後重試。")
-            return
-
-        safe_narrative = _safe_render_text(narrative)
-        card_html = (
-            _format_narrative_for_card(safe_narrative) if safe_narrative else ""
-        )
-        if not safe_narrative or not card_html:
-            st.warning("目前 AI 伺服器擁擠，請稍後重試。")
-            return
-        if live_news_degraded and is_growth_strategy(strategy_key):
-            card_html += (
-                '<p class="fx-narrative-footnote">'
-                "即時新聞流連線超時 · 目前顯示基礎科技敘事"
-                "</p>"
-            )
-        _render_trusted_html(
-            f'<div class="fx-narrative-card">'
-            f'<div class="fx-narrative-body">{card_html}</div>'
-            f"</div>"
-        )
+    _render_html(
+        f'<div class="fx-narrative-card"><div class="fx-narrative-body">{card_html}</div></div>'
+    )
 
 
 def _fmt1(value: float | None) -> str:
@@ -434,55 +351,8 @@ def _fmt_money_large(value: float | None) -> str:
 
 def _inject_css() -> None:
     _render_trusted_html(
-        """
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-        """
-    )
-    _render_trusted_html(
         f"""
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-        html, body, .stApp, .stMarkdown, label, p, span {{
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
-        }}
-        [data-testid="stIconMaterial"],
-        [data-testid="stIconMaterial"] span {{
-            font-family: "Material Symbols Rounded", "Material Icons", sans-serif !important;
-        }}
-        div[data-testid="stMetric"] {{
-            background-color: #1E293B !important;
-            border: 1px solid #334155 !important;
-            border-radius: 8px !important;
-            padding: 0.85rem 1rem 0.95rem !important;
-            box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.06);
-            min-width: 8.5rem;
-            overflow: visible !important;
-        }}
-        div[data-testid="stMetric"] label {{
-            color: #94A3B8 !important;
-            font-size: 0.72rem !important;
-            font-weight: 600 !important;
-            letter-spacing: 0.04em !important;
-            text-transform: uppercase !important;
-            white-space: normal !important;
-            overflow-wrap: anywhere !important;
-            line-height: 1.35 !important;
-        }}
-        div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
-            font-size: 1.65rem !important;
-            font-weight: 700 !important;
-            color: #F1F5F9 !important;
-            white-space: normal !important;
-            overflow-wrap: anywhere !important;
-            line-height: 1.2 !important;
-        }}
-        div[data-testid="stMetric"] [data-testid="stMetricDelta"] {{
-            font-size: 0.78rem !important;
-            white-space: normal !important;
-            overflow-wrap: anywhere !important;
-        }}
         :root {{
             --bg-base: #0f172a;
             --bg-card: #1e293b;
@@ -493,15 +363,6 @@ def _inject_css() -> None:
         }}
         .stApp, [data-testid="stAppViewContainer"] {{
             background-color: var(--bg-base) !important;
-            margin-top: 0 !important;
-        }}
-        [data-testid="stAppViewContainer"] .main,
-        [data-testid="stMain"] {{
-            margin-top: 0 !important;
-            overflow: visible !important;
-        }}
-        header[data-testid="stHeader"] {{
-            background: rgba(15, 23, 42, 0.92) !important;
         }}
         section[data-testid="stSidebar"] {{
             background-color: #121212 !important;
@@ -511,43 +372,18 @@ def _inject_css() -> None:
             background-color: #121212 !important;
         }}
         .block-container {{
-            padding-top: 3rem !important;
+            padding-top: 3.75rem;
             padding-bottom: 2.5rem;
             max-width: 1480px;
-            margin-top: 0 !important;
-            overflow: visible !important;
         }}
         [data-testid="stMainBlockContainer"] {{
-            padding-top: 0 !important;
-            overflow: visible !important;
+            padding-top: 0.75rem;
         }}
         [data-testid="stAppViewContainer"] .main .block-container {{
-            padding-top: 3rem !important;
-            margin-top: 0 !important;
-        }}
-        [data-testid="stHorizontalBlock"] {{
-            gap: 0.75rem !important;
-            align-items: stretch !important;
-            flex-wrap: wrap !important;
-            overflow: visible !important;
-        }}
-        [data-testid="column"] {{
-            min-width: min(100%, 9.5rem) !important;
-            overflow: visible !important;
-        }}
-        [data-testid="column"] > div {{
-            overflow: visible !important;
-            min-width: 0;
+            padding-top: 3.75rem;
         }}
         [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] {{
             gap: 1.15rem;
-            overflow: visible !important;
-        }}
-        [data-testid="stMarkdownContainer"] p,
-        [data-testid="stMarkdownContainer"] span,
-        [data-testid="stMarkdownContainer"] div {{
-            overflow-wrap: anywhere;
-            word-break: break-word;
         }}
         [data-testid="stTabs"] {{
             margin-top: 0.75rem;
@@ -561,18 +397,6 @@ def _inject_css() -> None:
             margin: 0.85rem 0 1.35rem !important;
             box-shadow: 0 10px 28px rgba(2, 6, 23, 0.28);
         }}
-        .fx-html-shell {{
-            border: 1px solid rgba(148, 163, 184, 0.12);
-            border-radius: 8px;
-            padding: 0.75rem 1rem;
-            margin: 0.5rem 0;
-            color: #cbd5e1;
-            font-size: 0.86rem;
-            line-height: 1.6;
-        }}
-        .fx-html-shell p {{
-            margin: 0;
-        }}
         .fx-metric-card {{
             background: linear-gradient(160deg, #243044 0%, #1a2332 45%, #121a28 100%);
             border: 1px solid rgba(148, 163, 184, 0.14);
@@ -580,12 +404,10 @@ def _inject_css() -> None:
             padding: 1rem 1.1rem;
             margin: 0.35rem 0 1.1rem;
             min-height: 88px;
-            min-width: 9rem;
             box-shadow: 0 8px 22px rgba(2, 6, 23, 0.22);
             display: flex;
             flex-direction: column;
             justify-content: flex-start;
-            overflow: visible;
         }}
         .fx-metric-label {{
             color: #94a3b8;
@@ -595,11 +417,8 @@ def _inject_css() -> None:
             margin-bottom: 0.45rem;
             flex-shrink: 0;
             display: flex;
-            align-items: flex-start;
+            align-items: center;
             gap: 0.35rem;
-            white-space: normal;
-            overflow-wrap: anywhere;
-            line-height: 1.35;
         }}
         .fx-metric-tip {{
             position: relative;
@@ -753,7 +572,7 @@ def _inject_css() -> None:
         }}
         .scorecard-progress-grid {{
             display: grid;
-            grid-template-columns: repeat(2, minmax(11.5rem, 1fr));
+            grid-template-columns: repeat(2, minmax(0, 1fr));
             gap: 0.65rem;
             margin: 0.65rem 0 1.25rem;
         }}
@@ -782,12 +601,8 @@ def _inject_css() -> None:
             font-weight: 600;
             line-height: 1.35;
             display: flex;
-            align-items: flex-start;
+            align-items: center;
             gap: 0.3rem;
-            flex: 1 1 auto;
-            min-width: 0;
-            white-space: normal;
-            overflow-wrap: anywhere;
         }}
         .scorecard-progress-score {{
             font-size: 0.82rem;
@@ -823,8 +638,6 @@ def _inject_css() -> None:
             color: #64748b;
             font-size: 0.68rem;
             line-height: 1.45;
-            white-space: normal;
-            overflow-wrap: anywhere;
         }}
         .scorecard-grid-title {{
             color: #64748b;
@@ -845,70 +658,8 @@ def _inject_css() -> None:
             text-align: center;
             box-shadow: 0 0 12px rgba(239, 68, 68, 0.15);
         }}
-        .terminal-score-grid {{
-            display: grid;
-            grid-template-columns: repeat(2, minmax(12rem, 1fr));
-            gap: 1rem;
-            margin: 1.1rem 0 0.85rem;
-            overflow: visible;
-        }}
-        @media (max-width: 768px) {{
-            .terminal-score-grid {{ grid-template-columns: 1fr; }}
-        }}
-        .terminal-score-card {{
-            background: linear-gradient(165deg, #1E293B 0%, #172033 100%);
-            border: 1px solid #334155;
-            border-radius: 10px;
-            padding: 1.35rem 1.25rem 1.15rem;
-            text-align: center;
-            box-shadow: 0 8px 24px rgba(2, 6, 23, 0.35);
-        }}
-        .terminal-score-label {{
-            color: #94A3B8;
-            font-size: 0.72rem;
-            font-weight: 600;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            margin-bottom: 0.35rem;
-            white-space: normal;
-            overflow-wrap: anywhere;
-            line-height: 1.35;
-        }}
-        .terminal-score-sublabel {{
-            color: #64748B;
-            font-size: 0.68rem;
-            margin-bottom: 0.55rem;
-            white-space: normal;
-            overflow-wrap: anywhere;
-            line-height: 1.4;
-        }}
-        .terminal-score-cap {{
-            white-space: normal;
-            overflow-wrap: anywhere;
-            line-height: 1.4;
-        }}
-        .terminal-score-value {{
-            font-size: 48px;
-            font-weight: 800;
-            line-height: 1.05;
-            letter-spacing: -0.02em;
-        }}
-        .death-penalty-banner {{
-            background: linear-gradient(90deg, rgba(127, 29, 29, 0.55) 0%, rgba(69, 10, 10, 0.45) 100%);
-            border: 1px solid #EF4444;
-            border-left: 4px solid #EF4444;
-            color: #FEE2E2;
-            font-size: 0.88rem;
-            font-weight: 600;
-            padding: 0.85rem 1.1rem;
-            border-radius: 8px;
-            margin: 0.65rem 0 0.85rem;
-            line-height: 1.55;
-        }}
-        .terminal-grade-strip {{
-            color: #94A3B8;
-            font-size: 0.82rem;
-            margin: 0.35rem 0 0.85rem;
+        .ai-terminal-panel {{
+            display: none;
         }}
         .ai-terminal-body {{
             border: 1px solid #334155;
@@ -952,6 +703,40 @@ def _inject_css() -> None:
             margin: 0.85rem 0 0.45rem;
             letter-spacing: 0.04em;
             text-transform: uppercase;
+        }}
+        .ai-terminal-panel + div[data-testid="stMarkdownContainer"],
+        .ai-terminal-panel + div {{
+            border: 1px solid #334155;
+            border-radius: 10px;
+            background: #0f172a;
+            padding: 1rem 1.15rem;
+            margin: 0.75rem 0 1.35rem;
+            box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.05);
+        }}
+        .ai-terminal-panel + div h3 {{
+            font-size: 0.95rem !important;
+            color: #e2e8f0 !important;
+            margin: 0.65rem 0 0.35rem !important;
+        }}
+        .ai-terminal-panel + div h4 {{
+            font-size: 0.88rem !important;
+            color: #94a3b8 !important;
+            margin: 0.55rem 0 0.25rem !important;
+        }}
+        .ai-terminal-panel + div p,
+        .ai-terminal-panel + div li {{
+            color: #cbd5e1;
+            font-size: 0.86rem;
+            line-height: 1.65;
+        }}
+        .ai-terminal-panel + div strong {{
+            color: #f1f5f9;
+        }}
+        .ai-terminal-panel + div blockquote {{
+            border-left: 3px solid var(--accent);
+            padding-left: 0.75rem;
+            color: #94a3b8;
+            margin: 0.5rem 0;
         }}
         .fx-narrative-heading {{
             margin-top: 1.5rem !important;
@@ -1066,7 +851,7 @@ def _inject_css() -> None:
         .subtitle {{
             color: var(--text-muted);
             font-size: 0.92rem;
-            margin-bottom: 0.85rem;
+            margin-bottom: 1.35rem;
             line-height: 1.55;
         }}
         h2, h3, h4, h5 {{
@@ -1075,8 +860,9 @@ def _inject_css() -> None:
         }}
         [data-testid="stTabs"] button p {{
             font-size: 0.92rem;
-            white-space: normal !important;
-            overflow-wrap: anywhere !important;
+        }}
+        div[data-testid="stMetric"] {{
+            display: none !important;
         }}
         div.stButton > button {{
             border-radius: 8px !important;
@@ -1187,6 +973,12 @@ def _inject_css() -> None:
             margin: 1.5rem 0 !important;
             border-color: var(--border-subtle) !important;
         }}
+        [data-testid="stExpander"] {{
+            border: 1px solid var(--border-subtle) !important;
+            border-radius: 8px !important;
+            background: var(--bg-card) !important;
+            margin-top: 1rem;
+        }}
         div[data-testid="stAlert"] {{
             border-radius: 8px !important;
             border: 1px solid var(--border-subtle) !important;
@@ -1208,197 +1000,23 @@ def _score_tone(value: object) -> str:
     return "tone-red"
 
 
-def _format_grade(report: object) -> str:
+def _format_grade(report: StockReport) -> str:
     """Derive grade from business quality score."""
-    growth = is_growth_strategy(_report_strategy_mode(report))
-    quality = _report_quality_score(report)
+    growth = is_growth_strategy(report.strategy_mode)
+    quality = report.business_quality_score or report.total_score
     emoji, label = grade_from_score(quality, growth=growth)
     return f"{emoji} {label}"
 
 
-def _terminal_score_color(score: float | None) -> str:
-    """Semantic terminal colors: >=85 green, 70–84 gray, <70 red."""
-    if score is None:
-        return "#94A3B8"
-    try:
-        v = float(score)
-    except (TypeError, ValueError):
-        return "#94A3B8"
-    if v >= 85:
-        return "#10B981"
-    if v >= 70:
-        return "#94A3B8"
-    return "#EF4444"
+def _valuation_trap_warning(report: StockReport) -> bool:
+    quality = report.business_quality_score or report.total_score
+    return quality >= 70 and report.valuation_margin_score < 50
 
 
-def _score_detail_pair(report: object, *keywords: str) -> tuple[float | None, float | None]:
-    """Return (earned, max_points) for first matching score_detail category."""
-    details_raw = _rget(report, "score_details", None) or []
-    for raw in details_raw:
-        detail = _coerce_score_detail(raw)
-        if detail.max_points <= 0:
-            continue
-        if any(k in detail.category for k in keywords):
-            return detail.earned, detail.max_points
-    return None, None
-
-
-def _collect_death_penalty_messages(report: object) -> list[str]:
-    """Detect asymmetric death penalties for fatal red-flag banners."""
-    if is_growth_strategy(_report_strategy_mode(report)):
-        return []
-
-    messages: list[str] = []
-    m = _report_master(report)
-
-    nd_ebitda = _rget(m, "net_debt_ebitda")
-    if nd_ebitda is not None and float(nd_ebitda) > NET_DEBT_EBITDA_DEATH_THRESHOLD:
-        messages.append(
-            f"🚨 致命紅旗警告：債務槓桿嚴重超標（淨債務/EBITDA {float(nd_ebitda):.1f}x > "
-            f"{NET_DEBT_EBITDA_DEATH_THRESHOLD:.0f}x），觸發財務安全一票否決，"
-            f"企業品質分強制封頂 {VALUE_SCORE_DEATH_CAP:.0f}。"
-        )
-
-    fcf_pay = _rget(m, "fcf_payout_ratio")
-    if fcf_pay is not None and float(fcf_pay) > FCF_PAYOUT_DEATH_THRESHOLD:
-        messages.append(
-            f"🚨 致命紅旗警告：FCF 支付率 {float(fcf_pay) * 100:.1f}% 透支"
-            f"（>{FCF_PAYOUT_DEATH_THRESHOLD * 100:.0f}%），觸發現金流一票否決，"
-            f"該維度歸零並額外扣 {FCF_PAYOUT_EXTRA_PENALTY:.0f} 分。"
-        )
-
-    return messages
-
-
-def _render_terminal_dual_scores(report: object) -> None:
-    """Hero dual-track scores — Quality & Valuation (48px, semantic colors)."""
-    quality = _report_quality_score(report)
-    valuation = _report_valuation_score(report)
-    q_color = _terminal_score_color(quality)
-    v_color = _terminal_score_color(valuation)
-
-    _render_trusted_html(
-        f'<div class="terminal-score-grid">'
-        f'<div class="terminal-score-card">'
-        f'<div class="terminal-score-label">企業品質分 · Quality</div>'
-        f'<div class="terminal-score-sublabel">Business Quality Score</div>'
-        f'<div class="terminal-score-value" style="color:{q_color};">{quality:.1f}</div>'
-        f'<div class="terminal-score-cap">滿分 100 · Red Team 封頂 95</div>'
-        f"</div>"
-        f'<div class="terminal-score-card">'
-        f'<div class="terminal-score-label">估值安全邊際 · Valuation</div>'
-        f'<div class="terminal-score-sublabel">Valuation Safety Score</div>'
-        f'<div class="terminal-score-value" style="color:{v_color};">{valuation:.1f}</div>'
-        f'<div class="terminal-score-cap">Forward P/E · PEG · FCF Yield</div>'
-        f"</div>"
-        f"</div>"
-        f'<div class="terminal-grade-strip">等級 {_format_grade(report)}</div>'
-    )
-
-
-def _render_death_penalty_banners(report: object) -> None:
-    """Full-width fatal red-flag banners below hero scores."""
-    for msg in _collect_death_penalty_messages(report):
-        _render_trusted_html(
-            f'<div class="death-penalty-banner">{html.escape(msg)}</div>'
-        )
-
-
-def _render_value_dimension_grid(report: StockReport) -> None:
-    """Four-column dimension grid — custom metric cards (avoids column clipping)."""
-    dims: list[tuple[str, float, tuple[str, ...], str]] = [
-        (
-            f"企業品質 · {WEIGHT_VALUE_QUALITY:.0f}%",
-            WEIGHT_VALUE_QUALITY,
-            ("企業品質", "護城河"),
-            SCORE_WEIGHT_TOOLTIPS_VALUE["企業品質與護城河"]
-            + " 子指標：ROIC/ROA、毛利率波動、營業利益率。資料：SQLite cache · yfinance · SEC。",
-        ),
-        (
-            f"財務安全 · {WEIGHT_VALUE_SAFETY:.0f}%",
-            WEIGHT_VALUE_SAFETY,
-            ("財務安全",),
-            SCORE_WEIGHT_TOOLTIPS_VALUE["財務安全防線"]
-            + " 子指標：Net Debt/EBITDA、利息保障倍數。死亡門檻：槓桿 >3x。",
-        ),
-        (
-            f"現金流品質 · {WEIGHT_VALUE_CASHFLOW:.0f}%",
-            WEIGHT_VALUE_CASHFLOW,
-            ("現金流",),
-            SCORE_WEIGHT_TOOLTIPS_VALUE["現金流品質"]
-            + " 子指標：FCF 支付率、股息連續成長。死亡門檻：FCF Payout >90%。",
-        ),
-        (
-            f"營收穩定 · {WEIGHT_VALUE_REVENUE:.0f}%",
-            WEIGHT_VALUE_REVENUE,
-            ("營收穩定",),
-            SCORE_WEIGHT_TOOLTIPS_VALUE["營收穩定"]
-            + " 子指標：5Y 營收 CAGR、TTM 營收增速。資料：年度財報 · yfinance。",
-        ),
-    ]
-
-    items: list[tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]] = []
-    for label, max_pts, keys, help_text in dims:
-        earned, _ = _score_detail_pair(report, *keys)
-        earned = earned if earned is not None else 0.0
-        items.append((label, f"{earned:.1f}", f"/ {max_pts:.0f} pts", help_text))
-    _render_fx_metric_row(items)
-
-
-def _render_growth_dimension_grid(report: StockReport) -> None:
-    """Growth-mode four-column grid (30/25/25/15)."""
-    dims: list[tuple[str, float, tuple[str, ...], str]] = [
-        (
-            f"基本面增長 · {WEIGHT_GROWTH_FUNDAMENTAL:.0f}%",
-            WEIGHT_GROWTH_FUNDAMENTAL,
-            ("基本面增長",),
-            "營收成長 + CapEx 擴張率。資料：yfinance info · 季度現金流。",
-        ),
-        (
-            f"預期修正 · {WEIGHT_GROWTH_SURPRISE:.0f}%",
-            WEIGHT_GROWTH_SURPRISE,
-            ("預期修正", "Surprise"),
-            "EPS Surprise 連續超預期季數。資料：yfinance earnings_history。",
-        ),
-        (
-            f"PEG 估值 · {WEIGHT_GROWTH_PEG_VAL:.0f}%",
-            WEIGHT_GROWTH_PEG_VAL,
-            ("PEG", "估值相對"),
-            "Trailing PEG 相對成長估值剪刀差。資料：yfinance trailingPegRatio。",
-        ),
-        (
-            f"Timing 輔助 · {WEIGHT_GROWTH_TECH_TIMING:.0f}%",
-            WEIGHT_GROWTH_TECH_TIMING,
-            ("Timing", "技術面輔助"),
-            "SMA20/50 均線結構 — 僅作進場 Timing，不主導基本面決策。",
-        ),
-    ]
-
-    items: list[tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]] = []
-    for label, max_pts, keys, help_text in dims:
-        earned, _ = _score_detail_pair(report, *keys)
-        earned = earned if earned is not None else 0.0
-        items.append((label, f"{earned:.1f}", f"/ {max_pts:.0f} pts", help_text))
-    _render_fx_metric_row(items)
-
-
-def _render_dimension_grid(report: object) -> None:
-    if is_growth_strategy(_report_strategy_mode(report)):
-        _render_growth_dimension_grid(report)
-    else:
-        _render_value_dimension_grid(report)
-
-
-def _valuation_trap_warning(report: object) -> bool:
-    quality = _report_quality_score(report)
-    val = _report_valuation_score(report)
-    return quality >= 70 and val < 50
-
-
-def _render_valuation_trap_alert(report: object) -> None:
+def _render_valuation_trap_alert(report: StockReport) -> None:
     if not _valuation_trap_warning(report):
         return
-    _render_trusted_html(
+    _render_html(
         '<div class="valuation-trap-alert">'
         "⚠️ 品質極優，但估值過高，注意安全邊際"
         "</div>"
@@ -1468,12 +1086,14 @@ def _render_fx_metric_row(
             else ""
         )
         with col:
-            _render_trusted_html(
-                f'<div class="fx-metric-card">'
-                f'<div class="fx-metric-label">{html.escape(label)}{tip_html}</div>'
-                f'<div class="fx-metric-value">{html.escape(str(value))}</div>'
-                f"{sub_html}"
-                f"</div>"
+            _render_html(
+                f"""
+                <div class="fx-metric-card">
+                    <div class="fx-metric-label">{html.escape(label)}{tip_html}</div>
+                    <div class="fx-metric-value">{html.escape(str(value))}</div>
+                    {sub_html}
+                </div>
+                """
             )
 
 
@@ -1481,9 +1101,9 @@ def _render_factor_glossary(mode: str | None = None) -> None:
     """Expandable institutional factor glossary for scoring transparency."""
     active = mode or _current_strategy_mode()
     tips = SCORE_WEIGHT_TOOLTIPS_GROWTH if is_growth_strategy(active) else SCORE_WEIGHT_TOOLTIPS_VALUE
-    with st.expander("📊 量化因子方法論 · Factor Methodology"):
+    with st.expander("📐 量化因子方法論 · Factor Methodology", expanded=False):
         for dim, desc in tips.items():
-            _render_trusted_html(
+            _render_html(
                 f'<p class="factor-glossary-item">'
                 f'<span class="factor-glossary-dim">{html.escape(dim)}</span>'
                 f'<span class="factor-glossary-desc">{html.escape(desc)}</span>'
@@ -1550,42 +1170,27 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
     title_html = (
         f'<div class="fx-table-title">{html.escape(title)}</div>' if title else ""
     )
-    _render_trusted_html(
-        f'<div class="fx-table-card">'
-        f"{title_html}"
-        f'<div class="fx-table-wrap">'
-        f'<table class="fx-table">'
-        f"<thead><tr>{headers}</tr></thead>"
-        f'<tbody>{"".join(rows)}</tbody>'
-        f"</table>"
-        f"</div>"
-        f"</div>"
+    _render_html(
+        f"""
+        <div class="fx-table-card">
+            {title_html}
+            <div class="fx-table-wrap">
+                <table class="fx-table">
+                    <thead><tr>{headers}</tr></thead>
+                    <tbody>{"".join(rows)}</tbody>
+                </table>
+            </div>
+        </div>
+        """
     )
 
 
-def _render_ai_commentary_section(report: object) -> None:
-    """AI commentary block only — failures must not abort the rest of the page."""
-    with st.container():
-        _render_trusted_html('<p class="panel-label">AI 決策點評</p>')
-        raw = _rget(report, "analyst_commentary", None)
-        commentary = _safe_render_text(raw) if raw is not None else None
-        if not commentary:
-            st.warning("目前 AI 伺服器擁擠，請稍後重試。")
-            return
-        _render_ai_terminal_block(commentary)
-
-
-def _render_ai_terminal_block(text: str | None) -> None:
+def _render_ai_terminal_block(text: str) -> None:
     """Finance-terminal styled block for AI commentary — no raw Markdown headers."""
-    safe = _safe_render_text(text)
-    if not safe:
-        return
-    clean = _sanitize_ai_commentary(_strip_div_tags_from_fragment(safe))
-    if not clean:
-        return
-    body_html = html.escape(clean).replace(chr(10), "<br>")
+    clean = _sanitize_ai_commentary(text)
+    _render_trusted_html('<div class="ai-terminal-panel"></div>')
     _render_trusted_html(
-        f'<div class="ai-terminal-body">{body_html}</div>'
+        f'<div class="ai-terminal-body">{html.escape(clean).replace(chr(10), "<br>")}</div>'
     )
 
 
@@ -1612,15 +1217,9 @@ def _render_investment_scorecard(report: object) -> None:
         else:
             item = _coerce_scorecard_item(raw)
 
-        rationale = _safe_render_text(item.rationale)
-        if not rationale:
-            continue
-
         tone = _scorecard_tone(item.score)
         pct = max(0, min(100, item.score * 10))
         short_name = _scorecard_short_name(item.dimension)
-        if not short_name:
-            continue
         tip = _scorecard_tooltip(item.dimension)
         tip_html = ""
         if tip:
@@ -1628,39 +1227,42 @@ def _render_investment_scorecard(report: object) -> None:
                 f'<span class="fx-metric-tip" data-tip="{html.escape(tip)}">?</span>'
             )
         cards.append(
-            f'<div class="scorecard-progress-card">'
-            f'<div class="scorecard-progress-header">'
-            f'<div class="scorecard-progress-name">'
-            f"{html.escape(short_name)}{tip_html}"
-            f"</div>"
-            f'<div class="scorecard-progress-score {tone}">{item.score}/10</div>'
-            f"</div>"
-            f'<div class="scorecard-progress-track">'
-            f'<div class="scorecard-progress-fill {tone}" style="width:{pct}%;"></div>'
-            f"</div>"
-            f'<div class="scorecard-progress-rationale">{html.escape(rationale)}</div>'
-            f"</div>"
+            f"""
+            <div class="scorecard-progress-card">
+                <div class="scorecard-progress-header">
+                    <div class="scorecard-progress-name">
+                        {html.escape(short_name)}{tip_html}
+                    </div>
+                    <div class="scorecard-progress-score {tone}">{item.score}/10</div>
+                </div>
+                <div class="scorecard-progress-track">
+                    <div class="scorecard-progress-fill {tone}" style="width:{pct}%;"></div>
+                </div>
+                <div class="scorecard-progress-rationale">{html.escape(_clean_ai_html(item.rationale))}</div>
+            </div>
+            """
         )
 
-    if not cards:
-        st.caption("Master Scorecard 暫無可顯示項目（AI 服務異常時請稍後重試）。")
-        return
-
-    scorecard_html = (
-        f'<div class="scorecard-grid-title">'
-        f"Master Investment Scorecard · 大師級多空量化項目評價表"
-        f"</div>"
-        f'<div class="scorecard-progress-grid">{"".join(cards)}</div>'
+    _render_trusted_html(
+        f"""
+        <div class="scorecard-grid-title">
+            Master Investment Scorecard · 大師級多空量化項目評價表
+        </div>
+        <div class="scorecard-progress-grid">
+            {"".join(cards)}
+        </div>
+        """
     )
-    _render_trusted_html(scorecard_html)
 
 
 def _render_deep_analysis_divider() -> None:
     """Visual separator between scan workspace and deep-dive analysis."""
     _render_trusted_html(
-        '<div class="section-divider">'
-        '<span class="section-divider-label">深度研究區 · Deep Dive Workspace</span>'
-        "</div>"
+        """
+        <div class="section-divider">
+            <span class="section-divider-label">深度研究區 · Deep Dive Workspace</span>
+        </div>
+        """
     )
 
 
@@ -1934,10 +1536,7 @@ def _build_reports_map(tickers: list[str]) -> dict[str, StockReport]:
         sym = raw.upper().strip()
         if not sym:
             continue
-        try:
-            reports[sym] = _coerce_report(load_report_for_symbol(strategy_key, sym))
-        except Exception as exc:
-            print(f"Warning: failed to load report for {sym}: {exc}")
+        reports[sym] = load_report_for_symbol(strategy_key, sym)
     return reports
 
 
@@ -2017,18 +1616,21 @@ def _render_trend_signal_block(trend: dict | None, *, growth_mode: bool = False)
         border, bg, emoji, label = TREND_BADGE_STYLES.get(signal, TREND_BADGE_STYLES["Hold"])
 
     _render_trusted_html(
-        f'<div class="trend-tag" style="background:{bg}; color:{border};'
-        f"box-shadow: inset 0 0 0 1px {border}33;\">"
-        f"{emoji} {html.escape(label)}</div>"
+        f"""
+        <div class="trend-tag" style="background:{bg}; color:{border};
+             box-shadow: inset 0 0 0 1px {border}33;">
+          {emoji} {label}
+        </div>
+        """
     )
 
     as_of = trend.get("as_of_date") or "—"
     _render_trusted_html(
         f'<p class="trend-facts">'
-        f"現價 <strong>{html.escape(_fmt_price(trend.get('current_price')))}</strong> · "
-        f"SMA20 <strong>{html.escape(_fmt_price(trend.get('sma_20')))}</strong> · "
-        f"SMA50 <strong>{html.escape(_fmt_price(trend.get('sma_50')))}</strong><br>"
-        f"截至 {html.escape(str(as_of))}</p>"
+        f"現價 <strong>{_fmt_price(trend.get('current_price'))}</strong> · "
+        f"SMA20 <strong>{_fmt_price(trend.get('sma_20'))}</strong> · "
+        f"SMA50 <strong>{_fmt_price(trend.get('sma_50'))}</strong><br>"
+        f"截至 {as_of}</p>"
     )
 
 
@@ -2526,8 +2128,7 @@ def _display_technical_chart(symbol: str) -> None:
 
     freq_label = frequency.split("(")[0].strip()
     _render_trusted_html(
-        f'<p class="panel-label">📉 {html.escape(sym)} · {html.escape(freq_label)}'
-        f"技術線圖（預設近3個月）</p>"
+        f'<p class="panel-label">📉 {sym} · {freq_label}技術線圖（預設近3個月）</p>'
     )
     fig = render_technical_chart(sym, frequency=frequency, indicators=indicators)
     ind_suffix = "_".join(i.split()[0] for i in indicators) or "base"
@@ -2607,35 +2208,6 @@ def _rget(obj: object, key: str, default: object = None) -> object:
     return default if value is None else value
 
 
-def _report_strategy_mode(report: object) -> str:
-    return str(_rget(report, "strategy_mode", STRATEGY_VALUE) or STRATEGY_VALUE)
-
-
-def _report_quality_score(report: object) -> float:
-    q = _rget(report, "business_quality_score", None)
-    if q is None:
-        q = _rget(report, "total_score", 0.0)
-    try:
-        return float(q or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _report_valuation_score(report: object) -> float:
-    v = _rget(report, "valuation_safety_score", None)
-    if v is None:
-        v = _rget(report, "valuation_margin_score", 0.0)
-    try:
-        return float(v or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _report_master(report: object) -> MasterMetrics:
-    raw = _rget(report, "master", None) or _rget(report, "master_metrics", None)
-    return _coerce_master(raw)
-
-
 def _coerce_master(raw: object) -> MasterMetrics:
     """Normalize a master-metrics payload (dict / object / None) into MasterMetrics."""
     if isinstance(raw, MasterMetrics):
@@ -2672,8 +2244,6 @@ def _coerce_master(raw: object) -> MasterMetrics:
         ttm_operating_margin=_rget(raw, "ttm_operating_margin"),
         ttm_gross_margin=_rget(raw, "ttm_gross_margin"),
         ttm_revenue_growth=_rget(raw, "ttm_revenue_growth"),
-        forward_pe=_rget(raw, "forward_pe"),
-        fcf_yield=_rget(raw, "fcf_yield"),
         data_as_of=str(_rget(raw, "data_as_of", "")),
     )
 
@@ -2742,8 +2312,8 @@ def _coerce_report(report: object) -> StockReport:
     div_history = [_coerce_year_div(y) for y in (report.get("div_history") or [])]
 
     return StockReport(
-        symbol=str(report.get("symbol") or ""),
-        company_name=str(report.get("company_name") or ""),
+        symbol=str(report.get("symbol", "")),
+        company_name=str(report.get("company_name", "")),
         fcf_history=fcf_history,
         div_history=div_history,
         payout_ratio=report.get("payout_ratio"),
@@ -2753,22 +2323,16 @@ def _coerce_report(report: object) -> StockReport:
         business_quality_score=float(
             report.get("business_quality_score", report.get("total_score", 0.0)) or 0.0
         ),
-        valuation_safety_score=float(
-            report.get(
-                "valuation_safety_score",
-                report.get("valuation_margin_score", 0.0),
-            )
-            or 0.0
-        ),
-        grade_label=str(report.get("grade_label") or ""),
-        grade_emoji=str(report.get("grade_emoji") or ""),
-        analyst_commentary=str(report.get("analyst_commentary") or ""),
+        valuation_margin_score=float(report.get("valuation_margin_score", 0.0) or 0.0),
+        grade_label=str(report.get("grade_label", "")),
+        grade_emoji=str(report.get("grade_emoji", "")),
+        analyst_commentary=str(report.get("analyst_commentary", "")),
         fcf_pass=report.get("fcf_pass"),
-        fcf_note=str(report.get("fcf_note") or ""),
+        fcf_note=str(report.get("fcf_note", "")),
         div_pass=report.get("div_pass"),
-        div_note=str(report.get("div_note") or ""),
+        div_note=str(report.get("div_note", "")),
         trend_signal=report.get("trend_signal"),
-        strategy_mode=str(report.get("strategy_mode") or STRATEGY_VALUE),
+        strategy_mode=str(report.get("strategy_mode", STRATEGY_VALUE)),
         master=master,
         investment_scorecard=[
             _coerce_scorecard_item(row)
@@ -2848,36 +2412,23 @@ def _render_company_detail(report: StockReport) -> None:
         f'<p class="subtitle" style="margin-bottom:0.35rem;">'
         f"{html.escape(report.symbol)} · {html.escape(report.company_name)}</p>"
     )
-    _render_trusted_html(
-        f'<span class="strategy-badge">{html.escape(mode_label)}</span>'
-    )
-
-    _render_terminal_dual_scores(report)
-    _render_death_penalty_banners(report)
+    _render_trusted_html(f'<span class="strategy-badge">{html.escape(mode_label)}</span>')
     _render_valuation_trap_alert(report)
-    _render_dimension_grid(report)
 
-    payout_cell = (
-        f"{report.payout_ratio * 100:.1f}%"
-        if report.payout_ratio is not None
-        else "N/A"
-    )
-    beta_v = _fmt1(report.beta) if report.beta is not None else "N/A"
-    nd = report.master.net_debt_ebitda
-    nd_v = f"{nd:.1f}x" if nd is not None else "N/A"
+    quality = report.business_quality_score or report.total_score
     _render_fx_metric_row(
         [
-            ("EPS 發放率", payout_cell, "", "Trailing payout ratio · yfinance info"),
-            ("Beta", beta_v, "", "相對大盤波動係數 · 風險參考"),
+            ("企業品質分", _fmt1(quality), "Business Quality · 封頂95"),
+            ("估值安全分", _fmt1(report.valuation_margin_score), "Valuation Safety · 封頂95"),
+            ("等級", _format_grade(report)),
             (
-                "淨債務/EBITDA",
-                nd_v,
-                "",
-                "槓桿安全線 · >3.0x 觸發死亡懲罰",
+                "發放率",
+                f"{report.payout_ratio * 100:.1f}%"
+                if report.payout_ratio is not None
+                else "N/A",
             ),
         ]
     )
-
     _render_master_metric_row(report)
     _render_factor_glossary(report.strategy_mode)
 
@@ -2889,9 +2440,10 @@ def _render_company_detail(report: StockReport) -> None:
             report.trend_signal,
             growth_mode=is_growth_strategy(report.strategy_mode),
         )
-        _render_investment_scorecard(report)
-        _render_ai_commentary_section(report)
         _render_narrative_card(report.symbol)
+        _render_investment_scorecard(report)
+        _render_trusted_html('<p class="panel-label">AI 決策點評</p>')
+        _render_ai_terminal_block(report.analyst_commentary)
         _render_fcf_chart_section(report, height=240)
         _render_dps_chart_section(report, height=240)
 
@@ -2938,7 +2490,7 @@ def _render_core_scoring_tab() -> None:
     mode = _current_strategy_mode()
     weight_caption = _strategy_weight_caption(mode)
     _render_trusted_html(
-        f'<p class="subtitle">100 分制財務紀律評分 · {html.escape(weight_caption)}</p>'
+        f'<p class="subtitle">100 分制財務紀律評分 · {html.escape(str(weight_caption or ""))}</p>'
     )
     _render_factor_glossary(mode)
 
@@ -2947,19 +2499,19 @@ def _render_core_scoring_tab() -> None:
         return
 
     by_symbol = _build_reports_map(tickers)
-    reports = [_coerce_report(by_symbol[s]) for s in tickers if s in by_symbol]
+    reports = [by_symbol[s] for s in tickers if s in by_symbol]
 
-    top = [r for r in reports if _report_quality_score(r) >= 85]
+    top = [r for r in reports if (r.business_quality_score or r.total_score) >= 85]
     val_traps = [r for r in reports if _valuation_trap_warning(r)]
     _render_fx_metric_row(
         [
             ("分析標的", str(len(reports))),
             ("高品質 (≥85)", str(len(top))),
             ("估值紅燈 (<50)", str(len(val_traps))),
-            ("評分權重", _strategy_short_name(mode), weight_caption),
+            ("評分權重", _strategy_short_name(mode), str(weight_caption or "")),
             (
                 "均品質分",
-                _fmt1(sum(_report_quality_score(r) for r in reports) / len(reports))
+                _fmt1(sum((r.business_quality_score or r.total_score) for r in reports) / len(reports))
                 if reports
                 else "—",
             ),
@@ -3022,8 +2574,7 @@ def _render_company_deep_analysis() -> None:
 def _render_turnaround_hunter_tab() -> None:
     """Turnaround radar — index universes or custom list feed analyzed_tickers."""
     _render_trusted_html(
-        '<p class="panel-label" style="margin-top:0.25rem;">'
-        "掃描工作區 · Reversal Scan Workspace</p>"
+        '<p class="panel-label" style="margin-top:0.25rem;">掃描工作區 · Reversal Scan Workspace</p>'
     )
     _render_trusted_html(
         '<p class="subtitle">'
@@ -3045,7 +2596,7 @@ def _render_turnaround_hunter_tab() -> None:
             ("價格濾網", "半年跌幅 > 15%", "Close > SMA20 右側確認"),
             ("估值濾網", "距52週高點 ≥25% 或 PEG<1.5", "錯殺確認"),
             ("防破產濾網", "淨債務/EBITDA < 3x", "FCF > 0 · 利息保障 > 3x"),
-            ("防結構腐壞", "3Y 營收 CAGR > 0", "拒絕萎縮本業價值陷阱"),
+            ("防結構腐壞", "3Y CAGR>0 或 GM≥產業中位數", "拒絕萎縮本業"),
             ("評分引擎", "🛡️ 100分防禦模式", "≥85 分優先排序"),
             ("上次命中", str(len(st.session_state.hunter_results))),
         ]
@@ -3240,16 +2791,17 @@ def _render_sidebar() -> None:
     st.sidebar.header("量化評分標準")
     st.sidebar.markdown(
         """
-        **Red Team Protocol · 雙軌計分（封頂 95）**
-        - **企業品質分**：護城河 · 現金流 · 財務 · 營收
-        - **估值安全分**：Forward P/E · PEG · FCF Yield
+        **雙軌計分（Quality vs Valuation）**
+        - **企業品質分** (100)：護城河 · 現金流 · 財務安全 · 營收
+        - **估值安全分** (100，封頂 **95**)：Forward P/E · PEG · FCF Yield
         - **<50 估值紅燈**：品質極優但估值過高
 
         **🛡️ 價值模式品質權重**：35/25/25/15 + 死亡懲罰
 
-        **🚀 動能模式**：基本面30 + Surprise25 + PEG25 + Timing15 + 風險緩衝5
+        **🚀 動能模式**：基本面30 + Surprise25 + PEG25 + 風險緩衝5 + Timing15
+        - 技術面降級為 Timing 輔助，不主導決策
 
-        **等級**：依企業品質分 · 紅隊 AI 強制【🩸漏洞審查】
+        **等級**：依企業品質分映射 · 紅隊 AI 強制漏洞審查
         """
     )
     st.sidebar.header("逆向轉機股雷達")
@@ -3260,7 +2812,7 @@ def _render_sidebar() -> None:
         2. 估值吸引力（52週高點 / PEG）
         3. FCF > 0 · 淨槓桿 < 3x · 利息保障 > 3x
         4. 毛利率 YoY 穩定
-        5. **3Y 營收 CAGR > 0** 或 **季毛利率 > 產業中位數/無結構崩塌**
+        5. **3Y 營收 CAGR > 0** 或 **毛利率 ≥ 產業中位數且未崩塌**
         6. 🛡️ 100分防禦評分 · Gemini 錯殺標籤
         """
     )
@@ -3277,14 +2829,15 @@ def _render_sidebar() -> None:
         f"**已載入深度分析**：{len(st.session_state.get('analyzed_tickers', []))} 檔"
     )
     st.sidebar.markdown("---")
-    _render_sidebar_trusted_html(
+    _render_trusted_html(
         """
         <div class="sidebar-lab-card">
-        <div class="sidebar-lab-badge">COMING SOON</div>
-        <div class="sidebar-lab-title">實驗性引擎：社會套利 (Social Sentiment Lab)</div>
-        <p class="sidebar-lab-hint">TODO: 接入 Reddit / TikTok API</p>
+            <div class="sidebar-lab-badge">COMING SOON</div>
+            <div class="sidebar-lab-title">實驗性引擎：社會套利 (Social Sentiment Lab)</div>
+            <p class="sidebar-lab-hint">TODO: 接入 Reddit / TikTok API</p>
         </div>
-        """
+        """,
+        container=st.sidebar,
     )
     st.sidebar.button(
         "社會套利 · Social Sentiment Lab",
@@ -3304,36 +2857,28 @@ def _render_sidebar() -> None:
 
 
 def main() -> None:
-    try:
-        st.set_page_config(layout="wide")
-    except Exception:
-        pass  # full config already applied at import (before @st.cache_data)
     _inject_css()
     _init_session_state()
+    _render_trusted_html('<p class="main-title">股息安全 · 綜合分析儀表板</p>')
+    _render_trusted_html(
+        '<p class="subtitle">自訂觀察清單 · 100 分制財務評分 · 轉機股雷達 · 技術線圖</p>'
+    )
+    _render_watchlist_bar()
 
-    main_container = st.container()
-    with main_container:
-        _render_trusted_html('<p class="main-title">股息安全 · 綜合分析儀表板</p>')
-        _render_trusted_html(
-            '<p class="subtitle">自訂觀察清單 · 100 分制財務評分 · 轉機股雷達 · 技術線圖</p>'
-        )
-        _render_watchlist_bar()
+    tab_score, tab_hunter = st.tabs(
+        [
+            "📊 核心財務評分",
+            "🛡️ 逆向轉機股雷達",
+        ]
+    )
 
-        tab_score, tab_hunter = st.tabs(
-            [
-                "📊 核心財務評分",
-                "🛡️ 逆向轉機股雷達",
-            ]
-        )
+    with tab_score:
+        _render_core_scoring_tab()
 
-        with tab_score:
-            _render_core_scoring_tab()
+    with tab_hunter:
+        _render_turnaround_hunter_tab()
 
-        with tab_hunter:
-            _render_turnaround_hunter_tab()
-
-        _render_company_deep_analysis()
-
+    _render_company_deep_analysis()
     _render_sidebar()
 
 
