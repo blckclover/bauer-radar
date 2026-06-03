@@ -349,41 +349,48 @@ def _format_narrative_for_card(raw: str) -> str:
 
 
 def _render_narrative_card(symbol: str) -> None:
-    st.markdown(
-        '<p class="panel-label fx-narrative-heading">'
-        "💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>",
-        unsafe_allow_html=True,
-    )
-    strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
-    try:
-        narrative, live_news_degraded = load_company_narrative(strategy_key, symbol)
-    except Exception:
-        st.warning(
-            "科技敘事暫時無法載入（API 或連線異常）。"
-            "雙軌分數、計分卡與財務圖表不受影響。"
+    """Narrative block — warnings render here only (never during cached LLM fetch)."""
+    with st.container():
+        st.markdown(
+            '<p class="panel-label fx-narrative-heading">'
+            "💡 科技願景與最新嘗試 (Company Narrative & Tech Pulse)</p>",
+            unsafe_allow_html=True,
         )
-        return
-    safe_narrative = _safe_render_text(narrative)
-    if not safe_narrative:
-        if _is_llm_error_payload(narrative):
+        strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
+        narrative = ""
+        live_news_degraded = False
+        try:
+            narrative, live_news_degraded = load_company_narrative(strategy_key, symbol)
+        except Exception:
             st.warning(
-                "科技敘事 AI 暫時不可用。雙軌分數、計分卡與財務圖表不受影響。"
+                "⚠️ 目前 AI 伺服器擁擠，科技敘事暫時無法載入，請稍後重試。"
             )
-        return
-    card_html = _format_narrative_for_card(safe_narrative)
-    if not card_html:
-        return
-    if live_news_degraded and is_growth_strategy(strategy_key):
-        card_html += (
-            '<p class="fx-narrative-footnote">'
-            "即時新聞流連線超時 · 目前顯示基礎科技敘事"
-            "</p>"
+            return
+
+        safe_narrative = _safe_render_text(narrative)
+        if not safe_narrative:
+            st.warning(
+                "⚠️ 目前 AI 伺服器擁擠，科技敘事暫時無法載入，請稍後重試。"
+            )
+            return
+
+        card_html = _format_narrative_for_card(safe_narrative)
+        if not card_html:
+            st.warning(
+                "⚠️ 目前 AI 伺服器擁擠，科技敘事暫時無法載入，請稍後重試。"
+            )
+            return
+        if live_news_degraded and is_growth_strategy(strategy_key):
+            card_html += (
+                '<p class="fx-narrative-footnote">'
+                "即時新聞流連線超時 · 目前顯示基礎科技敘事"
+                "</p>"
+            )
+        _render_trusted_html(
+            f'<div class="fx-narrative-card">'
+            f'<div class="fx-narrative-body">{card_html}</div>'
+            f"</div>"
         )
-    _render_trusted_html(
-        f'<div class="fx-narrative-card">'
-        f'<div class="fx-narrative-body">{card_html}</div>'
-        f"</div>"
-    )
 
 
 def _fmt1(value: float | None) -> str:
@@ -1526,23 +1533,23 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
 
 def _render_ai_commentary_section(report: object) -> None:
     """AI commentary block only — failures must not abort the rest of the page."""
-    st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
-    raw = _rget(report, "analyst_commentary", None)
-    commentary = _safe_render_text(raw)
-    if commentary:
+    with st.container():
+        st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
+        raw = _rget(report, "analyst_commentary", None)
+        if _is_llm_error_payload(raw):
+            st.warning(
+                "⚠️ 目前 AI 伺服器擁擠，紅隊決策點評暫時無法載入，請稍後重試。"
+            )
+            return
+
+        commentary = _safe_render_text(raw)
+        if not commentary:
+            st.warning(
+                "⚠️ 目前 AI 伺服器擁擠，紅隊決策點評暫時無法載入，請稍後重試。"
+            )
+            return
+
         _render_ai_terminal_block(commentary)
-        return
-    if _is_llm_error_payload(raw):
-        st.warning(
-            "目前 AI 伺服器擁擠，已改用離線紅隊評語；"
-            "量化計分卡、雙軌分數與財務明細仍可正常查閱。"
-        )
-        return
-    fallback = (str(raw).strip() if raw is not None else "")
-    if fallback and not _is_llm_error_payload(fallback):
-        _render_ai_terminal_block(fallback)
-        return
-    st.info("AI 決策點評暫不可用，請稍後重試。")
 
 
 def _render_ai_terminal_block(text: str | None) -> None:
@@ -1907,8 +1914,8 @@ def _build_reports_map(tickers: list[str]) -> dict[str, StockReport]:
             continue
         try:
             reports[sym] = _coerce_report(load_report_for_symbol(strategy_key, sym))
-        except Exception:
-            st.warning(f"無法完整載入 {sym}（資料源或 AI 服務異常），已跳過該標的。")
+        except Exception as exc:
+            print(f"Warning: failed to load report for {sym}: {exc}")
     return reports
 
 

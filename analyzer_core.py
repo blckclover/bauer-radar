@@ -3448,8 +3448,8 @@ _LLM_BUSY_MESSAGE = "目前 AI 伺服器擁擠，請稍後重試。"
 
 
 def _notify_llm_busy() -> None:
-    """Surface a user-visible error without caching the message itself."""
-    st.error(_LLM_BUSY_MESSAGE)
+    """Log rate-limit / LLM outage only — UI alerts render in app.py section blocks."""
+    print(f"Warning: {_LLM_BUSY_MESSAGE}")
 
 
 def _accept_cached_llm_text(text: str | None) -> str | None:
