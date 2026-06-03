@@ -349,11 +349,20 @@ def _render_narrative_card(symbol: str) -> None:
         unsafe_allow_html=True,
     )
     strategy_key = st.session_state.get(ACTIVE_STRATEGY_KEY, STRATEGY_LABEL_VALUE)
-    narrative, live_news_degraded = load_company_narrative(strategy_key, symbol)
+    try:
+        narrative, live_news_degraded = load_company_narrative(strategy_key, symbol)
+    except Exception:
+        st.warning(
+            "科技敘事暫時無法載入（API 或連線異常）。"
+            "雙軌分數、計分卡與財務圖表不受影響。"
+        )
+        return
     safe_narrative = _safe_render_text(narrative)
     if not safe_narrative:
         if _is_llm_error_payload(narrative):
-            st.error("目前 AI 伺服器擁擠，請稍後重試。")
+            st.warning(
+                "科技敘事 AI 暫時不可用。雙軌分數、計分卡與財務圖表不受影響。"
+            )
         return
     card_html = _format_narrative_for_card(safe_narrative)
     if not card_html:
@@ -399,8 +408,12 @@ def _inject_css() -> None:
         f"""
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-        html, body, [class*="css"], .stApp, .stMarkdown, label, p, span, div {{
+        html, body, .stApp, .stMarkdown, label, p, span {{
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
+        }}
+        [data-testid="stIconMaterial"],
+        [data-testid="stIconMaterial"] span {{
+            font-family: "Material Symbols Rounded", "Material Icons", sans-serif !important;
         }}
         div[data-testid="stMetric"] {{
             background-color: #1E293B !important;
@@ -1163,22 +1176,6 @@ def _inject_css() -> None:
             margin: 1.5rem 0 !important;
             border-color: var(--border-subtle) !important;
         }}
-        [data-testid="stExpander"] {{
-            border: 1px solid var(--border-subtle) !important;
-            border-radius: 8px !important;
-            background: var(--bg-card) !important;
-            margin-top: 1rem;
-        }}
-        [data-testid="stExpander"] details summary {{
-            overflow: visible !important;
-            align-items: center !important;
-        }}
-        [data-testid="stExpander"] details summary p {{
-            margin: 0 !important;
-            white-space: normal !important;
-            overflow-wrap: anywhere !important;
-            line-height: 1.4 !important;
-        }}
         div[data-testid="stAlert"] {{
             border-radius: 8px !important;
             border: 1px solid var(--border-subtle) !important;
@@ -1560,12 +1557,31 @@ def _render_fx_table_card(df: pd.DataFrame, *, title: str = "") -> None:
     )
 
 
+def _render_ai_commentary_section(report: object) -> None:
+    """AI commentary block only — failures must not abort the rest of the page."""
+    st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
+    raw = _rget(report, "analyst_commentary", None)
+    commentary = _safe_render_text(raw)
+    if commentary:
+        _render_ai_terminal_block(commentary)
+        return
+    if _is_llm_error_payload(raw):
+        st.warning(
+            "目前 AI 伺服器擁擠，已改用離線紅隊評語；"
+            "量化計分卡、雙軌分數與財務明細仍可正常查閱。"
+        )
+        return
+    fallback = (str(raw).strip() if raw is not None else "")
+    if fallback and not _is_llm_error_payload(fallback):
+        _render_ai_terminal_block(fallback)
+        return
+    st.info("AI 決策點評暫不可用，請稍後重試。")
+
+
 def _render_ai_terminal_block(text: str | None) -> None:
     """Finance-terminal styled block for AI commentary — no raw Markdown headers."""
     safe = _safe_render_text(text)
     if not safe:
-        if text and _is_llm_error_payload(text):
-            st.error("目前 AI 伺服器擁擠，請稍後重試。")
         return
     clean = _sanitize_ai_commentary(safe)
     if not clean:
@@ -1632,6 +1648,7 @@ def _render_investment_scorecard(report: object) -> None:
         )
 
     if not cards:
+        st.caption("Master Scorecard 暫無可顯示項目（AI 服務異常時請稍後重試）。")
         return
 
     scorecard_html = (
@@ -1930,7 +1947,10 @@ def _build_reports_map(tickers: list[str]) -> dict[str, StockReport]:
         sym = raw.upper().strip()
         if not sym:
             continue
-        reports[sym] = _coerce_report(load_report_for_symbol(strategy_key, sym))
+        try:
+            reports[sym] = _coerce_report(load_report_for_symbol(strategy_key, sym))
+        except Exception:
+            st.warning(f"無法完整載入 {sym}（資料源或 AI 服務異常），已跳過該標的。")
     return reports
 
 
@@ -2890,15 +2910,9 @@ def _render_company_detail(report: StockReport) -> None:
             report.trend_signal,
             growth_mode=is_growth_strategy(report.strategy_mode),
         )
-        _render_narrative_card(report.symbol)
         _render_investment_scorecard(report)
-        commentary = _safe_render_text(_rget(report, "analyst_commentary", None))
-        if commentary:
-            st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
-            _render_ai_terminal_block(commentary)
-        elif _is_llm_error_payload(_rget(report, "analyst_commentary", None)):
-            st.markdown('<p class="panel-label">AI 決策點評</p>', unsafe_allow_html=True)
-            st.error("目前 AI 伺服器擁擠，請稍後重試。")
+        _render_ai_commentary_section(report)
+        _render_narrative_card(report.symbol)
         _render_fcf_chart_section(report, height=240)
         _render_dps_chart_section(report, height=240)
 
