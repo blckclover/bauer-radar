@@ -247,6 +247,24 @@ _HTML_FENCE_TRAILING_RE = re.compile(r"\n?\s*```\s*$")
 
 
 _HTML_FENCE_RE = re.compile(r"```(?:html)?\n?", re.IGNORECASE)
+_DIV_OPEN_RE = re.compile(r"<div\b[^>]*>", re.IGNORECASE)
+_DIV_CLOSE_RE = re.compile(r"</div>", re.IGNORECASE)
+
+
+def _count_div_tags(html: str) -> tuple[int, int]:
+    """Return (opening <div count, closing </div> count)."""
+    opens = len(_DIV_OPEN_RE.findall(html))
+    closes = len(_DIV_CLOSE_RE.findall(html))
+    return opens, closes
+
+
+def _strip_div_tags_from_fragment(text: str) -> str:
+    """Remove div wrappers from untrusted LLM fragments — outer shells stay balanced."""
+    if not text:
+        return ""
+    out = _DIV_OPEN_RE.sub("", text)
+    out = _DIV_CLOSE_RE.sub("", out)
+    return out.strip()
 
 
 def _clean_ai_html(raw: str) -> str:
@@ -261,14 +279,21 @@ def _clean_ai_html(raw: str) -> str:
         clean_html = _HTML_FENCE_RE.sub("", inner).replace("```", "").strip()
     clean_html = _HTML_FENCE_LEADING_RE.sub("", clean_html)
     clean_html = _HTML_FENCE_TRAILING_RE.sub("", clean_html)
-    return _HTML_FENCE_RE.sub("", clean_html).replace("```", "").strip()
+    clean_html = _HTML_FENCE_RE.sub("", clean_html).replace("```", "").strip()
+    return _strip_div_tags_from_fragment(clean_html)
 
 
 def _render_trusted_html(html_content: str) -> None:
     """Render app-owned HTML templates (dedented — Streamlit requires unindented blocks)."""
     content = dedent(html_content or "").strip()
-    if content:
-        st.markdown(content, unsafe_allow_html=True)
+    if not content:
+        return
+    opens, closes = _count_div_tags(content)
+    if opens != closes:
+        plain = _strip_div_tags_from_fragment(content)
+        plain = html.escape(plain).replace("\n", "<br>")
+        content = f'<div class="fx-html-shell"><p>{plain}</p></div>'
+    st.markdown(content, unsafe_allow_html=True)
 
 
 def _render_html(html_content: str) -> None:
@@ -309,9 +334,9 @@ def _safe_render_text(text: object) -> str | None:
 
 def _format_narrative_for_card(raw: str) -> str:
     """Strip AI filler / markdown artifacts; convert **bold** to HTML <strong>."""
-    text = _clean_ai_html(raw)
-    if text.lstrip().startswith("<"):
-        return text
+    text = _strip_div_tags_from_fragment(_clean_ai_html(raw))
+    if not text:
+        return ""
     filler_re = re.compile(
         r"^(好的[，,].*?|分析師報告如下[：:].*?|以下是.*?[：:].*?|"
         r"Sure[,.].*?|Here(?:'s| is).*?:)\s*\n?",
@@ -539,6 +564,18 @@ def _inject_css() -> None:
             padding: 1rem 1.15rem !important;
             margin: 0.85rem 0 1.35rem !important;
             box-shadow: 0 10px 28px rgba(2, 6, 23, 0.28);
+        }}
+        .fx-html-shell {{
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            border-radius: 8px;
+            padding: 0.75rem 1rem;
+            margin: 0.5rem 0;
+            color: #cbd5e1;
+            font-size: 0.86rem;
+            line-height: 1.6;
+        }}
+        .fx-html-shell p {{
+            margin: 0;
         }}
         .fx-metric-card {{
             background: linear-gradient(160deg, #243044 0%, #1a2332 45%, #121a28 100%);
@@ -1557,11 +1594,13 @@ def _render_ai_terminal_block(text: str | None) -> None:
     safe = _safe_render_text(text)
     if not safe:
         return
-    clean = _sanitize_ai_commentary(safe)
+    clean = _sanitize_ai_commentary(_strip_div_tags_from_fragment(safe))
     if not clean:
         return
     body_html = html.escape(clean).replace(chr(10), "<br>")
-    _render_trusted_html(f'<div class="ai-terminal-body">{body_html}</div>')
+    _render_trusted_html(
+        f'<div class="ai-terminal-body">{body_html}</div>'
+    )
 
 
 def _scorecard_tone(score: int) -> str:
@@ -1632,13 +1671,10 @@ def _render_investment_scorecard(report: object) -> None:
 
 def _render_deep_analysis_divider() -> None:
     """Visual separator between scan workspace and deep-dive analysis."""
-    st.markdown(
-        """
-        <div class="section-divider">
-            <span class="section-divider-label">深度研究區 · Deep Dive Workspace</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    _render_trusted_html(
+        '<div class="section-divider">'
+        '<span class="section-divider-label">深度研究區 · Deep Dive Workspace</span>'
+        "</div>"
     )
 
 
@@ -1968,11 +2004,10 @@ def _render_trend_signal_block(trend: dict | None, *, growth_mode: bool = False)
     st.markdown('<p class="panel-label">右側動態趨勢</p>', unsafe_allow_html=True)
 
     if not trend:
-        st.markdown(
+        _render_trusted_html(
             '<div class="section-card" style="color:#64748b;font-size:0.85rem;">'
             "趨勢數據不足，無法計算 SMA 20/50 交叉訊號。"
-            "</div>",
-            unsafe_allow_html=True,
+            "</div>"
         )
         return
 
@@ -1995,14 +2030,10 @@ def _render_trend_signal_block(trend: dict | None, *, growth_mode: bool = False)
     else:
         border, bg, emoji, label = TREND_BADGE_STYLES.get(signal, TREND_BADGE_STYLES["Hold"])
 
-    st.markdown(
-        f"""
-        <div class="trend-tag" style="background:{bg}; color:{border};
-             box-shadow: inset 0 0 0 1px {border}33;">
-          {emoji} {label}
-        </div>
-        """,
-        unsafe_allow_html=True,
+    _render_trusted_html(
+        f'<div class="trend-tag" style="background:{bg}; color:{border};'
+        f"box-shadow: inset 0 0 0 1px {border}33;\">"
+        f"{emoji} {html.escape(label)}</div>"
     )
 
     as_of = trend.get("as_of_date") or "—"
@@ -2023,10 +2054,7 @@ def _chart_df_ready(df: pd.DataFrame | None, *required_columns: str) -> bool:
 
 
 def _render_chart_empty_notice(message: str) -> None:
-    st.markdown(
-        f'<div class="fx-chart-empty">{html.escape(message)}</div>',
-        unsafe_allow_html=True,
-    )
+    _render_trusted_html(f'<div class="fx-chart-empty">{html.escape(message)}</div>')
 
 
 def _fcf_bar_chart(report: StockReport, *, height: int = 400) -> go.Figure | None:
@@ -3265,16 +3293,18 @@ def _render_sidebar() -> None:
         f"**已載入深度分析**：{len(st.session_state.get('analyzed_tickers', []))} 檔"
     )
     st.sidebar.markdown("---")
-    st.sidebar.markdown(
+    _sidebar_html = dedent(
         """
         <div class="sidebar-lab-card">
-            <div class="sidebar-lab-badge">COMING SOON</div>
-            <div class="sidebar-lab-title">實驗性引擎：社會套利 (Social Sentiment Lab)</div>
-            <p class="sidebar-lab-hint">TODO: 接入 Reddit / TikTok API</p>
+        <div class="sidebar-lab-badge">COMING SOON</div>
+        <div class="sidebar-lab-title">實驗性引擎：社會套利 (Social Sentiment Lab)</div>
+        <p class="sidebar-lab-hint">TODO: 接入 Reddit / TikTok API</p>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        """
+    ).strip()
+    opens, closes = _count_div_tags(_sidebar_html)
+    if opens == closes:
+        st.sidebar.markdown(_sidebar_html, unsafe_allow_html=True)
     st.sidebar.button(
         "社會套利 · Social Sentiment Lab",
         disabled=True,
