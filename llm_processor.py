@@ -18,20 +18,15 @@ MODEL_NAME = "gemini-2.5-flash"
 
 
 def is_narrative_error_payload(text: str) -> bool:
-    """True when text looks like a leaked API/JSON error, not user-facing narrative."""
-    if not (text or "").strip():
+    """檢查 LLM 回傳的字串是否為底層 API 的 JSON 錯誤代碼 (如 429 資源耗盡)"""
+    if not text:
         return False
-    t = text.strip()
-    if t.startswith("{"):
+    upper_text = text.upper()
+    if "RESOURCE_EXHAUSTED" in upper_text or "QUOTA EXCEEDED" in upper_text:
         return True
-    upper = t.upper()
-    if "RESOURCE_EXHAUSTED" in upper:
+    if "429" in upper_text and "ERROR" in upper_text:
         return True
-    if re.search(r"\b429\b", t):
-        return True
-    if re.search(r"""['"]error['"]\s*:""", t):
-        return True
-    if t.startswith("⚠️ 科技敘事生成失敗"):
+    if text.strip().startswith("{") and "'ERROR':" in upper_text:
         return True
     return False
 
