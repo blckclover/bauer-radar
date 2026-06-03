@@ -49,6 +49,7 @@ from analyzer_core import (
     reports_to_summary_df,
 )
 
+# Must run before any @st.cache_data registration (decorators execute at import time).
 st.set_page_config(
     page_title="股息安全分析儀表板",
     page_icon="📊",
@@ -461,18 +462,18 @@ def _inject_css() -> None:
             background-color: #121212 !important;
         }}
         .block-container {{
-            padding-top: 2.75rem;
+            padding-top: 3rem !important;
             padding-bottom: 2.5rem;
             max-width: 1480px;
             margin-top: 0 !important;
             overflow: visible !important;
         }}
         [data-testid="stMainBlockContainer"] {{
-            padding-top: 0.75rem;
+            padding-top: 0 !important;
             overflow: visible !important;
         }}
         [data-testid="stAppViewContainer"] .main .block-container {{
-            padding-top: 2.75rem;
+            padding-top: 3rem !important;
             margin-top: 0 !important;
         }}
         [data-testid="stHorizontalBlock"] {{
@@ -1168,6 +1169,16 @@ def _inject_css() -> None:
             background: var(--bg-card) !important;
             margin-top: 1rem;
         }}
+        [data-testid="stExpander"] details summary {{
+            overflow: visible !important;
+            align-items: center !important;
+        }}
+        [data-testid="stExpander"] details summary p {{
+            margin: 0 !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            line-height: 1.4 !important;
+        }}
         div[data-testid="stAlert"] {{
             border-radius: 8px !important;
             border: 1px solid var(--border-subtle) !important;
@@ -1465,7 +1476,7 @@ def _render_factor_glossary(mode: str | None = None) -> None:
     """Expandable institutional factor glossary for scoring transparency."""
     active = mode or _current_strategy_mode()
     tips = SCORE_WEIGHT_TOOLTIPS_GROWTH if is_growth_strategy(active) else SCORE_WEIGHT_TOOLTIPS_VALUE
-    with st.expander("📐 量化因子方法論 · Factor Methodology", expanded=False):
+    with st.expander("📊 量化因子方法論 · Factor Methodology"):
         for dim, desc in tips.items():
             _render_html(
                 f'<p class="factor-glossary-item">'
@@ -3303,7 +3314,10 @@ def _render_sidebar() -> None:
 
 
 def main() -> None:
-    # layout="wide" is set at module import (Streamlit requires first st.* call).
+    try:
+        st.set_page_config(layout="wide")
+    except Exception:
+        pass  # full config already applied at import (before @st.cache_data)
     _inject_css()
     _init_session_state()
 
