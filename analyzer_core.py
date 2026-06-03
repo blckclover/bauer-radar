@@ -416,6 +416,11 @@ class StockReport:
         """Alias — Red Team Protocol naming."""
         return self.valuation_margin_score
 
+    @property
+    def revenue_cagr(self) -> float | None:
+        """5Y revenue CAGR used for mode-applicability heuristics."""
+        return self.master.revenue_cagr_5y
+
 
 @lru_cache(maxsize=1)
 def _symbol_to_cik() -> dict[str, str]:
@@ -3541,6 +3546,53 @@ def normalize_strategy_mode(strategy_mode: str) -> str:
 
 def is_growth_strategy(strategy_mode: str) -> bool:
     return normalize_strategy_mode(strategy_mode) == STRATEGY_GROWTH
+
+
+_GROWTH_MODE_MISMATCH_WARNING = (
+    "⚠️ 標的屬性不符：此為成熟防禦型標的（營收動能偏低、具備配息特徵）。"
+    "當前【動能成長模式】會給出異常低分，建議切換至【價值防禦模式】評估。"
+)
+_VALUE_MODE_MISMATCH_WARNING = (
+    "⚠️ 標的屬性不符：此標的具備高波動與高成長特徵。"
+    "當前【價值防禦模式】的嚴格估值與配息要求極易觸發死亡懲罰，"
+    "建議切換至【動能成長模式】評估。"
+)
+
+
+def evaluate_mode_applicability(report: StockReport) -> tuple[bool, str]:
+    """Return (is_applicable, warning_message) for the active strategy mode."""
+    mode = normalize_strategy_mode(report.strategy_mode)
+
+    revenue_cagr: float | None = None
+    if report.revenue_cagr is not None:
+        revenue_cagr = report.revenue_cagr
+
+    payout_ratio: float | None = None
+    if report.payout_ratio is not None:
+        payout_ratio = report.payout_ratio
+
+    beta: float | None = None
+    if report.beta is not None:
+        beta = report.beta
+
+    if mode == STRATEGY_GROWTH:
+        if revenue_cagr is not None and revenue_cagr < 0.05:
+            has_dividend_defense = (
+                payout_ratio is not None and payout_ratio > 0.3
+            ) or (beta is not None and beta < 0.9)
+            if has_dividend_defense:
+                return False, _GROWTH_MODE_MISMATCH_WARNING
+
+    if mode == STRATEGY_VALUE:
+        if (
+            revenue_cagr is not None
+            and revenue_cagr > 0.20
+            and beta is not None
+            and beta > 1.2
+        ):
+            return False, _VALUE_MODE_MISMATCH_WARNING
+
+    return True, ""
 
 
 def compute_scores(

@@ -28,6 +28,7 @@ from analyzer_core import (
     clear_gemini_llm_cache,
     analyze_symbol,
     build_company_narrative,
+    evaluate_mode_applicability,
     detect_trend_signals,
     dividend_chart_df,
     fcf_chart_df,
@@ -2423,6 +2424,9 @@ def _render_company_detail(report: StockReport) -> None:
         f"{html.escape(report.symbol)} · {html.escape(report.company_name)}</p>"
     )
     _render_trusted_html(f'<span class="strategy-badge">{html.escape(mode_label)}</span>')
+    is_applicable, mode_warning = evaluate_mode_applicability(report)
+    if not is_applicable and mode_warning:
+        st.warning(mode_warning)
     _render_valuation_trap_alert(report)
 
     quality = report.business_quality_score or report.total_score
