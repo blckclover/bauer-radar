@@ -18,6 +18,7 @@ from analyzer_core import (
     STRATEGY_LABEL_VALUE,
     STRATEGY_LABELS,
     STRATEGY_VALUE,
+    VALUE_TRAP_STRUCTURAL_ALERT_MSG,
     MasterMetrics,
     ScoreDetail,
     ScorecardItem,
@@ -1032,6 +1033,20 @@ def _render_valuation_trap_alert(report: StockReport) -> None:
         "⚠️ 品質極優，但估值過高，注意安全邊際"
         "</div>"
     )
+
+
+def _structural_value_trap_alert(report: StockReport) -> bool:
+    """Value-mode structural trap: gross bleed and/or revenue collapse + downgrades."""
+    if is_growth_strategy(report.strategy_mode):
+        return False
+    return bool(report.gross_margin_red_flag or report.value_trap_red_flag)
+
+
+def _render_structural_value_trap_alert(report: StockReport) -> None:
+    if not _structural_value_trap_alert(report):
+        return
+    msg = (report.value_trap_alert_msg or VALUE_TRAP_STRUCTURAL_ALERT_MSG).strip()
+    _render_html(f'<div class="valuation-trap-alert">{html.escape(msg)}</div>')
 
 
 def _grade_tone(value: object) -> str:
@@ -2252,6 +2267,11 @@ def _coerce_master(raw: object) -> MasterMetrics:
         operating_margin_red_flag_msg=str(_rget(raw, "operating_margin_red_flag_msg", "")),
         capex_red_flag=bool(_rget(raw, "capex_red_flag", False)),
         capex_red_flag_msg=str(_rget(raw, "capex_red_flag_msg", "")),
+        current_gross_margin=_rget(raw, "current_gross_margin"),
+        historical_gross_margin_avg=_rget(raw, "historical_gross_margin_avg"),
+        gross_margin_red_flag=bool(_rget(raw, "gross_margin_red_flag", False)),
+        gross_margin_red_flag_msg=str(_rget(raw, "gross_margin_red_flag_msg", "")),
+        value_trap_red_flag=bool(_rget(raw, "value_trap_red_flag", False)),
         ttm_operating_margin=_rget(raw, "ttm_operating_margin"),
         ttm_gross_margin=_rget(raw, "ttm_gross_margin"),
         ttm_revenue_growth=_rget(raw, "ttm_revenue_growth"),
@@ -2349,6 +2369,13 @@ def _coerce_report(report: object) -> StockReport:
             _coerce_scorecard_item(row)
             for row in (report.get("investment_scorecard") or [])
         ],
+        gross_margin_red_flag=bool(
+            _rget(report, "gross_margin_red_flag", _rget(master, "gross_margin_red_flag", False))
+        ),
+        value_trap_red_flag=bool(
+            _rget(report, "value_trap_red_flag", _rget(master, "value_trap_red_flag", False))
+        ),
+        value_trap_alert_msg=str(_rget(report, "value_trap_alert_msg", "")),
     )
 
 
@@ -2427,6 +2454,7 @@ def _render_company_detail(report: StockReport) -> None:
     is_applicable, mode_warning = evaluate_mode_applicability(report)
     if not is_applicable and mode_warning:
         st.warning(mode_warning)
+    _render_structural_value_trap_alert(report)
     _render_valuation_trap_alert(report)
 
     quality = report.business_quality_score or report.total_score

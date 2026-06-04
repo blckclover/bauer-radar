@@ -56,6 +56,14 @@ NET_DEBT_EBITDA_DEATH_THRESHOLD = 3.0
 FCF_PAYOUT_DEATH_THRESHOLD = 0.90
 VALUE_SCORE_DEATH_CAP = 69.0
 FCF_PAYOUT_EXTRA_PENALTY = 10.0
+# Value-trap detector (value mode) — gross bleed + structural trap
+GROSS_MARGIN_BLEED_VS_HIST = 0.03          # latest GM ≥3pp below multi-year avg (ratio units)
+OPERATING_MARGIN_SEVERE_DECLINE_PP = -3.0  # YoY OM collapse (percentage points)
+VALUE_TRAP_GM_QUALITY_PENALTY = 20.0
+VALUE_TRAP_VALUATION_CAP = 45.0
+VALUE_TRAP_STRUCTURAL_ALERT_MSG = (
+    "⚠️ 偵測到結構性價值陷阱風險：毛利連續失血/預期持續下修，請極度小心低估值錯覺。"
+)
 # Turnaround radar — anti-bankruptcy gate (shared with death penalty)
 NET_DEBT_EBITDA_MAX = 3.0
 # 🚀 Growth momentum — nerfed technicals; quality vs valuation split
@@ -340,6 +348,10 @@ class MasterMetrics:
     roa: float | None = None                # returnOnAssets (ROIC fallback)
     roic: float | None = None               # returnOnCapitalEmployed or strict ROIC
     gross_margins: float | None = None      # pricing power proxy (TTM)
+    current_gross_margin: float | None = None       # latest quarter GM ratio (0–1)
+    historical_gross_margin_avg: float | None = None  # multi-year average GM ratio (0–1)
+    gross_margin_red_flag: bool = False
+    gross_margin_red_flag_msg: str = ""
     gross_margin_volatility: float | None = None  # max-min gross margin range (pp, 3-5Y)
     interest_coverage: float | None = None  # EBIT / |interest expense|
     net_debt_ebitda: float | None = None    # (totalDebt - cash) / EBITDA
@@ -365,6 +377,7 @@ class MasterMetrics:
     ttm_revenue_growth: float | None = None        # info.revenueGrowth (TTM proxy)
     forward_pe: float | None = None                # forwardPE — valuation margin input
     fcf_yield: float | None = None                 # FCF / market cap
+    value_trap_red_flag: bool = False              # structural trap (shrinking rev + downgrades)
     data_as_of: str = ""                           # ISO date of latest price / quarter
 
 
@@ -401,6 +414,9 @@ class StockReport:
     strategy_mode: str = STRATEGY_VALUE
     master: MasterMetrics = field(default_factory=MasterMetrics)
     investment_scorecard: list[ScorecardItem] = field(default_factory=list)
+    gross_margin_red_flag: bool = False
+    value_trap_red_flag: bool = False
+    value_trap_alert_msg: str = ""
 
     @property
     def overall_pass(self) -> bool | None:
@@ -1124,6 +1140,43 @@ def fetch_gross_margin_volatility(ticker: yf.Ticker, years: int = 5) -> float | 
     return round((max(margins) - min(margins)) * 100.0, 2)
 
 
+def fetch_historical_gross_margin_avg(ticker: yf.Ticker, years: int = 5) -> float | None:
+    """Mean annual gross margin ratio (0–1) over recent fiscal years."""
+    try:
+        inc = ticker.get_income_stmt(freq="yearly")
+    except Exception:
+        return None
+    if inc is None or inc.empty:
+        return None
+
+    gross_row = _pick_row(inc, *GROSS_PROFIT_ROW_NAMES)
+    rev_row = _pick_row(inc, *TOTAL_REVENUE_ROW_NAMES)
+    if gross_row is None or rev_row is None:
+        return None
+
+    margins: list[float] = []
+    for col in sorted(inc.columns, reverse=True)[:years]:
+        try:
+            g = float(gross_row.get(col))
+            r = float(rev_row.get(col))
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        if pd.notna(g) and pd.notna(r) and r > 0:
+            margins.append(g / r)
+
+    if not margins:
+        return None
+    return round(sum(margins) / len(margins), 4)
+
+
+def fetch_current_quarter_gross_margin_ratio(ticker: yf.Ticker) -> float | None:
+    """Latest-quarter gross margin as a 0–1 ratio."""
+    _passed, latest_pct, _change = _gross_margin_filter(ticker)
+    if latest_pct is not None:
+        return round(latest_pct / 100.0, 4)
+    return None
+
+
 def fetch_capex_growth(ticker: yf.Ticker) -> tuple[float | None, float | None]:
     """YoY growth of quarterly CapEx as an expansion / industry-tailwind lead signal.
 
@@ -1337,6 +1390,10 @@ def fetch_master_metrics(
     capex_flag, capex_msg = _evaluate_capex_red_flag(
         capex_growth, margin_trend.get("operating_margin_change_pp")
     )
+    gm_current = fetch_current_quarter_gross_margin_ratio(t)
+    if gm_current is None:
+        gm_current = _safe_info_float(info, "grossMargins")
+    gm_hist_avg = fetch_historical_gross_margin_avg(t)
 
     if cached is not None and cached.ticker:
         roic, roa = cached.roic, cached.roa
@@ -1353,6 +1410,8 @@ def fetch_master_metrics(
         roa=roa,
         roic=roic,
         gross_margins=_safe_info_float(info, "grossMargins"),
+        current_gross_margin=gm_current,
+        historical_gross_margin_avg=gm_hist_avg,
         gross_margin_volatility=(
             cached.gross_margin_volatility if cached else fetch_gross_margin_volatility(t)
         ),
@@ -2606,6 +2665,114 @@ def score_value_revenue_stability_component(master: MasterMetrics) -> ScoreDetai
     return ScoreDetail(category, max_pts, round(earned, 1), rationale)
 
 
+def _earnings_revision_downgrade_signal(master: MasterMetrics) -> bool:
+    """Wall Street expectation downgrade: recent miss + weak beat history."""
+    sample = master.surprise_sample or 0
+    if sample == 0:
+        return False
+    latest = master.surprise_latest_pct
+    if latest is None:
+        return False
+    streak = master.surprise_beat_streak or 0
+    beats = master.surprise_beats or 0
+    if latest < 0 and streak == 0:
+        return True
+    if latest < 0 and sample >= 3 and beats <= sample // 2:
+        return True
+    return False
+
+
+def _evaluate_gross_margin_bleed(master: MasterMetrics) -> tuple[bool, str]:
+    """Value-trap gross margin bleed: GM vs history or severe OM erosion."""
+    reasons: list[str] = []
+
+    current = master.current_gross_margin
+    if current is None:
+        current = master.ttm_gross_margin
+    if current is None:
+        current = master.gross_margins
+
+    hist_avg = master.historical_gross_margin_avg
+    if (
+        current is not None
+        and hist_avg is not None
+        and current < hist_avg - GROSS_MARGIN_BLEED_VS_HIST
+    ):
+        reasons.append(
+            f"毛利率 {current * 100:.1f}% 低於歷史均値 {hist_avg * 100:.1f}% "
+            f"逾 {GROSS_MARGIN_BLEED_VS_HIST * 100:.0f}pp（定價權失血）"
+        )
+
+    if master.operating_margin_red_flag:
+        if master.operating_margin_red_flag_msg:
+            reasons.append(master.operating_margin_red_flag_msg)
+        else:
+            reasons.append("營業利益率年對年顯著衰退（營運紅旗）")
+    elif (
+        master.operating_margin_change_pp is not None
+        and master.operating_margin_change_pp <= OPERATING_MARGIN_SEVERE_DECLINE_PP
+    ):
+        reasons.append(
+            f"營業利益率 YoY {master.operating_margin_change_pp:+.1f}pp "
+            "（獲利能力嚴重衰退）"
+        )
+
+    if not reasons:
+        return False, ""
+    return True, " · ".join(reasons)
+
+
+def _evaluate_structural_value_trap(master: MasterMetrics) -> bool:
+    """Shrinking revenue base + earnings downgrades → valuation trap."""
+    cagr = master.revenue_cagr_5y
+    if cagr is None or cagr >= 0:
+        return False
+    return _earnings_revision_downgrade_signal(master)
+
+
+def _apply_value_trap_death_penalties(
+    business_quality: float,
+    valuation_margin: float,
+    quality_details: list[ScoreDetail],
+    val_detail: ScoreDetail,
+    master: MasterMetrics,
+) -> tuple[float, float, bool, bool]:
+    """
+    Value-trap death penalties (value mode only).
+
+    - Gross bleed: −20 business quality, gross_margin_red_flag on master.
+    - Structural trap: cap valuation safety at VALUE_TRAP_VALUATION_CAP.
+    """
+    gross_red, gm_msg = _evaluate_gross_margin_bleed(master)
+    value_trap = _evaluate_structural_value_trap(master)
+
+    if gross_red:
+        master.gross_margin_red_flag = True
+        master.gross_margin_red_flag_msg = gm_msg
+        business_quality = max(0.0, business_quality - VALUE_TRAP_GM_QUALITY_PENALTY)
+        for detail in quality_details:
+            if "企業品質" in detail.category:
+                detail.rationale += (
+                    f" 【毛利失血死亡懲罰】{gm_msg}；"
+                    f"企業品質分硬性扣除 {VALUE_TRAP_GM_QUALITY_PENALTY:.0f} 分。"
+                )
+                break
+
+    if value_trap:
+        master.value_trap_red_flag = True
+        valuation_margin = min(valuation_margin, VALUE_TRAP_VALUATION_CAP)
+        val_detail.earned = apply_score_cap(valuation_margin)
+        val_detail.rationale += (
+            f" 【價值陷阱估值封頂】5Y 營收 CAGR {master.revenue_cagr_5y * 100:+.1f}% "
+            "且預期修正下修；估值安全分封頂 "
+            f"{VALUE_TRAP_VALUATION_CAP:.0f}（低本益比錯覺風險）。"
+        )
+        valuation_margin = val_detail.earned
+
+    business_quality = apply_score_cap(business_quality)
+    return business_quality, valuation_margin, gross_red, value_trap
+
+
 def _apply_value_death_penalties(
     details: list[ScoreDetail],
     master: MasterMetrics,
@@ -3650,6 +3817,13 @@ def compute_scores(
     business_quality = _apply_value_death_penalties(quality_details, master)
     val_detail = score_valuation_safety_component(master, info)
     valuation_margin = val_detail.earned
+    business_quality, valuation_margin, _gross_red, _trap = _apply_value_trap_death_penalties(
+        business_quality,
+        valuation_margin,
+        quality_details,
+        val_detail,
+        master,
+    )
     details = quality_details + [val_detail]
     emoji, label = grade_from_score(business_quality, growth=False)
     return details, business_quality, valuation_margin, emoji, label
@@ -3706,6 +3880,13 @@ def analyze_symbol(symbol: str, *, strategy_mode: str) -> StockReport:
         trend_signal=trend,
         strategy_mode=mode,
         master=master,
+        gross_margin_red_flag=master.gross_margin_red_flag,
+        value_trap_red_flag=master.value_trap_red_flag,
+        value_trap_alert_msg=(
+            VALUE_TRAP_STRUCTURAL_ALERT_MSG
+            if master.gross_margin_red_flag or master.value_trap_red_flag
+            else ""
+        ),
     )
     commentary, scorecard = build_analyst_commentary(report)
     report.analyst_commentary = commentary
