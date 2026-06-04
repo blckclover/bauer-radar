@@ -3347,11 +3347,21 @@ def _cached_llm_value_narrative(
     business_summary: str,
     sector: str,
     industry: str,
+    quant_context: str,
+    master_text: str,
 ) -> str:
-    """Cache value-mode tech narrative (static business summary)."""
+    """Cache value-mode investment thesis narrative."""
     from llm_processor import generate_company_narrative_text
 
-    return generate_company_narrative_text(symbol, business_summary, sector, industry)
+    return generate_company_narrative_text(
+        symbol,
+        business_summary,
+        sector,
+        industry,
+        strategy_mode=strategy_mode,
+        quant_context=quant_context,
+        master_text=master_text,
+    )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -3361,11 +3371,12 @@ def _cached_llm_growth_narrative(
     business_summary: str,
     sector: str,
     industry: str,
+    quant_context: str,
     live_news_text: str,
     trend_json: str,
     master_text: str,
 ) -> str:
-    """Cache growth-mode live-news narrative — trend serialized as JSON."""
+    """Cache growth-mode live-news investment thesis — trend serialized as JSON."""
     from llm_processor import generate_growth_narrative_text
 
     trend: dict | None = None
@@ -3379,6 +3390,8 @@ def _cached_llm_growth_narrative(
         business_summary,
         sector,
         industry,
+        strategy_mode=strategy_mode,
+        quant_context=quant_context,
         live_news_text=live_news_text,
         trend_signal=trend,
         master_text=master_text,
@@ -3711,6 +3724,20 @@ def build_company_narrative(
     summary, sector, industry = fetch_business_summary(sym)
     mode = normalize_strategy_mode(strategy_mode)
 
+    info = _safe_ticker_info(yf_ticker, sym)
+    master = fetch_master_metrics(sym, info, ticker=yf_ticker)
+    payout = fetch_payout_ratio(sym, ticker=yf_ticker)
+    beta = _safe_beta(info)
+    from llm_processor import (
+        build_narrative_quant_context_from_master,
+        is_narrative_error_payload,
+    )
+
+    quant_context = build_narrative_quant_context_from_master(
+        mode, master, payout_ratio=payout, beta=beta
+    )
+    master_block = format_master_metrics_block(master)
+
     if is_growth_strategy(mode):
         live_news: list[LiveNewsItem] = []
         degraded = False
@@ -3724,11 +3751,7 @@ def build_company_narrative(
 
         trend = detect_trend_signals(yf_ticker)
         live_block = format_live_news_block(live_news)
-        info = _safe_ticker_info(yf_ticker, sym)
-        master = fetch_master_metrics(sym, info, ticker=yf_ticker)
-        master_block = format_master_metrics_block(master)
         trend_json = json.dumps(trend or {}, sort_keys=True, default=str)
-        from llm_processor import is_narrative_error_payload
 
         text = _cached_llm_growth_narrative(
             sym,
@@ -3736,6 +3759,7 @@ def build_company_narrative(
             summary or "",
             sector or "",
             industry or "",
+            quant_context,
             live_block,
             trend_json,
             master_block,
@@ -3743,7 +3767,15 @@ def build_company_narrative(
         if is_narrative_error_payload(text):
             text = ""
         if text.startswith("⚠️") and summary and not text.startswith("⚠️ 科技敘事生成失敗"):
-            text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
+            text = _cached_llm_value_narrative(
+                sym,
+                mode,
+                summary,
+                sector or "",
+                industry or "",
+                quant_context,
+                master_block,
+            )
             if is_narrative_error_payload(text):
                 text = ""
         elif not text.strip():
@@ -3755,9 +3787,16 @@ def build_company_narrative(
             text="尚無官方業務摘要（longBusinessSummary），暫時無法生成科技敘事。",
             live_news_degraded=False,
         )
-    from llm_processor import is_narrative_error_payload
 
-    text = _cached_llm_value_narrative(sym, mode, summary, sector or "", industry or "")
+    text = _cached_llm_value_narrative(
+        sym,
+        mode,
+        summary,
+        sector or "",
+        industry or "",
+        quant_context,
+        master_block,
+    )
     if is_narrative_error_payload(text):
         text = ""
     return NarrativeResult(text=text, live_news_degraded=False)

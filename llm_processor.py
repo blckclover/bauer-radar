@@ -125,34 +125,147 @@ MASTER_SCORECARD_PROMPT = (
 # Legacy alias
 MASTER_ANALYST_SYSTEM_PROMPT = VALUE_ANALYST_SYSTEM_PROMPT
 
-NARRATIVE_GROWTH_LIVE_PROMPT = (
-    "你現在是矽谷頂級科技風投 (VC) 兼對沖基金的首席產業分析師。"
-    "你手上有【官方長期業務摘要】【過去兩週即時市場與技術新聞】，以及一組"
-    "【前瞻硬指標】（trailingPEG、CapEx 擴張率、Earnings Surprise、毛利率）。"
-    "請以『期望值與風險溢價』的前瞻視角揉合上述資訊，提煉成 3 點冰冷、機構級的繁體中文報告，"
-    "嚴格遵守以下結構，絕對禁止任何客套廢話："
-    "1. 【前瞻核心壁壘與定價權】：結合毛利率與業務摘要，點穿其核心技術護城河與轉嫁通膨的定價權。"
-    "2. 【未來 12 個月核心催化劑與預期管理】：結合即時新聞與 CapEx 乘數效應，"
-    "指出最關鍵的研發投入、法說會指引、訂單兌現或分析師預期修正節點（具體到季度）。"
-    "3. 【前瞻期望值與不對稱勝率】：結合 PEG 剪刀差、Surprise 趨勢與技術面結構，"
-    "分析資金配置邏輯，判斷目前價格是否已提前反應利多，評估其不對稱風險報酬。"
-    "注意：字數嚴格控制在 220 字內，語氣客觀、機構級、不帶情緒渲染。"
-    "禁止 Markdown 符號（**、#、```），禁止客套開場白，直接從第 1 點開始輸出。"
+NARRATIVE_BUY_SIDE_ROLE = (
+    "你是華爾街頂級對沖基金的資深研究員 (Buy-side Equity Analyst)。"
+    "你的任務是撰寫精準、犀利且具備前瞻性的投資論述 (Investment Thesis)。"
+    "嚴禁提供維基百科式的公司簡介，必須直接切入核心驅動力與風險。"
+)
+
+NARRATIVE_THESIS_STRUCTURE = (
+    "【深度敘事結構 — 硬性規定】"
+    "輸出必須且僅能包含以下三個 Markdown 標題區塊（標題逐字保留含 **，每段限 2-3 句話，禁止羅列廢話）："
+    "**【🛡️ 商業模式與護城河】** (Business Model & Moat)："
+    "公司真正賺錢的引擎是什麼？定價權是否穩固？面對 Private Label 或競爭對手的壓力如何？"
+    "**【🔥 營運趨勢與利潤動能】** (Margin & Revenue Drivers)："
+    "未來的成長是靠漲價、銷量、還是併購？毛利率是在擴張還是被通膨/競爭壓縮？"
+    "**【⚡ 催化劑與多空情境】** (Catalysts & Bull/Bear Cases)："
+    "未來半年有無改變股價的催化劑？"
+    "Bull Case：錯殺反轉的理由；Bear Case：價值陷阱或成長透支的死法。"
+    "禁止 # 標題與 ``` 程式碼區塊；禁止客套開場白；全文繁體中文，總字數 280–420 字。"
+)
+
+NARRATIVE_QUANT_GROUNDING_RULE = (
+    "【量化錨定】必須引用使用者提供的「量化特徵」與 MASTER DATA 中的數字進行定性推論。"
+    "若模式為價值防禦 (value)，側重現金流、配息安全、ROIC、估值邊際；"
+    "若模式為動能成長 (growth)，側重 TAM、CapEx 轉換率、PEG 剪刀差、預期修正與技術催化。"
+)
+
+NARRATIVE_THESIS_SYSTEM_PROMPT = (
+    f"{NARRATIVE_BUY_SIDE_ROLE}\n"
+    f"{NARRATIVE_THESIS_STRUCTURE}\n"
+    f"{NARRATIVE_QUANT_GROUNDING_RULE}"
+)
+
+NARRATIVE_GROWTH_LIVE_ADDENDUM = (
+    "【成長模式增量指令】你已獲得官方摘要、過去兩週即時新聞、MASTER DATA 與技術面事實。"
+    "在「催化劑與多空情境」段落必須融入至少一項可驗證的近期新聞或技術結構（禁止空泛預測）。"
     f"{GROWTH_LEXICON_CONSTRAINT}"
 )
 
-NARRATIVE_SYSTEM_PROMPT = (
-    "你現在是頂級科技產業分析師。請無視任何財經媒體的股價看好或看壞噪音。"
-    "請根據這段官方公司業務摘要，用 2-3 點極精鍊的繁體中文大白話，告訴用戶："
-    "1. 這家公司底層到底是靠什麼科技/業務賺錢？ "
-    "2. 他們最近在嘗試或投入什麼新研發/新方向？ "
-    "3. 他們的競爭對手是誰？"
-    "字數控制在 150 字內。"
-    "嚴格禁止："
-    "禁止輸出任何客套開場白（如「好的，分析師報告如下：」「以下是分析」）；"
-    "禁止 Markdown 符號（**、#、```）；"
-    "直接從第一點列點輸出，讓完全不懂股票的大學 CS 學生一讀就秒懂。"
-)
+# Legacy aliases
+NARRATIVE_SYSTEM_PROMPT = NARRATIVE_THESIS_SYSTEM_PROMPT
+NARRATIVE_GROWTH_LIVE_PROMPT = f"{NARRATIVE_THESIS_SYSTEM_PROMPT}\n{NARRATIVE_GROWTH_LIVE_ADDENDUM}"
+
+
+def _fmt_narrative_metric(value: float | None, *, as_pct: bool = False) -> str:
+    if value is None:
+        return "N/A"
+    if as_pct:
+        return f"{value * 100:.1f}%"
+    return f"{value:.2f}"
+
+
+def build_narrative_quant_context(
+    *,
+    strategy_mode: str = "value",
+    revenue_cagr: float | None = None,
+    gross_margin: float | None = None,
+    fcf_yield: float | None = None,
+    peg_ratio: float | None = None,
+    forward_pe: float | None = None,
+    payout_ratio: float | None = None,
+    beta: float | None = None,
+    business_quality_score: float | None = None,
+    valuation_margin_score: float | None = None,
+) -> str:
+    """Compact quant block for narrative LLM grounding (avoids analyzer_core import cycle)."""
+    mode_code = (strategy_mode or "value").strip().lower()
+    if mode_code in ("growth", "momentum") or "成長" in strategy_mode or "動能" in strategy_mode:
+        mode_label = "動能成長"
+    else:
+        mode_label = "價值防禦"
+
+    payout_str = _fmt_narrative_metric(payout_ratio, as_pct=True) if payout_ratio is not None else "N/A"
+    beta_str = _fmt_narrative_metric(beta)
+
+    return (
+        "【量化特徵 — Data-Driven Grounding】\n"
+        f"請基於以下量化特徵進行定性分析：當前模式={mode_label} ({mode_code}), "
+        f"營收成長(CAGR)={_fmt_narrative_metric(revenue_cagr, as_pct=True)}, "
+        f"毛利率={_fmt_narrative_metric(gross_margin, as_pct=True)}, "
+        f"FCF Yield={_fmt_narrative_metric(fcf_yield, as_pct=True)}, "
+        f"PEG={_fmt_narrative_metric(peg_ratio)}, "
+        f"估值(Forward P/E)={_fmt_narrative_metric(forward_pe)}, "
+        f"配息發放率={payout_str}, Beta={beta_str}, "
+        f"企業品質分={_fmt_narrative_metric(business_quality_score)}, "
+        f"估值安全分={_fmt_narrative_metric(valuation_margin_score)}。\n"
+        "若模式為『價值防禦』，請側重現金流與配息安全；若為『動能成長』，請側重 TAM 與資本支出轉換率。"
+    )
+
+
+def build_narrative_quant_context_from_report(report) -> str:
+    """Build quant grounding from StockReport or dict-like session objects."""
+    if not report:
+        return ""
+    mode = getattr(report, "strategy_mode", "value")
+    master = getattr(report, "master", None)
+    revenue_cagr = getattr(report, "revenue_cagr", None)
+    if revenue_cagr is None and master is not None:
+        revenue_cagr = getattr(master, "revenue_cagr_5y", None)
+    gross_margin = None
+    if master is not None:
+        gross_margin = getattr(master, "ttm_gross_margin", None) or getattr(
+            master, "gross_margins", None
+        )
+    fcf_yield = getattr(master, "fcf_yield", None) if master is not None else None
+    peg_ratio = getattr(master, "peg_ratio", None) if master is not None else None
+    forward_pe = getattr(master, "forward_pe", None) if master is not None else None
+    return build_narrative_quant_context(
+        strategy_mode=mode,
+        revenue_cagr=revenue_cagr,
+        gross_margin=gross_margin,
+        fcf_yield=fcf_yield,
+        peg_ratio=peg_ratio,
+        forward_pe=forward_pe,
+        payout_ratio=getattr(report, "payout_ratio", None),
+        beta=getattr(report, "beta", None),
+        business_quality_score=getattr(report, "business_quality_score", None)
+        or getattr(report, "total_score", None),
+        valuation_margin_score=getattr(report, "valuation_margin_score", None),
+    )
+
+
+def build_narrative_quant_context_from_master(
+    strategy_mode: str,
+    master,
+    *,
+    payout_ratio: float | None = None,
+    beta: float | None = None,
+) -> str:
+    """Build quant block when only MasterMetrics + mode are available (narrative-only fetch path)."""
+    if master is None:
+        return build_narrative_quant_context(strategy_mode=strategy_mode)
+    return build_narrative_quant_context(
+        strategy_mode=strategy_mode,
+        revenue_cagr=getattr(master, "revenue_cagr_5y", None),
+        gross_margin=getattr(master, "ttm_gross_margin", None)
+        or getattr(master, "gross_margins", None),
+        fcf_yield=getattr(master, "fcf_yield", None),
+        peg_ratio=getattr(master, "peg_ratio", None),
+        forward_pe=getattr(master, "forward_pe", None),
+        payout_ratio=payout_ratio,
+        beta=beta,
+    )
 
 
 def _format_news_list(news_list: list[NewsItem]) -> str:
@@ -191,20 +304,58 @@ def crush_and_filter_news(news_list: list[NewsItem]) -> str:
         return raw_text
 
 
-def generate_company_narrative_text(
+def _build_narrative_user_block(
     symbol: str,
     business_summary: str,
     sector: str = "",
     industry: str = "",
+    *,
+    quant_context: str = "",
+    master_text: str = "",
+    live_news_text: str = "",
+    trend_context: str = "",
 ) -> str:
-    """Summarize official business summary into concise Traditional Chinese tech narrative."""
     context_parts = [f"Ticker: {symbol.upper()}"]
     if sector:
         context_parts.append(f"Sector: {sector}")
     if industry:
         context_parts.append(f"Industry: {industry}")
-    context_parts.append(f"\nOfficial longBusinessSummary:\n{business_summary.strip()}")
-    user_block = "\n".join(context_parts)
+    if quant_context.strip():
+        context_parts.append(f"\n{quant_context.strip()}")
+    if master_text.strip():
+        context_parts.append(f"\n{master_text.strip()}")
+    context_parts.append(
+        f"\n【官方業務摘要 longBusinessSummary — 僅供事實錨定，禁止逐句改寫為百科介紹】\n"
+        f"{business_summary.strip()}"
+    )
+    if live_news_text.strip():
+        context_parts.append(f"\n【過去兩週即時市場與技術新聞】\n{live_news_text.strip()}")
+    if trend_context.strip():
+        context_parts.append(f"\n{trend_context.strip()}")
+    return "\n".join(context_parts)
+
+
+def generate_company_narrative_text(
+    symbol: str,
+    business_summary: str,
+    sector: str = "",
+    industry: str = "",
+    *,
+    strategy_mode: str = "value",
+    quant_context: str = "",
+    master_text: str = "",
+) -> str:
+    """Buy-side investment thesis from summary + quant grounding."""
+    if not quant_context.strip():
+        quant_context = build_narrative_quant_context(strategy_mode=strategy_mode)
+    user_block = _build_narrative_user_block(
+        symbol,
+        business_summary,
+        sector,
+        industry,
+        quant_context=quant_context,
+        master_text=master_text,
+    )
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -214,7 +365,7 @@ def generate_company_narrative_text(
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
             model=MODEL_NAME,
-            contents=f"{NARRATIVE_SYSTEM_PROMPT}\n\n{user_block}",
+            contents=f"{NARRATIVE_THESIS_SYSTEM_PROMPT}\n\n{user_block}",
         )
         text = (response.text or "").strip()
         if not text:
@@ -259,27 +410,28 @@ def generate_growth_narrative_text(
     sector: str = "",
     industry: str = "",
     *,
+    strategy_mode: str = "growth",
+    quant_context: str = "",
     live_news_text: str = "",
     trend_signal: dict | None = None,
     master_text: str = "",
 ) -> str:
-    """Growth-mode narrative: fuse static summary + live news + master metrics + technical catalyst."""
-    context_parts = [f"Ticker: {symbol.upper()}"]
-    if sector:
-        context_parts.append(f"Sector: {sector}")
-    if industry:
-        context_parts.append(f"Industry: {industry}")
-    context_parts.append(
-        f"\n【官方長期業務摘要 longBusinessSummary】\n{(business_summary or '（無）').strip()}"
+    """Growth-mode investment thesis: summary + live news + master metrics + technical catalyst."""
+    if not quant_context.strip():
+        quant_context = build_narrative_quant_context(strategy_mode=strategy_mode)
+    news_block = live_news_text.strip()
+    if not news_block:
+        news_block = "（即時新聞流暫不可用，請僅依靜態摘要、量化特徵與技術面推論。）"
+    user_block = _build_narrative_user_block(
+        symbol,
+        (business_summary or "（無）").strip(),
+        sector,
+        industry,
+        quant_context=quant_context,
+        master_text=master_text,
+        live_news_text=news_block,
+        trend_context=_format_trend_context(trend_signal),
     )
-    if live_news_text.strip():
-        context_parts.append(f"\n【過去兩週即時市場與技術新聞】\n{live_news_text.strip()}")
-    else:
-        context_parts.append("\n【過去兩週即時市場與技術新聞】\n（即時新聞流暫不可用，請僅依靜態摘要與技術面推論。）")
-    if master_text.strip():
-        context_parts.append(f"\n【前瞻硬指標 Master Variables】\n{master_text.strip()}")
-    context_parts.append(f"\n{_format_trend_context(trend_signal)}")
-    user_block = "\n".join(context_parts)
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
