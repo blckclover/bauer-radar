@@ -3965,7 +3965,10 @@ def build_company_narrative(
 
     if not summary:
         return NarrativeResult(
-            text="尚無官方業務摘要（longBusinessSummary），暫時無法生成科技敘事。",
+            text=(
+                "💡 該標的當前季度之官方業務敘事或技術變更申報處理中，"
+                "暫採量化指標進行全面審查。"
+            ),
             live_news_degraded=False,
         )
 
