@@ -1,19 +1,7 @@
-# dividend-analyzer — direct Python dependencies
-# Install: pip install -r requirements.txt
-
-# --- Core data & SEC / Yahoo Finance (analyzer_core.py) ---
-pandas>=2.0.0
-requests>=2.31.0
-yfinance>=0.2.40
-
-# --- Streamlit dashboard (app.py) ---
-streamlit>=1.32.0
-lxml>=4.9.0
-html5lib>=1.1
-
-# --- CLI terminal output (analyze_dividend_screen.py) ---
-rich>=13.0.0
-
-# --- System A: news RSS + LLM briefing (data_fetcher.py, llm_processor.py, daily_briefing.py) ---
-feedparser>=6.0.0
-google-genai>=1.0.0
+streamlit
+plotly
+yfinance
+beautifulsoup4
+pandas
+numpy
+google-generativeai
