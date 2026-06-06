@@ -3516,6 +3516,8 @@ def _cached_llm_value_narrative(
     industry: str,
     quant_context: str,
     master_text: str,
+    revenue_cagr: float | None,
+    gross_margin: float | None,
 ) -> str:
     """Cache value-mode investment thesis narrative."""
     from llm_processor import generate_company_narrative_text
@@ -3526,6 +3528,8 @@ def _cached_llm_value_narrative(
         sector,
         industry,
         strategy_mode=strategy_mode,
+        revenue_cagr=revenue_cagr,
+        gross_margin=gross_margin,
         quant_context=quant_context,
         master_text=master_text,
     )
@@ -3542,6 +3546,8 @@ def _cached_llm_growth_narrative(
     live_news_text: str,
     trend_json: str,
     master_text: str,
+    revenue_cagr: float | None,
+    gross_margin: float | None,
 ) -> str:
     """Cache growth-mode live-news investment thesis — trend serialized as JSON."""
     from llm_processor import generate_growth_narrative_text
@@ -3558,6 +3564,8 @@ def _cached_llm_growth_narrative(
         sector,
         industry,
         strategy_mode=strategy_mode,
+        revenue_cagr=revenue_cagr,
+        gross_margin=gross_margin,
         quant_context=quant_context,
         live_news_text=live_news_text,
         trend_signal=trend,
@@ -3918,6 +3926,12 @@ def build_company_narrative(
         mode, master, payout_ratio=payout, beta=beta
     )
     master_block = format_master_metrics_block(master)
+    narrative_cagr = master.revenue_cagr_5y
+    narrative_gm = (
+        master.current_gross_margin
+        or master.ttm_gross_margin
+        or master.gross_margins
+    )
 
     if is_growth_strategy(mode):
         live_news: list[LiveNewsItem] = []
@@ -3944,6 +3958,8 @@ def build_company_narrative(
             live_block,
             trend_json,
             master_block,
+            narrative_cagr,
+            narrative_gm,
         )
         if is_narrative_error_payload(text):
             text = ""
@@ -3956,6 +3972,8 @@ def build_company_narrative(
                 industry or "",
                 quant_context,
                 master_block,
+                narrative_cagr,
+                narrative_gm,
             )
             if is_narrative_error_payload(text):
                 text = ""
@@ -3980,6 +3998,8 @@ def build_company_narrative(
         industry or "",
         quant_context,
         master_block,
+        narrative_cagr,
+        narrative_gm,
     )
     if is_narrative_error_payload(text):
         text = ""

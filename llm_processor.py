@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import re
 
-from google import genai
+import google.generativeai as genai
 
 from data_fetcher import NewsItem
 
@@ -125,46 +125,12 @@ MASTER_SCORECARD_PROMPT = (
 # Legacy alias
 MASTER_ANALYST_SYSTEM_PROMPT = VALUE_ANALYST_SYSTEM_PROMPT
 
-NARRATIVE_BUY_SIDE_ROLE = (
-    "你是華爾街頂級對沖基金的資深研究員 (Buy-side Equity Analyst)。"
-    "你的任務是撰寫精準、犀利且具備前瞻性的投資論述 (Investment Thesis)。"
-    "嚴禁提供維基百科式的公司簡介，必須直接切入核心驅動力與風險。"
-)
-
-NARRATIVE_THESIS_STRUCTURE = (
-    "【深度敘事結構 — 硬性規定】"
-    "輸出必須且僅能包含以下三個 Markdown 標題區塊（標題逐字保留含 **，每段限 2-3 句話，禁止羅列廢話）："
-    "**【🛡️ 商業模式與護城河】** (Business Model & Moat)："
-    "公司真正賺錢的引擎是什麼？定價權是否穩固？面對 Private Label 或競爭對手的壓力如何？"
-    "**【🔥 營運趨勢與利潤動能】** (Margin & Revenue Drivers)："
-    "未來的成長是靠漲價、銷量、還是併購？毛利率是在擴張還是被通膨/競爭壓縮？"
-    "**【⚡ 催化劑與多空情境】** (Catalysts & Bull/Bear Cases)："
-    "未來半年有無改變股價的催化劑？"
-    "Bull Case：錯殺反轉的理由；Bear Case：價值陷阱或成長透支的死法。"
-    "禁止 # 標題與 ``` 程式碼區塊；禁止客套開場白；全文繁體中文，總字數 280–420 字。"
-)
-
-NARRATIVE_QUANT_GROUNDING_RULE = (
-    "【量化錨定】必須引用使用者提供的「量化特徵」與 MASTER DATA 中的數字進行定性推論。"
-    "若模式為價值防禦 (value)，側重現金流、配息安全、ROIC、估值邊際；"
-    "若模式為動能成長 (growth)，側重 TAM、CapEx 轉換率、PEG 剪刀差、預期修正與技術催化。"
-)
-
-NARRATIVE_THESIS_SYSTEM_PROMPT = (
-    f"{NARRATIVE_BUY_SIDE_ROLE}\n"
-    f"{NARRATIVE_THESIS_STRUCTURE}\n"
-    f"{NARRATIVE_QUANT_GROUNDING_RULE}"
-)
-
 NARRATIVE_GROWTH_LIVE_ADDENDUM = (
-    "【成長模式增量指令】你已獲得官方摘要、過去兩週即時新聞、MASTER DATA 與技術面事實。"
+    "\n【成長模式增量指令】你已獲得官方摘要、過去兩週即時新聞、MASTER DATA 與技術面事實。"
     "在「催化劑與多空情境」段落必須融入至少一項可驗證的近期新聞或技術結構（禁止空泛預測）。"
+    "禁止 # 標題與 ``` 程式碼區塊；全文繁體中文。"
     f"{GROWTH_LEXICON_CONSTRAINT}"
 )
-
-# Legacy aliases
-NARRATIVE_SYSTEM_PROMPT = NARRATIVE_THESIS_SYSTEM_PROMPT
-NARRATIVE_GROWTH_LIVE_PROMPT = f"{NARRATIVE_THESIS_SYSTEM_PROMPT}\n{NARRATIVE_GROWTH_LIVE_ADDENDUM}"
 
 
 def _fmt_narrative_metric(value: float | None, *, as_pct: bool = False) -> str:
@@ -173,6 +139,69 @@ def _fmt_narrative_metric(value: float | None, *, as_pct: bool = False) -> str:
     if as_pct:
         return f"{value * 100:.1f}%"
     return f"{value:.2f}"
+
+
+def build_narrative_thesis_prompt(
+    *,
+    strategy_mode: str = "value",
+    revenue_cagr: float | None = None,
+    gross_margin: float | None = None,
+    growth_live: bool = False,
+) -> str:
+    """Buy-side investment thesis system prompt with quant anchors."""
+    mode_raw = (strategy_mode or "value").strip()
+    if (
+        mode_raw.lower() in ("growth", "momentum")
+        or "成長" in mode_raw
+        or "動能" in mode_raw
+    ):
+        mode_display = f"動能成長 ({mode_raw})"
+    elif mode_raw.lower() == "value" or "價值" in mode_raw or "防禦" in mode_raw:
+        mode_display = f"價值防禦 ({mode_raw})"
+    else:
+        mode_display = mode_raw
+
+    prompt = (
+        "你是華爾街頂級對沖基金的資深研究員 (Buy-side Equity Analyst)。\n"
+        "請基於以下量化特徵，為標的撰寫犀利、具前瞻性的投資論述：\n"
+        f"當前策略模式：{mode_display}\n"
+        f"5年營收 CAGR：{_fmt_narrative_metric(revenue_cagr, as_pct=True)}\n"
+        f"當前毛利率：{_fmt_narrative_metric(gross_margin, as_pct=True)}\n"
+        "\n"
+        "輸出必須嚴格包含以下三個標題區塊（每段限 2-3 句話，嚴禁客套廢話）：\n"
+        "- **【🛡️ 商業模式與護城河】**："
+        "分析公司賺錢的核心引擎、定價權韌性，以及是否面臨同業或自有品牌 (Private Label) 的侵蝕壓力。\n"
+        "- **【🔥 營運趨勢與利潤動能】**："
+        "剖析成長是靠漲價、銷量還是併購？最新毛利率表現是在擴張還是被壓縮？\n"
+        "- **【⚡ 催化劑與多空情境】**："
+        "推演未來半年有無股價催化劑。(Bull Case: 錯殺反轉的理由 / Bear Case: 價值陷阱的死法)\n"
+        "【量化錨定】必須引用下方 MASTER DATA 與量化特徵中的數字；"
+        "嚴禁維基百科式公司簡介。"
+    )
+    if growth_live:
+        prompt += NARRATIVE_GROWTH_LIVE_ADDENDUM
+    return prompt
+
+
+# Legacy aliases
+NARRATIVE_THESIS_SYSTEM_PROMPT = build_narrative_thesis_prompt()
+NARRATIVE_SYSTEM_PROMPT = NARRATIVE_THESIS_SYSTEM_PROMPT
+NARRATIVE_GROWTH_LIVE_PROMPT = build_narrative_thesis_prompt(growth_live=True)
+
+
+def _generate_gemini_text(contents: str) -> str | None:
+    """Call Gemini via google.generativeai (GenerativeModel API)."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(contents)
+        text = (getattr(response, "text", None) or "").strip()
+        return text or None
+    except Exception:
+        return None
 
 
 def build_narrative_quant_context(
@@ -290,12 +319,7 @@ def crush_and_filter_news(news_list: list[NewsItem]) -> str:
         return raw_text
 
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=f"{FILTER_PROMPT}\n\n{raw_text}",
-        )
-        filtered_text = (response.text or "").strip()
+        filtered_text = _generate_gemini_text(f"{FILTER_PROMPT}\n\n{raw_text}")
         if not filtered_text:
             raise ValueError("Gemini returned an empty response.")
         return filtered_text
@@ -342,12 +366,23 @@ def generate_company_narrative_text(
     industry: str = "",
     *,
     strategy_mode: str = "value",
+    revenue_cagr: float | None = None,
+    gross_margin: float | None = None,
     quant_context: str = "",
     master_text: str = "",
 ) -> str:
     """Buy-side investment thesis from summary + quant grounding."""
     if not quant_context.strip():
-        quant_context = build_narrative_quant_context(strategy_mode=strategy_mode)
+        quant_context = build_narrative_quant_context(
+            strategy_mode=strategy_mode,
+            revenue_cagr=revenue_cagr,
+            gross_margin=gross_margin,
+        )
+    system_prompt = build_narrative_thesis_prompt(
+        strategy_mode=strategy_mode,
+        revenue_cagr=revenue_cagr,
+        gross_margin=gross_margin,
+    )
     user_block = _build_narrative_user_block(
         symbol,
         business_summary,
@@ -357,17 +392,11 @@ def generate_company_narrative_text(
         master_text=master_text,
     )
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
+    if not os.environ.get("GEMINI_API_KEY"):
         return "⚠️ 未設定 GEMINI_API_KEY，無法生成科技敘事。請在環境變數中設定後重新整理。"
 
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=f"{NARRATIVE_THESIS_SYSTEM_PROMPT}\n\n{user_block}",
-        )
-        text = (response.text or "").strip()
+        text = _generate_gemini_text(f"{system_prompt}\n\n{user_block}")
         if not text:
             raise ValueError("Gemini returned an empty narrative.")
         if is_narrative_error_payload(text):
@@ -411,6 +440,8 @@ def generate_growth_narrative_text(
     industry: str = "",
     *,
     strategy_mode: str = "growth",
+    revenue_cagr: float | None = None,
+    gross_margin: float | None = None,
     quant_context: str = "",
     live_news_text: str = "",
     trend_signal: dict | None = None,
@@ -418,7 +449,17 @@ def generate_growth_narrative_text(
 ) -> str:
     """Growth-mode investment thesis: summary + live news + master metrics + technical catalyst."""
     if not quant_context.strip():
-        quant_context = build_narrative_quant_context(strategy_mode=strategy_mode)
+        quant_context = build_narrative_quant_context(
+            strategy_mode=strategy_mode,
+            revenue_cagr=revenue_cagr,
+            gross_margin=gross_margin,
+        )
+    system_prompt = build_narrative_thesis_prompt(
+        strategy_mode=strategy_mode,
+        revenue_cagr=revenue_cagr,
+        gross_margin=gross_margin,
+        growth_live=True,
+    )
     news_block = live_news_text.strip()
     if not news_block:
         news_block = "（即時新聞流暫不可用，請僅依靜態摘要、量化特徵與技術面推論。）"
@@ -433,17 +474,11 @@ def generate_growth_narrative_text(
         trend_context=_format_trend_context(trend_signal),
     )
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
+    if not os.environ.get("GEMINI_API_KEY"):
         return "⚠️ 未設定 GEMINI_API_KEY，無法生成科技敘事。請在環境變數中設定後重新整理。"
 
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=f"{NARRATIVE_GROWTH_LIVE_PROMPT}\n\n{user_block}",
-        )
-        text = (response.text or "").strip()
+        text = _generate_gemini_text(f"{system_prompt}\n\n{user_block}")
         if not text:
             raise ValueError("Gemini returned an empty narrative.")
         if is_narrative_error_payload(text):
@@ -454,19 +489,7 @@ def generate_growth_narrative_text(
 
 
 def _call_gemini(system_prompt: str, context: str) -> str | None:
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return None
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=f"{system_prompt}\n\n{context.strip()}",
-        )
-        text = (response.text or "").strip()
-        return text or None
-    except Exception:
-        return None
+    return _generate_gemini_text(f"{system_prompt}\n\n{context.strip()}")
 
 
 def generate_growth_analyst_commentary(context: str) -> str | None:
